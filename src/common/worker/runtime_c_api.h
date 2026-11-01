@@ -995,6 +995,20 @@ int finalize_device(DeviceContextHandle ctx);
 int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable);
 
 /**
+ * Optional A5 HostRegister mapping API.
+ *
+ * These entries are resolved opportunistically. A runtime without a real
+ * HostRegister backend omits them (or returns an unsupported capability);
+ * ChipWorker must fail explicitly rather than substitute another transport.
+ */
+int host_register_supported_ctx(DeviceContextHandle ctx, uint32_t *supported);
+int host_register_map_ctx(
+    DeviceContextHandle ctx, int device, uint64_t host, uint64_t bytes, uint64_t *mapped, uint32_t *registered
+);
+int host_register_unmap_ctx(DeviceContextHandle ctx, int device, uint64_t host);
+int host_urma_capability_ctx(DeviceContextHandle ctx, uint32_t *supported);
+
+/**
  * Register on an initialized PROGRAM or KERNEL context with an unused ID.
  * KERNEL contexts use the kernel preparation path internally. The entry does
  * not initialize the context; an uninitialized, failed-init or finalized

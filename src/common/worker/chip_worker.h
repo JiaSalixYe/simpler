@@ -389,6 +389,13 @@ public:
     ///
     /// Multi-domain bootstrap allocates a hidden base communicator plus one
     /// symmetric pool, then derives per-domain views with comm_derive_context.
+    /// Optional A5 HostRegister mapping. These return false/raise when the
+    /// loaded runtime does not implement the optional HostRegister entry
+    /// points; they never substitute another transport.
+    bool host_register_supported() const;
+    uint64_t host_register_map(uint64_t host, uint64_t bytes) const;
+    void host_register_unmap(uint64_t host) const;
+    bool host_urma_supported() const;
     uint64_t comm_init(int rank, int nranks, const std::string &rootinfo_path);
     uint64_t comm_alloc_windows(uint64_t comm_handle, size_t win_size);
     uint64_t comm_get_local_window_base(uint64_t comm_handle);
@@ -604,6 +611,10 @@ private:
     using CommGlobalDomainReleaseFn = int (*)(uint64_t);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
+    using HostRegisterSupportedFn = int (*)(void *, uint32_t *);
+    using HostRegisterMapFn = int (*)(void *, int, uint64_t, uint64_t, uint64_t *, uint32_t *);
+    using HostRegisterUnmapFn = int (*)(void *, int, uint64_t);
+    using HostUrmaCapabilityFn = int (*)(void *, uint32_t *);
     using KernelSupportedFn = decltype(&simpler_kernel_mode_supported);
     using KernelInitFn = decltype(&simpler_kernel_mode_init);
     using KernelPrepareCallableFn = decltype(&simpler_kernel_mode_prepare_callable);
@@ -628,6 +639,10 @@ private:
     void require_comm_reclamation_safe() const;
 
     std::shared_ptr<RuntimeModule> runtime_module_;
+    HostRegisterSupportedFn host_register_supported_fn_ = nullptr;
+    HostRegisterMapFn host_register_map_fn_ = nullptr;
+    HostRegisterUnmapFn host_register_unmap_fn_ = nullptr;
+    HostUrmaCapabilityFn host_urma_capability_fn_ = nullptr;
     CreateDeviceContextFn create_device_context_fn_ = nullptr;
     DestroyDeviceContextFn destroy_device_context_fn_ = nullptr;
     DeviceMallocCtxFn device_malloc_ctx_fn_ = nullptr;

@@ -108,7 +108,11 @@ requires matching torch/torch_npu/CANN and does not enable capture submission.
 | `free(handle)` | Releases a device `Buffer` returned by either allocation method |
 | `copy_to(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `nbytes` defaults to the rest of the host side after `src_offset`, so `copy_to(dst, src)` transfers the whole host backing |
 | `copy_from(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). Same defaulting, measured from `dst_offset` on the host side |
-| `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `Tensor(handle, shapes=shapes, dtype=dtype)` |
+| `create_buffer(nbytes, *, host_window=None) -> Buffer` | Without `host_window`, allocates POSIX shared memory accessible through `buffer.shm.buf`. On A5 direct L2, `host_window=HostWindowSpec(nbytes)` allocates the same CPU backing and creates a HostRegister resource; its `shm` stays available for CPU writes |
+| `map_view(tensor, *, target=None, access=AccessMode.READWRITE) -> Tensor` | A5 direct L2 HostRegister only; registers one restricted device mapping for the current target and returns a new mapped Tensor without changing the native view or canonical identity |
+| `unmap_view(tensor) -> None` | Revokes one issued A5 HostRegister mapping after accepted uses finish; the last active record unregisters the host memory and retains the CPU backing |
+| `release_buffer(buffer)` | Releases the original Host Buffer only after every mapped view is unmapped and accepted uses finish; a borrowed alias cannot release it |
+| `Buffer.close()` | Revokes new use of that handle. A HostRegister Buffer borrows its physical allocation: use `release_buffer` for backing cleanup after unmapping views |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
 
 A partial update names the **whole allocation plus an offset** — `copy_to(dev, src,
@@ -116,6 +120,27 @@ dst_offset=32, nbytes=16)`. A handle rebuilt at `base + 32` is not an interior v
 allocation; it is a different canonical identity that names no allocation at all, and is refused.
 Both offsets are bounded together with the length against the *registered* extent, so an offset
 cannot walk a legal-looking length past the end.
+
+`HostWindowSpec`, `AccessMode`, `TensorTransfer` and `TaskArgs` are available from
+`simpler.task_interface`. The A5 branch implements **direct L2 only**: one
+initialized Worker, POSIX-shm CPU backing, and `aclrtHostRegisterV2` +
+`aclrtHostGetDevicePointer` for the device mapping. A5 L3 domains, cross-process
+Host mapping, and URMA data transfer are not implemented here.
+
+`HostWindowSpec.nbytes` must be positive, below `2**63` and a multiple of 64; at
+L2 it must equal `create_buffer`'s `nbytes`. Build the native Tensor from the
+Buffer, then call `map_view` for the intended access and use
+`TensorTransfer.NONE` on the task argument. The native Tensor remains a CPU view;
+A5 device tasks must consume the mapped Tensor. Mapping references are opaque,
+increase from 1 through 255 per backing, encode neither rank nor access, and are
+never reused. Exhaustion raises an explicit error. A failed map or unmap leaves
+no grant and is retried explicitly; an unconfirmed unregister keeps the record
+CLOSING and refuses a new mapping. In-flight or accepted uses refuse release.
+
+A runtime that does not export the HostRegister entry points (including the A5
+simulator) refuses the mapping explicitly. The A5 URMA backend is a capability
+skeleton: it reports unsupported and never falls back to HostRegister, A3 Fabric,
+or another transport. See the [A5 HostRegister guide](../../zh-cn/a5-host-register.md).
 
 ### Execution
 

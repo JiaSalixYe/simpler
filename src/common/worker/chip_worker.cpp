@@ -459,6 +459,13 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = module->required<CommGlobalDomainReleaseFn>("comm_global_domain_release");
         comm_barrier_fn_ = module->required<CommBarrierFn>("comm_barrier");
         comm_destroy_fn_ = module->required<CommDestroyFn>("comm_destroy");
+        // Optional HostRegister bridge: only an A5 onboard runtime that
+        // actually implements HostRegister exports these. A missing entry is
+        // a capability refusal, not a reason to fall back.
+        host_register_supported_fn_ = module->optional<HostRegisterSupportedFn>("host_register_supported_ctx");
+        host_register_map_fn_ = module->optional<HostRegisterMapFn>("host_register_map_ctx");
+        host_register_unmap_fn_ = module->optional<HostRegisterUnmapFn>("host_register_unmap_ctx");
+        host_urma_capability_fn_ = module->optional<HostUrmaCapabilityFn>("host_urma_capability_ctx");
         kernel_supported_fn = module->required<KernelSupportedFn>("simpler_kernel_mode_supported");
         kernel_init_fn = module->required<KernelInitFn>("simpler_kernel_mode_init");
         kernel_prepare_callable_fn = module->required<KernelPrepareCallableFn>("simpler_kernel_mode_prepare_callable");
@@ -2283,6 +2290,57 @@ void ChipWorker::copy_from(uint64_t dst, uint64_t src, size_t size) {
     if (rc != 0) {
         throw std::runtime_error("copy_from failed with code " + std::to_string(rc));
     }
+}
+
+bool ChipWorker::host_register_supported() const {
+    if (device_ctx_ == nullptr || host_register_supported_fn_ == nullptr || host_register_map_fn_ == nullptr ||
+        host_register_unmap_fn_ == nullptr) {
+        return false;
+    }
+    uint32_t supported = 0;
+    return host_register_supported_fn_(device_ctx_, &supported) == 0 && supported != 0;
+}
+
+uint64_t ChipWorker::host_register_map(uint64_t host, uint64_t bytes) const {
+    if (!host_register_supported()) {
+        throw std::runtime_error("A5 HostRegister is not supported by this runtime");
+    }
+    uint64_t mapped = 0;
+    uint32_t registered = 0;
+    const int rc = host_register_map_fn_(device_ctx_, device_id_, host, bytes, &mapped, &registered);
+    if (rc != 0) {
+        if (registered != 0) {
+            const int cleanup = host_register_unmap_fn_(device_ctx_, device_id_, host);
+            if (cleanup != 0) {
+                throw std::runtime_error(
+                    "A5 HostRegister map failed with code " + std::to_string(rc) + " and cleanup failed with code " +
+                    std::to_string(cleanup)
+                );
+            }
+        }
+        throw std::runtime_error("A5 HostRegister map failed with code " + std::to_string(rc));
+    }
+    if (!registered || mapped == 0) {
+        if (registered != 0) host_register_unmap_fn_(device_ctx_, device_id_, host);
+        throw std::runtime_error("A5 HostRegister map returned no device address");
+    }
+    return mapped;
+}
+
+void ChipWorker::host_register_unmap(uint64_t host) const {
+    if (host_register_unmap_fn_ == nullptr) {
+        throw std::runtime_error("A5 HostRegister unmap is not supported by this runtime");
+    }
+    const int rc = host_register_unmap_fn_(device_ctx_, device_id_, host);
+    if (rc != 0) {
+        throw std::runtime_error("A5 HostRegister unmap failed with code " + std::to_string(rc));
+    }
+}
+
+bool ChipWorker::host_urma_supported() const {
+    if (device_ctx_ == nullptr || host_urma_capability_fn_ == nullptr) return false;
+    uint32_t supported = 0;
+    return host_urma_capability_fn_(device_ctx_, &supported) == 0 && supported != 0;
 }
 
 uint64_t ChipWorker::comm_init(int rank, int nranks, const std::string &rootinfo_path) {

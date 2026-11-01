@@ -128,6 +128,7 @@ from .buffer import (
     ImportContext,
     ImportRegistry,
     LocalEndpointBufferIdentityAllocator,
+    Tensor,
     _DeviceBufferSource,
     buffer_reference,
     capabilities_for_adapter,
@@ -152,7 +153,7 @@ from .callable_identity import (
     parse_python_callable_payload,
     parse_python_import_target,
 )
-from .comm_domain import CommDomainRef, DomainConfig
+from .comm_domain import CommDomainRef, DomainConfig, HostWindowSpec
 from .comm_endpoints import (
     DEVICE_AICORE,
     DEVICE_AICPU,
@@ -274,6 +275,8 @@ from .global_comm_domain import (
     resolve_global_comm_capability,
     validate_descriptor_table,
 )
+from .host_domain import HostDomainResource
+from .host_domain_backend import A5HostRegisterEntry
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
 from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
@@ -4796,6 +4799,14 @@ class CleanupJournal:
         """Drive every retained entry whose resource kind is in ``kinds``."""
         return self.drive({(kind, identity) for kind, identity, _cleanup in self._entries if kind in kinds})
 
+    def discard(self, kind: str, identity: str) -> None:
+        """Forget one completed obligation without replaying its cleanup."""
+        self._entries = [
+            (entry_kind, entry_identity, cleanup)
+            for entry_kind, entry_identity, cleanup in self._entries
+            if (entry_kind, entry_identity) != (kind, identity)
+        ]
+
 
 class _CloseAttempt:
     """Private completion record for one close() teardown attempt.
@@ -5866,6 +5877,8 @@ class Worker:
         self._owner_instance_id: bytes = mint_owner_instance_id()
         self._buffer_identity_allocator = LocalEndpointBufferIdentityAllocator(self._owner_instance_id)
         self._buffers: dict[int, Buffer] = {}
+        self._direct_host_domains: dict[CanonicalIdentity, tuple] = {}
+        self._l2_materialize_local = threading.local()
         # Local chip endpoint incarnation facts, frozen once per (chip index, deployment).
         # AICPU/AICORE each have a nonce; only AICPU has a Buffer identity allocator.
         self._device_endpoint_identities: dict[tuple[int, EndpointDeployment], tuple[bytes, bool]] = {}
@@ -12249,7 +12262,8 @@ class Worker:
             if not source.live(identity):
                 self._drop_device_alloc(identity)
                 self._source_attachments.remove(identity)
-        snapshots = source.acquire(args, self._source_attachments)
+        device_args = self._device_provenance_args(args)
+        snapshots = source.acquire(device_args if device_args is not None else TaskArgs(), self._source_attachments)
         identities = tuple(buffer.identity for buffer in snapshots)
         added = []
         try:
@@ -12574,11 +12588,14 @@ class Worker:
         each one's descriptor back into Python costs more than comparing it. Only the refusal
         returns here, where naming the argument is worth an object.
         """
-        failure = self._child_alloc.check_dispatch(args, target_worker_id)
+        device_args = self._device_provenance_args(args)
+        if device_args is None:
+            return
+        failure = self._child_alloc.check_dispatch(device_args, target_worker_id)
         if failure is None:
             return
         arg_index, reason = failure
-        identity = args.tensor(arg_index).buffer.identity
+        identity = device_args.tensor(arg_index).buffer.identity
         if reason == PROV_NOT_LIVE:
             raise ValueError(
                 f"orch.{api}: device argument (arg {arg_index}, {identity}) is not a live "
@@ -13122,7 +13139,140 @@ class Worker:
     # Post-fork zero-copy host buffers
     # ------------------------------------------------------------------
 
-    def create_buffer(self, nbytes: int) -> Buffer:
+    def _ensure_chip_import_registry(self) -> ImportRegistry:
+        registry = self._chip_import_registry
+        if registry is None:
+            chip = self._chip_worker
+            environment = getattr(chip, "_execution_environment", None)
+            registry = ImportRegistry(
+                ImportContext(
+                    deployment=DEVICE_AICPU,
+                    device_owner_instance_id=self._owner_instance_id,
+                    platform=self._config.get("platform"),
+                    runtime=self._config.get("runtime"),
+                    execution_environment=environment,
+                    current_environment=lambda: getattr(chip, "_execution_environment", None),
+                )
+            )
+            self._chip_import_registry = registry
+        return registry
+
+    @contextlib.contextmanager
+    def _host_view_scope(self, resource, worker: int, api: str):
+        with (
+            self._operation_lease(api, allow_continuation=True),
+            self._child_prov_worker_lock(worker),
+            self._child_prov_lock,
+            self._registry_lock,
+        ):
+            if self._source_context_failed:
+                raise RuntimeError("Host mapping retained after unconfirmed device completion")
+            if any(resource.identity in touched for touched in self._chip_run_touched_identities.values()):
+                raise RuntimeError("Host mapping still referenced by an in-flight L2 run")
+            yield
+
+    def _control_host_view(self, resource, worker: int, reference: int, access, *, unmap: bool):
+        if resource._direct_view is None:
+            raise RuntimeError("Host backing is not allocated")
+        resource._direct_view.apply(
+            self._chip_worker, self._ensure_chip_import_registry(), reference, access, unmap=unmap
+        )
+
+    def _create_host_register_buffer(self, nbytes: int, spec: HostWindowSpec) -> Buffer:
+        if self.level != 2:
+            raise ValueError("host_window requires a direct L2 Worker")
+        if self._config.get("platform") != "a5":
+            raise ValueError("A5 HostRegister requires the a5 platform")
+        if not isinstance(spec, HostWindowSpec) or spec.nbytes != nbytes:
+            raise ValueError("host_window must describe the requested buffer size")
+        if spec.numa_id:
+            raise ValueError("A5 HostRegister does not implement NUMA placement; numa_id must be 0")
+        chip = self._chip_worker
+        if chip is None:
+            raise RuntimeError("A5 HostRegister requires an initialized Worker")
+        if not chip.host_register_supported():
+            raise RuntimeError("A5 HostRegister is not supported by this runtime")
+        identity = self._burn_buffer_identity()
+        mapping = A5HostRegisterEntry(chip)
+        resource = HostDomainResource(
+            spec,
+            identity,
+            (0,),
+            self._config["platform"],
+            self._config["device_ids"][0],
+            mapping=mapping,
+            view_scope=self._host_view_scope,
+            view_control=self._control_host_view,
+        )
+        self._direct_host_domains[identity] = (resource, mapping)
+        self._cleanup_journal.add_once("host-domain", str(identity.buffer_id), resource.close)
+        try:
+            resource.allocate()
+            resource.published = True
+            if resource.buffer is None:
+                raise RuntimeError("A5 HostRegister allocation returned no Buffer")
+            return resource.buffer
+        except BaseException:
+            self._release_direct_host_domain(identity, raise_on_failure=False)
+            raise
+
+    def map_view(self, tensor: Tensor, *, target=None, access=AccessMode.READWRITE) -> Tensor:
+        """Establish a restricted A5 HostRegister device mapping for one view."""
+        if self.level != 2 or (target is not None and target != self.device_location):
+            raise ValueError("map_view requires this Worker's device endpoint")
+        entry = getattr(self, "_direct_host_domains", {}).get(tensor.buffer.identity)
+        if entry is None:
+            raise ValueError("map_view requires an A5 Host buffer allocated by this Worker")
+        return entry[0].map_view(tensor, 0, access=access)
+
+    def unmap_view(self, tensor: Tensor) -> None:
+        """Revoke one issued A5 HostRegister mapping."""
+        if self.level != 2:
+            raise ValueError("unmap_view requires a direct L2 Worker")
+        entry = getattr(self, "_direct_host_domains", {}).get(tensor.buffer.identity)
+        if entry is None:
+            raise ValueError("unmap_view requires an A5 Host buffer allocated by this Worker")
+        entry[0].unmap_view(tensor)
+
+    def _release_direct_host_domain(self, identity, *, raise_on_failure: bool = True) -> None:
+        entry = getattr(self, "_direct_host_domains", {}).get(identity)
+        if entry is None:
+            return
+        resource, _mapping = entry
+        try:
+            with self._child_prov_worker_lock(0), self._registry_lock:
+                if self._source_context_failed:
+                    raise RuntimeError("A5 Host backing retained after unconfirmed device completion")
+                if any(identity in touched for touched in self._chip_run_touched_identities.values()):
+                    raise RuntimeError("A5 Host backing still referenced by an in-flight L2 run")
+                resource.close()
+            del self._direct_host_domains[identity]
+            self._cleanup_journal.discard("host-domain", str(identity.buffer_id))
+        except BaseException:
+            if raise_on_failure:
+                raise
+
+    def _validate_host_args(self, args: TaskArgs) -> None:
+        with self._registry_lock:
+            host_domains = getattr(self, "_direct_host_domains", {})
+            for i in range(args.tensor_count()):
+                tensor = args.tensor(i)
+                entry = host_domains.get(tensor.buffer.identity)
+                if entry is not None:
+                    entry[0].validate(tensor, 0)
+
+    def _device_provenance_args(self, args: TaskArgs) -> TaskArgs | None:
+        host_domains = getattr(self, "_direct_host_domains", {})
+        if not any(args.tensor(i).buffer.identity in host_domains for i in range(args.tensor_count())):
+            return args
+        device_args = TaskArgs()
+        for i in range(args.tensor_count()):
+            if args.tensor(i).buffer.identity in host_domains:
+                continue
+            device_args.add_tensor(args.tensor(i), args.tag(i), transfer=args.transfer(i))
+        return device_args if device_args.tensor_count() else None
+
+    def create_buffer(self, nbytes: int, *, host_window: HostWindowSpec | None = None) -> Buffer:
         """Allocate a shared ``Buffer`` owned by this Worker (P1-B).
 
         The backing is a POSIX shm; the Buffer carries a typed canonical identity and a
@@ -13136,6 +13286,8 @@ class Worker:
         if self.level < 2:
             raise TypeError("create_buffer requires a level >= 2 Worker")
         with self._operation_lease("create_buffer", allow_continuation=True):
+            if host_window is not None:
+                return self._create_host_register_buffer(int(nbytes), host_window)
             return self._create_buffer_locked(int(nbytes))
 
     def alloc_shared_tensor(self, shapes: tuple[int, ...], dtype) -> Buffer:
@@ -13320,6 +13472,13 @@ class Worker:
         The slot is dropped only when it still holds *this* buffer: a buffer_id minted elsewhere can
         collide with a registry key, and evicting the live entry it names would strand that
         backing."""
+        host_entry = getattr(self, "_direct_host_domains", {}).get(buffer.identity)
+        if host_entry is not None:
+            if host_entry[0].buffer is not buffer:
+                raise ValueError("release_buffer requires the original owning Host Buffer")
+            with self._operation_lease("release_buffer", allow_continuation=True):
+                self._release_direct_host_domain(buffer.identity)
+            return
         if not buffer.closed:
             # Exclusive, not shared: `shared()` would already exclude admission and so
             # satisfy the "never mid-callback" argument above, but this keeps the
@@ -13857,6 +14016,7 @@ class Worker:
         if borrowed and any(args.transfer(i) == TensorTransfer.H2D for i in range(args.tensor_count())):
             raise ValueError("borrowed submission does not copy HOST tensors to DEVICE")
         _validate_host_control_access(self._callable_registry.get(callable_id), args)
+        self._validate_host_args(args)
         touched = self._identities_in_args(args)
         # Device identity validation and accepted-use publication share free's chip lock.
         # After publication, the touched set refuses free through run finalization, including
@@ -13881,7 +14041,15 @@ class Worker:
                     self._chip_source_uses[run_id] = sources
         native_entered = False
         try:
-            chip_args = self._materialize_l2_args(args)
+            local = getattr(self, "_l2_materialize_local", None)
+            previous_target = getattr(local, "target", None) if local is not None else None
+            if local is not None:
+                local.target = self._callable_registry.get(callable_id)
+            try:
+                chip_args = self._materialize_l2_args(args)
+            finally:
+                if local is not None:
+                    local.target = previous_target
             native_entered = True
             submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
             chip_run = self._chip_worker._submit_chip_run_direct(callable_id, chip_args, cfg, **submit_options)
@@ -14173,32 +14341,32 @@ class Worker:
     def _materialize_l2_args(self, args) -> Any:
         """Resolve an L2 leaf's tensor args to a chip-POD blob in this process.
 
-        The user builds args as ``TaskArgs`` (``Tensor``) at every level; an L2 leaf is the consumer of
-        its own args, so it does exactly what a chip child does — resolve each ref's embedded descriptor
-        to a local base (map-once, cached in ``_chip_import_registry``) and build the chip blob the
-        runtime reads — only without a mailbox, since the args are already in this process.
-
         ``args`` is a ``TaskArgs`` or ``None`` (no args). The chip-only POD
         ``ChipStorageTaskArgs`` is not accepted here; this boundary requires address-free ``TaskArgs``.
         """
-        registry = self._chip_import_registry
-        if registry is None:
-            # This worker runs its own chip in-process (no fork, no mailbox): it is its own device
-            # endpoint, so DEVICE backings it materializes must be its own.
-            context = ImportContext(
-                deployment=DEVICE_AICPU,
-                device_owner_instance_id=self._owner_instance_id,
-            )
-            registry = ImportRegistry(context)
-            self._chip_import_registry = registry
+        registry = self._ensure_chip_import_registry()
         if args is None:
             args = TaskArgs()
-        return _materialize_chip_task_args(args, registry)
+        self._validate_host_args(args)
+        local = getattr(self, "_l2_materialize_local", None)
+        target = getattr(local, "target", None) if local is not None else None
+        if target is None:
+            target = getattr(self, "_l2_materialize_target", None)
+        return _materialize_chip_task_args(args, registry, target)
 
     def _run_l2_materialized(self, callable_id: int, args, cfg) -> None:
         """Materialize an L2 leaf's tensor args and run the kernel to completion."""
         _validate_host_control_access(self._callable_registry.get(callable_id), TaskArgs() if args is None else args)
-        chip_args = self._materialize_l2_args(args)
+        self._validate_host_args(TaskArgs() if args is None else args)
+        local = getattr(self, "_l2_materialize_local", None)
+        previous_target = getattr(local, "target", None) if local is not None else None
+        if local is not None:
+            local.target = self._callable_registry.get(callable_id)
+        try:
+            chip_args = self._materialize_l2_args(args)
+        finally:
+            if local is not None:
+                local.target = previous_target
         assert self._chip_worker is not None
         self._chip_worker.run_materialized(callable_id, chip_args, cfg)
 

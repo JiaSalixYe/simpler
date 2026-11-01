@@ -103,11 +103,12 @@ it is the resolved `addr` + `size`. That is the whole of what materialization do
 | — | ⟂ | `buffer.addr` |
 | `byte_offset` (bytes) | ≈ | `start_offset` (elements) |
 | `shapes[5]` / `strides[5]` / `ndims` / `dtype` | = | `shapes[5]` / `strides[5]` / `ndims` / `dtype` |
-| `buffer.address_space` | = | `address_space` |
+| `buffer.address_space` + selected mapping | ≈ | `address_space` of the resolved attachment |
+| `mapping_ref` (opaque endpoint-local mapping record) | ⟂ | resolved before the L2 boundary |
 | `TaskArgs.transfer(i)` (per-call metadata) | = | `ChipStorageTaskArgs.tensor(i).transfer` (internal ABI carrier) |
 
 `AddressSpace` describes the backing's physical HOST/DEVICE location. `Tensor` holds
-only the backing descriptor and view geometry. `TensorTransfer` belongs to each
+the backing descriptor, view geometry, and an explicit mapping reference. `TensorTransfer` belongs to each
 TaskArgs entry: `NONE` borrows storage, `H2D` requests Program-managed device storage,
 and `D2H` is reserved and rejected. Callable direction still controls input copies
 and output copy-back; H2D does not mean every argument is copied in. Buffer identity,
@@ -129,6 +130,18 @@ changes `view`. Omitted transfer in `TaskArgs.add_tensor` or the transitional L2
 Mailbox slots preserve each request in byte 141, formerly reserved view padding;
 standalone Tensor values do not carry it. Re-export and L2 materialization preserve
 the request alongside the view. Chip binders accept HOST/H2D and DEVICE/NONE.
+
+An explicit mapping uses byte 142 of the same 144-byte Tensor; zero selects the
+native view. The source descriptor and canonical identity remain unchanged. Each
+`Worker.map_view` request issues a restricted record in the target's
+`ImportRegistry`. References increase monotonically from 1 through 255 per backing;
+they encode neither rank nor access, are never reused, and fail explicitly on
+exhaustion. The adapter resolves `(identity, mapping_ref)` only against a confirmed,
+live record for the current execution environment, extent and access. A mapped
+Tensor cannot switch references through `_with_mapping_ref`; native ref 0 remains
+available for CPU access and explicit H2D. Mapped arguments require explicit
+`NONE` and resolve to DEVICE/NONE at the chip boundary. Local mapping references
+are rejected by the remote wire. See the [A5 HostRegister guide](zh-cn/a5-host-register.md).
 HBG also accepts HOST/NONE with a declared IN/OUT/INOUT direction; TMR device
 orchestration returns UNSUPPORTED for it. Invalid location/transfer pairs return
 INVALID_ARGUMENT before tensor content copying or device allocation. HOST/H2D also requires canonical

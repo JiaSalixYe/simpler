@@ -1786,12 +1786,15 @@ ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict re
         throw std::runtime_error("materialize: byte_offset is not a multiple of dtype size");
     }
     nb::object key = nb::cast(r.buffer.identity);
+    if (r.mapping_ref) key = nb::make_tuple(key, r.mapping_ref);
     if (!resolved.contains(key)) {
         throw std::runtime_error("materialize: canonical identity not in the import registry");
     }
     nb::tuple val = nb::cast<nb::tuple>(resolved[key]);
     auto base = nb::cast<uint64_t>(val[0]);
     auto addr_space = nb::cast<int>(val[1]);
+    if (r.mapping_ref && addr_space != static_cast<int>(AddressSpace::DEVICE))
+        throw std::invalid_argument("mapped Tensor requires a DEVICE attachment");
     // The view origin is base + byte_offset (start_offset folded into addr); strides carry any
     // non-row-major layout (transpose / permute / step-slice), which ChipTensor expresses natively.
     return make_tensor_strided(
@@ -2480,6 +2483,20 @@ NB_MODULE(_task_interface, m) {
 
         .def_ro("buffer", &Tensor::buffer)
         .def_ro("byte_offset", &Tensor::byte_offset)
+        .def_ro("mapping_ref", &Tensor::mapping_ref)
+        .def(
+            "_with_mapping_ref",
+            [](const Tensor &self, uint8_t reference) {
+                if (!reference) throw std::invalid_argument("mapping reference must be nonzero");
+                if (self.mapping_ref && self.mapping_ref != reference)
+                    throw std::invalid_argument("mapping reference is immutable; map the native Tensor explicitly");
+                Tensor mapped = self;
+                mapped.mapping_ref = reference;
+                validate_tensor(mapped);
+                return mapped;
+            },
+            nb::arg("reference")
+        )
         .def_ro("ndims", &Tensor::ndims)
         .def_prop_ro(
             "shapes",
@@ -2505,7 +2522,7 @@ NB_MODULE(_task_interface, m) {
             "__eq__",
             [](const Tensor &a, const Tensor &b) {
                 if (!(a.buffer == b.buffer) || a.byte_offset != b.byte_offset || a.ndims != b.ndims ||
-                    a.dtype != b.dtype) {
+                    a.dtype != b.dtype || a.mapping_ref != b.mapping_ref) {
                     return false;
                 }
                 for (uint32_t i = 0; i < a.ndims; ++i) {
@@ -2929,6 +2946,7 @@ NB_MODULE(_task_interface, m) {
             [](const TaskArgs &self) {
                 const int32_t n = self.tensor_count();
                 for (int32_t i = 0; i < n; ++i) {
+                    if (self.tensor(i).mapping_ref) return true;
                     const auto backend = static_cast<BackendKind>(self.tensor(i).buffer.backend_kind);
                     if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW) return true;
                 }
@@ -3638,6 +3656,10 @@ NB_MODULE(_task_interface, m) {
             "retains the binding for explicit finalize and prevents reinitialization."
         )
         .def("finalize", &ChipWorker::finalize)
+        .def("host_register_supported", &ChipWorker::host_register_supported)
+        .def("host_register_map", &ChipWorker::host_register_map, nb::arg("host"), nb::arg("bytes"))
+        .def("host_register_unmap", &ChipWorker::host_register_unmap, nb::arg("host"))
+        .def("host_urma_supported", &ChipWorker::host_urma_supported)
         .def("_validate_execution_context", &ChipWorker::validate_execution_context)
         .def(
             "_validate_caller_stream",
