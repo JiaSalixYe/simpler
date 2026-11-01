@@ -32,13 +32,22 @@ extern "C" int host_register_map_ctx(
         auto *base = reinterpret_cast<void *>(host);
         rc = aclrtHostRegisterV2(base, static_cast<size_t>(bytes), ACL_HOST_REG_MAPPED);
         if (rc != 0) return rc;
-        // Preserve the registration even if obtaining the device address fails:
-        // the caller must be able to unregister it during cleanup.
-        *registered = 1;
         void *address = nullptr;
         rc = aclrtHostGetDevicePointer(base, &address, 0);
-        if (rc != 0) return rc;
-        if (!address) return PTO_RUNTIME_ERR_INTERNAL;
+        if (rc != 0 || !address) {
+            // A failed map must not leave an unowned registration behind. If
+            // this cleanup also fails, return that failure rather than a
+            // successful mapping; no caller can retry an unrecorded range.
+            const aclError cleanup = aclrtHostUnregister(base);
+            if (cleanup != 0) {
+                // Report the registration as pending so ChipWorker retains the
+                // range for an explicit retry instead of losing it.
+                *registered = 1;
+                return cleanup;
+            }
+            return rc != 0 ? rc : PTO_RUNTIME_ERR_INTERNAL;
+        }
+        *registered = 1;
         *mapped = reinterpret_cast<uint64_t>(address);
         return 0;
     } catch (...) {

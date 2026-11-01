@@ -137,9 +137,11 @@ native view. The source descriptor and canonical identity remain unchanged. Each
 `ImportRegistry`. References increase monotonically from 1 through 255 per backing;
 they encode neither rank nor access, are never reused, and fail explicitly on
 exhaustion. The adapter resolves `(identity, mapping_ref)` only against a confirmed,
-live record for the current execution environment, extent and access. A mapped
+live record for the current execution environment, backing extent and access; the
+A5 Worker additionally binds the ref to the native Tensor view it issued. A mapped
 Tensor cannot switch references through `_with_mapping_ref`; native ref 0 remains
-available for CPU access and explicit H2D. Mapped arguments require explicit
+available for CPU access. H2D is a backend-specific path: A5 HostRegister rejects
+native/H2D task arguments and requires an explicit mapped view. Mapped arguments require explicit
 `NONE` and resolve to DEVICE/NONE at the chip boundary. Local mapping references
 are rejected by the remote wire. See the [A5 HostRegister guide](zh-cn/a5-host-register.md).
 HBG also accepts HOST/NONE with a declared IN/OUT/INOUT direction; TMR device

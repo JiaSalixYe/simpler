@@ -35,7 +35,7 @@ class CommDomainRef:
 
 @dataclass(frozen=True)
 class HostWindowSpec:
-    """One local Host allocation shared by the domain's NPU members."""
+    """One local Host allocation for an A5 direct-L2 Worker."""
 
     nbytes: int
     numa_id: int = 0
@@ -56,7 +56,6 @@ class DomainConfig:
     buffers: tuple
     retain_after_run: bool
     topology: tuple
-    host_window: HostWindowSpec | None = None
 
     @classmethod
     def capture(cls, members, window_size, buffers, retain_after_run, topology):

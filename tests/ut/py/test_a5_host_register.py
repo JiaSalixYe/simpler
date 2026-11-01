@@ -107,8 +107,6 @@ def _resource():
         HostWindowSpec(128),
         identity,
         (0,),
-        "a5",
-        0,
         mapping=mapping,
         view_scope=None,
         view_control=None,
@@ -117,7 +115,6 @@ def _resource():
     resource._view_scope = worker.scope
     resource._view_control = worker.control
     resource.allocate()
-    resource.published = True
     return resource, chip, registry, worker
 
 
@@ -127,7 +124,7 @@ def test_a5_hostregister_maps_one_view_and_unmaps_last():
         native = _host_buffer(resource).tensor((32,), DataType.FLOAT32)
         mapped = resource.map_view(native, 0, access=AccessMode.READ)
         assert mapped.mapping_ref and mapped.buffer == native.buffer
-        with pytest.raises(RuntimeError, match="unmap every view"):
+        with pytest.raises(RuntimeError, match="Worker.release_buffer"):
             _host_buffer(resource).close()
         assert mapped.buffer.address_space == AddressSpace.HOST
         assert chip.map_calls and chip.map_calls[0][0] == _host_buffer(resource).base
@@ -201,7 +198,7 @@ def test_a5_hostregister_unsupported_is_explicit():
 
     mapping = A5HostRegisterEntry(UnsupportedChip())
     with pytest.raises(RuntimeError, match="HostRegister is not supported"):
-        mapping.allocate(HostWindowSpec(128), SimpleNamespace(owner_instance_id=b"o", buffer_id=1, generation=1), 0, 1)
+        mapping.allocate(HostWindowSpec(128), SimpleNamespace(owner_instance_id=b"o", buffer_id=1, generation=1))
 
 
 def test_a5_urma_skeleton_never_falls_back():
@@ -222,7 +219,7 @@ def test_worker_host_window_lifecycle_uses_host_register():
         level=2,
         platform="a5",
         runtime="tensormap_and_ringbuffer",
-        device_ids=[0],
+        device_id=0,
     )
     worker._chip_worker = chip
     worker._lifecycle = _Lifecycle.READY
@@ -233,11 +230,11 @@ def test_worker_host_window_lifecycle_uses_host_register():
         mapped = worker.map_view(native, access=AccessMode.READ)
         args = TaskArgs()
         args.add_tensor(mapped, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
-        worker._l2_materialize_target = SimpleNamespace(sig_count=1, sig=lambda _index: ArgDirection.IN)
+        worker._l2_materialize_local.target = SimpleNamespace(sig_count=1, sig=lambda _index: ArgDirection.IN)
         try:
             materialized = worker._materialize_l2_args(args)
         finally:
-            worker._l2_materialize_target = None
+            worker._l2_materialize_local.target = None
         assert materialized.tensor(0).data == 0x8000
         with pytest.raises(RuntimeError, match="unmap every mapped view"):
             worker.release_buffer(buffer)
@@ -270,6 +267,8 @@ class TestMappedTensorContract:
             assert mapped.mapping_ref == 1 and native.mapping_ref == 0
             with pytest.raises(ValueError, match="immutable"):
                 mapped._with_mapping_ref(2)
+            with pytest.raises(ValueError, match="nonzero"):
+                native._with_mapping_ref(0)
             with pytest.raises(ValueError, match="transfer NONE"):
                 TaskArgs().add_tensor(mapped, TensorArgType.INPUT)
         finally:
@@ -308,7 +307,7 @@ def test_worker_refuses_missing_hostregister_without_fallback():
         def host_register_supported(self):
             return False
 
-    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_ids=[0])
+    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_id=0)
     worker._chip_worker = UnsupportedChip()
     worker._lifecycle = _Lifecycle.READY
     try:
@@ -322,7 +321,7 @@ def test_worker_refuses_missing_hostregister_without_fallback():
 
 def test_worker_release_refuses_inflight_host_use_then_retries():
     chip = FakeChip()
-    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_ids=[0])
+    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_id=0)
     worker._chip_worker = chip
     worker._lifecycle = _Lifecycle.READY
     try:
@@ -340,7 +339,7 @@ def test_worker_release_refuses_inflight_host_use_then_retries():
 
 
 def test_worker_refuses_hostregister_on_a5sim_without_fallback():
-    worker = Worker(level=2, platform="a5sim", runtime="host_build_graph", device_ids=[0])
+    worker = Worker(level=2, platform="a5sim", runtime="host_build_graph", device_id=0)
     worker._lifecycle = _Lifecycle.READY
     try:
         with pytest.raises(ValueError, match="requires the a5 platform"):
@@ -377,7 +376,7 @@ def test_worker_l2_submit_accepts_mapped_host_argument():
             return SimpleNamespace()
 
     chip = SubmitChip()
-    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_ids=[0])
+    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_id=0)
     worker._chip_worker = chip
     worker._lifecycle = _Lifecycle.READY
     worker._callable_registry[3] = SimpleNamespace(
@@ -405,7 +404,7 @@ def test_worker_l2_submit_accepts_mapped_host_argument():
 
 def test_worker_refuses_numa_placement_for_hostregister():
     chip = FakeChip()
-    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_ids=[0])
+    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_id=0)
     worker._chip_worker = chip
     worker._lifecycle = _Lifecycle.READY
     try:
@@ -414,3 +413,160 @@ def test_worker_refuses_numa_placement_for_hostregister():
     finally:
         worker._close_chip_import_registry()
         worker._lifecycle = _Lifecycle.CLOSED
+
+
+def test_worker_close_reclaims_mapped_host_domain():
+    chip = FakeChip()
+    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_id=0)
+    worker._chip_worker = chip
+    worker._lifecycle = _Lifecycle.READY
+    try:
+        buffer = worker.create_buffer(128, host_window=HostWindowSpec(128))
+        mapped = worker.map_view(buffer.tensor((32,), DataType.FLOAT32), access=AccessMode.READ)
+        base = buffer.base
+        worker._release_all_direct_host_domains()
+        assert not worker._direct_host_domains
+        assert chip.unmapped == [int(base)]
+        assert buffer.closed
+        assert mapped.mapping_ref
+    finally:
+        worker._close_chip_import_registry()
+        worker._lifecycle = _Lifecycle.CLOSED
+
+
+def test_worker_refuses_borrowed_context_for_hostregister():
+    class BorrowedChip(FakeChip):
+        def __init__(self):
+            super().__init__()
+            self.environment = (os.getpid(), 1, 1, 0, True)
+            self._execution_environment = self.environment
+
+    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_id=0)
+    worker._chip_worker = BorrowedChip()
+    worker._lifecycle = _Lifecycle.READY
+    try:
+        with pytest.raises(RuntimeError, match="borrowed context"):
+            worker.create_buffer(128, host_window=HostWindowSpec(128))
+    finally:
+        worker._close_chip_import_registry()
+        worker._lifecycle = _Lifecycle.CLOSED
+
+
+def test_worker_close_reclaims_mapped_host_domain_through_teardown():
+    class CloseChip(FakeChip):
+        def workspace_report(self):
+            return ("disabled", None)
+
+        def finalize(self):
+            return None
+
+    chip = CloseChip()
+    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_id=0)
+    worker._chip_worker = chip
+    worker._lifecycle = _Lifecycle.READY
+    buffer = worker.create_buffer(128, host_window=HostWindowSpec(128))
+    mapped = worker.map_view(buffer.tensor((32,), DataType.FLOAT32), access=AccessMode.READ)
+    try:
+        worker.close()
+        assert chip.unmapped == [int(buffer.base)]
+        assert not worker._direct_host_domains
+        assert buffer.closed
+        assert mapped.mapping_ref
+        assert not worker._cleanup_journal
+    finally:
+        worker._close_chip_import_registry()
+
+
+def test_failed_second_map_does_not_invalidate_live_sibling(monkeypatch):
+    resource, chip, registry, _worker = _resource()
+    try:
+        native = _host_buffer(resource).tensor((32,), DataType.FLOAT32)
+        first = resource.map_view(native, 0, access=AccessMode.READ)
+        original = registry.register_attachment
+
+        def fail_second(*args, **kwargs):
+            if kwargs.get("mapping_ref") == 2:
+                raise ValueError("injected registration failure")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(registry, "register_attachment", fail_second)
+        with pytest.raises(ValueError, match="injected registration failure"):
+            resource.map_view(native, 0, access=AccessMode.READ)
+        assert registry.resolve_tensor(first).base == 0x8000
+        assert chip.unmapped == []
+        resource.unmap_view(first)
+        assert chip.unmapped == [int(_host_buffer(resource).base)]
+        resource.close()
+    finally:
+        if not resource.closed:
+            resource._mapping_targets.clear()
+            resource.close()
+
+
+def test_host_buffer_direct_close_is_refused_even_when_unmapped():
+    resource, _chip, _registry, _worker = _resource()
+    try:
+        with pytest.raises(RuntimeError, match="Worker.release_buffer"):
+            _host_buffer(resource).close()
+        resource.close()
+    finally:
+        if not resource.closed:
+            resource.close()
+
+
+def test_mapping_ref_is_bound_to_the_issued_view():
+    resource, chip, _registry, _worker = _resource()
+    try:
+        buffer = _host_buffer(resource)
+        native = buffer.tensor((32,), DataType.FLOAT32)
+        mapped = resource.map_view(native, 0, access=AccessMode.READ)
+        forged = buffer.tensor((16,), DataType.FLOAT32)._with_mapping_ref(mapped.mapping_ref)
+        with pytest.raises(ValueError, match="live explicit mapping|not the view"):
+            resource.validate(forged, 0)
+        with pytest.raises(ValueError, match="not the view"):
+            resource.unmap_view(forged)
+        resource.unmap_view(mapped)
+        assert chip.unmapped == [int(buffer.base)]
+        resource.close()
+    finally:
+        if not resource.closed:
+            resource._mapping_targets.clear()
+            resource.close()
+
+
+def test_worker_exposes_urma_capability_without_fallback():
+    chip = FakeChip()
+    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_id=0)
+    worker._chip_worker = chip
+    worker._lifecycle = _Lifecycle.READY
+    try:
+        assert worker.host_transport_capability() is False
+        chip.host_urma_supported = lambda: True
+        assert worker.host_transport_capability() is True
+    finally:
+        worker._close_chip_import_registry()
+        worker._lifecycle = _Lifecycle.CLOSED
+
+
+def test_failed_map_with_failed_cleanup_is_retried_by_close(monkeypatch):
+    resource, chip, registry, _worker = _resource()
+    try:
+        native = _host_buffer(resource).tensor((32,), DataType.FLOAT32)
+
+        def fail_registration(*_args, **_kwargs):
+            raise ValueError("injected registration failure")
+
+        monkeypatch.setattr(registry, "register_attachment", fail_registration)
+        chip.unmap_error = RuntimeError("injected cleanup failure")
+        with pytest.raises(ValueError, match="injected registration failure"):
+            resource.map_view(native, 0, access=AccessMode.READ)
+        assert resource._mapping_targets
+        chip.unmap_error = None
+        resource.close()
+        assert not resource._mapping_targets
+        assert chip.unmapped == [int(_host_buffer(resource).base)]
+    finally:
+        chip.unmap_error = None
+        if not resource.closed:
+            resource._mapping_targets.clear()
+            resource.close()

@@ -112,7 +112,8 @@ requires matching torch/torch_npu/CANN and does not enable capture submission.
 | `map_view(tensor, *, target=None, access=AccessMode.READWRITE) -> Tensor` | A5 direct L2 HostRegister only; registers one restricted device mapping for the current target and returns a new mapped Tensor without changing the native view or canonical identity |
 | `unmap_view(tensor) -> None` | Revokes one issued A5 HostRegister mapping after accepted uses finish; the last active record unregisters the host memory and retains the CPU backing |
 | `release_buffer(buffer)` | Releases the original Host Buffer only after every mapped view is unmapped and accepted uses finish; a borrowed alias cannot release it |
-| `Buffer.close()` | Revokes new use of that handle. A HostRegister Buffer borrows its physical allocation: use `release_buffer` for backing cleanup after unmapping views |
+| `Buffer.close()` | Revokes new use of that handle. An A5 HostRegister Buffer is Worker-owned and refuses direct close; use `release_buffer` after unmapping views |
+| `host_transport_capability() -> bool` | A5 direct L2: whether the optional URMA transport backend is available in the loaded runtime; it does not enable HostRegister fallback |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
 
 A partial update names the **whole allocation plus an offset** — `copy_to(dev, src,

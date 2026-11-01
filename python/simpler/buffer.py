@@ -342,7 +342,7 @@ class Buffer:
     # a field it changes stays visible to the provenance comparison that rejects it.
     _descriptor: BufferDescriptor | None = field(default=None, init=False, compare=False, repr=False)
 
-    _source_registration: tuple[_DeviceBufferSource, CanonicalIdentity] | None = field(
+    _source_registration: tuple[Any, CanonicalIdentity] | None = field(
         default=None, init=False, compare=False, repr=False
     )
 
@@ -412,9 +412,11 @@ class Buffer:
 
         Domain Host handles borrow storage from their resource owner: close only
         revokes this handle; domain.release / Worker.release_buffer performs view
-        and backing cleanup after accepted users finish. A profile or alias does
-        not transfer ownership. Directly owned shared storage is unlinked so a later
-        consumer map fails rather than resolving a name whose bytes are gone. Idempotent;
+        and backing cleanup after accepted users finish. An A5 HostRegister Buffer
+        is Worker-owned and refuses direct close; use Worker.release_buffer. A
+        profile or alias does not transfer ownership. Directly owned shared
+        storage is unlinked so a later consumer map fails rather than resolving a
+        name whose bytes are gone. Idempotent;
         a released Buffer's ``tensor()``/
         ``to_descriptor()`` are refused rather than building a view over memory that may already be
         gone — that refusal holds from the first call on, whether or not the release itself
@@ -1327,8 +1329,9 @@ class ImportRegistry:
             if t.buffer.address_space == AddressSpace.DEVICE or t.mapping_ref:
                 # Depth behind the submit-time endpoint check: this process is a host compute leaf, so
                 # a device address here would be handed to torch as a host pointer.
+                kind = "DEVICE-space" if t.buffer.address_space == AddressSpace.DEVICE else "mapped"
                 raise ValueError(
-                    f"sub-worker argument {i} is a DEVICE-space tensor "
+                    f"sub-worker argument {i} is a {kind} tensor "
                     f"({t.buffer.backend_kind.name}); it cannot be mapped into a host process"
                 )
             tensors.append(MappedArg(self.resolve_tensor(t), t.byte_offset, t.shapes, t.strides, t.dtype))

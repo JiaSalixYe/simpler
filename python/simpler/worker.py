@@ -276,7 +276,7 @@ from .global_comm_domain import (
     validate_descriptor_table,
 )
 from .host_domain import HostDomainResource
-from .host_domain_backend import A5HostRegisterEntry
+from .host_domain_backend import A5HostRegisterEntry, A5UrmaBackend
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
 from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
@@ -12594,8 +12594,11 @@ class Worker:
         failure = self._child_alloc.check_dispatch(device_args, target_worker_id)
         if failure is None:
             return
-        arg_index, reason = failure
-        identity = device_args.tensor(arg_index).buffer.identity
+        filtered_index, reason = failure
+        identity = device_args.tensor(filtered_index).buffer.identity
+        arg_index = next(
+            (i for i in range(args.tensor_count()) if args.tensor(i).buffer.identity == identity), filtered_index
+        )
         if reason == PROV_NOT_LIVE:
             raise ValueError(
                 f"orch.{api}: device argument (arg {arg_index}, {identity}) is not a live "
@@ -13190,6 +13193,9 @@ class Worker:
         chip = self._chip_worker
         if chip is None:
             raise RuntimeError("A5 HostRegister requires an initialized Worker")
+        environment = getattr(chip, "_execution_environment", None)
+        if environment is not None and len(environment) >= 5 and environment[4]:
+            raise RuntimeError("A5 HostRegister requires an owned execution context; borrowed context is unsupported")
         if not chip.host_register_supported():
             raise RuntimeError("A5 HostRegister is not supported by this runtime")
         identity = self._burn_buffer_identity()
@@ -13198,23 +13204,25 @@ class Worker:
             spec,
             identity,
             (0,),
-            self._config["platform"],
-            self._config["device_ids"][0],
             mapping=mapping,
             view_scope=self._host_view_scope,
             view_control=self._control_host_view,
         )
         self._direct_host_domains[identity] = (resource, mapping)
-        self._cleanup_journal.add_once("host-domain", str(identity.buffer_id), resource.close)
         try:
             resource.allocate()
-            resource.published = True
             if resource.buffer is None:
                 raise RuntimeError("A5 HostRegister allocation returned no Buffer")
             return resource.buffer
         except BaseException:
             self._release_direct_host_domain(identity, raise_on_failure=False)
             raise
+
+    def host_transport_capability(self) -> bool:
+        """Whether the A5 URMA transport backend is available for this Worker."""
+        if self.level != 2 or self._chip_worker is None:
+            return False
+        return A5UrmaBackend(self._chip_worker).capability()
 
     def map_view(self, tensor: Tensor, *, target=None, access=AccessMode.READWRITE) -> Tensor:
         """Establish a restricted A5 HostRegister device mapping for one view."""
@@ -13234,6 +13242,30 @@ class Worker:
             raise ValueError("unmap_view requires an A5 Host buffer allocated by this Worker")
         entry[0].unmap_view(tensor)
 
+    def _release_all_direct_host_domains(self) -> None:
+        """Reclaim every direct-L2 HostRegister domain at Worker close.
+
+        Teardown has already drained accepted runs, so a mapped view can no
+        longer have a live consumer. Revoke each view explicitly rather than
+        relying on Buffer.close, then release the CPU backing.
+        """
+        errors: list[BaseException] = []
+        for identity, entry in list(getattr(self, "_direct_host_domains", {}).items()):
+            resource, _mapping = entry
+            try:
+                with self._child_prov_worker_lock(0), self._registry_lock:
+                    resource.close(force=True)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+                continue
+            del self._direct_host_domains[identity]
+        chip = self._chip_worker
+        retry = getattr(chip, "retry_host_register_cleanup", None)
+        if retry is not None and not retry():
+            errors.append(RuntimeError("A5 HostRegister cleanup is pending; retry after the device is available"))
+        if errors:
+            raise errors[0]
+
     def _release_direct_host_domain(self, identity, *, raise_on_failure: bool = True) -> None:
         entry = getattr(self, "_direct_host_domains", {}).get(identity)
         if entry is None:
@@ -13247,7 +13279,6 @@ class Worker:
                     raise RuntimeError("A5 Host backing still referenced by an in-flight L2 run")
                 resource.close()
             del self._direct_host_domains[identity]
-            self._cleanup_journal.discard("host-domain", str(identity.buffer_id))
         except BaseException:
             if raise_on_failure:
                 raise
@@ -13281,6 +13312,9 @@ class Worker:
         materializes it lazily on first receipt (map-once, keyed by canonical identity). At L3+ that
         consumer is a forked child; at L2 (a leaf, no children) the Worker itself materializes the
         tensor in-process on ``run``. Build a tensor over ``buffer.shm.buf`` with the buffer protocol.
+        With ``host_window`` on an owned direct-L2 A5 Worker, the same POSIX-shm
+        backing is registered through A5 HostRegister on first ``map_view``. The
+        native Tensor is CPU-only; device arguments need a mapped view.
         Not thread-safe against a concurrent run/create/free on the same Worker.
         """
         if self.level < 2:
@@ -13471,7 +13505,12 @@ class Worker:
 
         The slot is dropped only when it still holds *this* buffer: a buffer_id minted elsewhere can
         collide with a registry key, and evicting the live entry it names would strand that
-        backing."""
+        backing.
+
+        A5 HostRegister Buffers take the Host branch: every mapped view must be
+        unmapped and no accepted L2 run may still name the identity. The Worker
+        owns the registration and CPU backing, so ``Buffer.close()`` is refused.
+        """
         host_entry = getattr(self, "_direct_host_domains", {}).get(buffer.identity)
         if host_entry is not None:
             if host_entry[0].buffer is not buffer:
@@ -14350,8 +14389,6 @@ class Worker:
         self._validate_host_args(args)
         local = getattr(self, "_l2_materialize_local", None)
         target = getattr(local, "target", None) if local is not None else None
-        if target is None:
-            target = getattr(self, "_l2_materialize_target", None)
         return _materialize_chip_task_args(args, registry, target)
 
     def _run_l2_materialized(self, callable_id: int, args, cfg) -> None:
@@ -15049,6 +15086,7 @@ class Worker:
             ("domain", "all Global CommDomains", self._release_all_live_global_domains),
             ("domain", "Global CommDomain nodes", self._release_all_global_domain_nodes),
             ("domain", "all CommDomains", self._release_all_live_domains),
+            ("host-domain", "all direct Host domains", self._release_all_direct_host_domains),
             ("provenance", "child allocation provenance", self._clear_child_prov),
             ("remote", "active remote slot references", self._release_active_remote_slot_refs),
             ("remote", "pending remote frees", self._flush_pending_remote_frees),

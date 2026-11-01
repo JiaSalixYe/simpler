@@ -373,6 +373,15 @@ public:
     /// remaining life, for a run whose last device consumer is unproven.
     void release_caller_device_borrow(uint64_t borrow_id, bool keep) noexcept;
 
+    /// Optional A5 HostRegister mapping. These return false/raise when the
+    /// loaded runtime does not implement the optional HostRegister entry
+    /// points; they never substitute another transport.
+    bool host_register_supported() const;
+    uint64_t host_register_map(uint64_t host, uint64_t bytes) const;
+    void host_register_unmap(uint64_t host) const;
+    bool retry_host_register_cleanup();
+    bool host_urma_supported() const;
+
     /// Distributed communication primitives (optional — only available when
     /// the bound runtime exports comm_*).  Wraps the backend-neutral C API
     /// defined in src/<arch>/platform/include/host/comm.h.
@@ -389,13 +398,6 @@ public:
     ///
     /// Multi-domain bootstrap allocates a hidden base communicator plus one
     /// symmetric pool, then derives per-domain views with comm_derive_context.
-    /// Optional A5 HostRegister mapping. These return false/raise when the
-    /// loaded runtime does not implement the optional HostRegister entry
-    /// points; they never substitute another transport.
-    bool host_register_supported() const;
-    uint64_t host_register_map(uint64_t host, uint64_t bytes) const;
-    void host_register_unmap(uint64_t host) const;
-    bool host_urma_supported() const;
     uint64_t comm_init(int rank, int nranks, const std::string &rootinfo_path);
     uint64_t comm_alloc_windows(uint64_t comm_handle, size_t win_size);
     uint64_t comm_get_local_window_base(uint64_t comm_handle);
@@ -643,6 +645,7 @@ private:
     HostRegisterMapFn host_register_map_fn_ = nullptr;
     HostRegisterUnmapFn host_register_unmap_fn_ = nullptr;
     HostUrmaCapabilityFn host_urma_capability_fn_ = nullptr;
+    mutable std::vector<uint64_t> host_register_cleanup_pending_;
     CreateDeviceContextFn create_device_context_fn_ = nullptr;
     DestroyDeviceContextFn destroy_device_context_fn_ = nullptr;
     DeviceMallocCtxFn device_malloc_ctx_fn_ = nullptr;

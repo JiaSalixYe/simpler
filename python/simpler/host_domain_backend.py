@@ -29,7 +29,6 @@ class A5HostRegisterEntry:
     """The HostRegister backend paired with its per-view mapping operations."""
 
     profile = AdapterProfile.HOST_SVM_MAP
-    attachment_profile = AdapterProfile.HOST_SVM_MAP
 
     def __init__(self, chip_worker):
         self.chip = chip_worker
@@ -42,7 +41,7 @@ class A5HostRegisterEntry:
         if os.getpid() != self._pid:
             raise RuntimeError("A5 HostRegister mapping belongs to another process")
 
-    def allocate(self, spec, identity, device, rank_count) -> Buffer:
+    def allocate(self, spec, identity) -> Buffer:
         self._check_process()
         if not getattr(self.chip, "host_register_supported", lambda: False)():
             raise RuntimeError("A5 HostRegister is not supported by this runtime")
@@ -70,16 +69,6 @@ class A5HostRegisterEntry:
         cw.host_register_unmap(int(host_base))
 
 
-class SharedHostBacking:
-    """A5 simulator has no HostRegister capability; it is never a silent fallback."""
-
-    profile = AdapterProfile.HOST_SHM_MAP
-    attachment_profile = AdapterProfile.HOST_SHM_MAP
-
-    def __init__(self, chip_worker):
-        raise RuntimeError("A5 HostRegister is not implemented for the a5 simulator")
-
-
 class A5UrmaBackend:
     """Transport skeleton only; no local mapping or data path is implemented."""
 
@@ -98,13 +87,3 @@ class A5UrmaBackend:
 
     def wait(self, *args, **kwargs):
         raise HostTransportUnsupported("A5 URMA transport is not qualified or not compiled")
-
-
-_HOST_BACKENDS = {"a5": A5HostRegisterEntry, "a5sim": SharedHostBacking}
-
-
-def host_backing_type(platform):
-    try:
-        return _HOST_BACKENDS[platform]
-    except KeyError:
-        raise ValueError(f"HostRegister backing is not implemented for {platform!r}") from None

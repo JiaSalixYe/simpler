@@ -850,6 +850,11 @@ void ChipWorker::finalize() {
 }
 
 void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
+    host_register_supported_fn_ = nullptr;
+    host_register_map_fn_ = nullptr;
+    host_register_unmap_fn_ = nullptr;
+    host_urma_capability_fn_ = nullptr;
+    host_register_cleanup_pending_.clear();
     create_device_context_fn_ = nullptr;
     simpler_init_fn_ = nullptr;
     destroy_device_context_fn_ = nullptr;
@@ -2312,23 +2317,37 @@ uint64_t ChipWorker::host_register_map(uint64_t host, uint64_t bytes) const {
         if (registered != 0) {
             const int cleanup = host_register_unmap_fn_(device_ctx_, device_id_, host);
             if (cleanup != 0) {
+                host_register_cleanup_pending_.push_back(host);
                 throw std::runtime_error(
-                    "A5 HostRegister map failed with code " + std::to_string(rc) + " and cleanup failed with code " +
-                    std::to_string(cleanup)
+                    "A5 HostRegister map failed with code " + std::to_string(rc) +
+                    " and cleanup is pending with code " + std::to_string(cleanup)
                 );
             }
         }
         throw std::runtime_error("A5 HostRegister map failed with code " + std::to_string(rc));
     }
     if (!registered || mapped == 0) {
-        if (registered != 0) host_register_unmap_fn_(device_ctx_, device_id_, host);
+        if (registered != 0 && host_register_unmap_fn_(device_ctx_, device_id_, host) != 0) {
+            host_register_cleanup_pending_.push_back(host);
+        }
         throw std::runtime_error("A5 HostRegister map returned no device address");
     }
     return mapped;
 }
 
+bool ChipWorker::retry_host_register_cleanup() {
+    if (host_register_cleanup_pending_.empty()) return true;
+    if (device_ctx_ == nullptr || host_register_unmap_fn_ == nullptr) return false;
+    std::vector<uint64_t> remaining;
+    for (const uint64_t host : host_register_cleanup_pending_) {
+        if (host_register_unmap_fn_(device_ctx_, device_id_, host) != 0) remaining.push_back(host);
+    }
+    host_register_cleanup_pending_ = std::move(remaining);
+    return host_register_cleanup_pending_.empty();
+}
+
 void ChipWorker::host_register_unmap(uint64_t host) const {
-    if (host_register_unmap_fn_ == nullptr) {
+    if (device_ctx_ == nullptr || host_register_unmap_fn_ == nullptr) {
         throw std::runtime_error("A5 HostRegister unmap is not supported by this runtime");
     }
     const int rc = host_register_unmap_fn_(device_ctx_, device_id_, host);

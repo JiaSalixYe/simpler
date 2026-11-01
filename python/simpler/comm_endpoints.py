@@ -605,12 +605,10 @@ class AdapterKind(str, Enum):
 class AdapterProfile(str, Enum):
     """How a consumer reaches a Buffer — the mechanism, not the wire backend tag."""
 
-    # The generic region planner does not infer Host registration from a backing alone.
+    # A5 HostRegister is the confirmed producer for a direct device consumer;
+    # the generic region planner still does not infer it from a backing alone.
     HOST_SVM_MAP = "HOST_SVM_MAP"
     HOST_VMM_COPY = "HOST_VMM_COPY"
-    # Process-local owner binding registered after allocation, not a region-planner
-    # candidate or a GlobalDomainCommand profile. It has no wire profile id.
-    HOST_VMM_MAP = "HOST_VMM_MAP"
     DEVICE_VMM_PEER_IMPORT = "DEVICE_VMM_PEER_IMPORT"
     DEVICE_FABRIC_V2_PEER_IMPORT = "DEVICE_FABRIC_V2_PEER_IMPORT"
     REMOTE_COPY = "REMOTE_COPY"
@@ -1085,23 +1083,12 @@ def buffer_adapter_candidates(query: BufferAccessQuery) -> tuple[_AdapterCandida
         profile = query.confirmed_profile
         device = query.consumer_deployment in (DEVICE_AICORE, DEVICE_AICPU)
         supported = (
-            query.source_address_space == AddressSpace.HOST
+            profile is AdapterProfile.HOST_SVM_MAP
+            and device
+            and query.source_address_space == AddressSpace.HOST
             and query.same_node
+            and query.platform == "a5"
             and query.runtime in ("host_build_graph", "tensormap_and_ringbuffer")
-            and (
-                (profile is AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT and device and query.platform == "a2a3")
-                or (profile is AdapterProfile.HOST_SVM_MAP and device and query.platform == "a5")
-                or (
-                    profile is AdapterProfile.HOST_SHM_MAP
-                    and query.consumer_deployment in (HOST_CPU, DEVICE_AICORE, DEVICE_AICPU)
-                    and query.platform == "a2a3sim"
-                )
-                or (
-                    profile is AdapterProfile.HOST_VMM_MAP
-                    and query.consumer_deployment is HOST_CPU
-                    and query.platform == "a2a3"
-                )
-            )
         )
         return (
             _AdapterCandidate(

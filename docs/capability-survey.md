@@ -59,7 +59,7 @@ shared across a device's AICPU/AICore tiers but exclusive per `device_id`.
 | `PLATFORM_MAX_BLOCKDIM` | 24 → 72 cores | 36 → 108 cores |
 | AICPU cores per die | 2 clusters × 4 = 8 (`src/a2a3/docs/hardware.md:30-32`) | 2 clusters × 2 = 4 (`src/a5/docs/hardware.md:17-19`) |
 | AICPU threads | max 4, launch bound 6 | max 7, launch bound 14 (7 physical × SMT) |
-| Host-map (SVM) | `halHostRegister(DEV_SVM_MAP_HOST)`, dlsym'd (`src/a2a3/platform/onboard/host/device_runner.cpp:78-102`) | not overridden |
+| Host-map (SVM) | `halHostRegister(DEV_SVM_MAP_HOST)`, dlsym'd (`src/a2a3/platform/onboard/host/device_runner.cpp:78-102`) | `aclrtHostRegisterV2(ACL_HOST_REG_MAPPED)` in the A5 host runtime (direct-L2 HostRegister) |
 | Comm window | Fabric V2 handles, VMM-IPC fallback | VMM shareable handles only |
 
 Two numbers surprise readers who skip the arch docs: the default

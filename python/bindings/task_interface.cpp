@@ -1775,8 +1775,8 @@ CtypesFormat classify_ctypes_format(const char *format) {
 }
 
 // Resolve one wire tensor onto a local base and build the address-bearing device POD.
-// `resolved` maps CanonicalIdentity -> (local_base, address_space); the caller populates it by
-// materializing each embedded descriptor.
+// `resolved` maps CanonicalIdentity (native) or (CanonicalIdentity, mapping_ref) (mapped) to
+// (local_base, address_space); the caller populates it by materializing each selected view.
 ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict resolved) {
     uint64_t elem = get_element_size(r.dtype);
     if (elem == 0) {
@@ -1788,7 +1788,7 @@ ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict re
     nb::object key = nb::cast(r.buffer.identity);
     if (r.mapping_ref) key = nb::make_tuple(key, r.mapping_ref);
     if (!resolved.contains(key)) {
-        throw std::runtime_error("materialize: canonical identity not in the import registry");
+        throw std::runtime_error("materialize: selected identity/attachment not in the import registry");
     }
     nb::tuple val = nb::cast<nb::tuple>(resolved[key]);
     auto base = nb::cast<uint64_t>(val[0]);
@@ -3659,6 +3659,7 @@ NB_MODULE(_task_interface, m) {
         .def("host_register_supported", &ChipWorker::host_register_supported)
         .def("host_register_map", &ChipWorker::host_register_map, nb::arg("host"), nb::arg("bytes"))
         .def("host_register_unmap", &ChipWorker::host_register_unmap, nb::arg("host"))
+        .def("retry_host_register_cleanup", &ChipWorker::retry_host_register_cleanup)
         .def("host_urma_supported", &ChipWorker::host_urma_supported)
         .def("_validate_execution_context", &ChipWorker::validate_execution_context)
         .def(
@@ -4225,9 +4226,9 @@ NB_MODULE(_task_interface, m) {
         "Materialize a TaskArgs held in this process into the runtime.so-ABI ChipStorageTaskArgs "
         "POD — the sole path to that POD, whether the args are an L2 leaf's own or a chip child's "
         "read back from its mailbox with read_args_from_blob. Each tensor's embedded buffer "
-        "identity is resolved via `resolved` {CanonicalIdentity: (local_base, address_space)}; "
-        "addr = base + byte_offset. The caller pre-populates `resolved` by materializing each "
-        "embedded descriptor on first receipt. Strided views (transpose / permute / step-slice) "
+        "identity is resolved via `resolved` {CanonicalIdentity or (CanonicalIdentity, mapping_ref): "
+        "(local_base, address_space)}; addr = base + byte_offset. The caller pre-populates `resolved` "
+        "by materializing each selected view on first receipt. Strided views (transpose / permute / step-slice) "
         "materialize to strided ChipTensors. Rejects an unknown identity and a non-dtype-aligned "
         "byte_offset."
     );

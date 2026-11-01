@@ -14,7 +14,6 @@ resource and grant-registration helpers are not public APIs.
 
 from __future__ import annotations
 
-import ctypes
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -23,7 +22,7 @@ from .comm_domain import HostWindowSpec
 
 
 class _BufferCloseGuard:
-    """Refuse direct Buffer.close/unlink while a device mapping still borrows it."""
+    """Refuse direct Buffer.close; the Worker owns Host backing release."""
 
     def __init__(self, resource):
         self.resource = resource
@@ -33,8 +32,7 @@ class _BufferCloseGuard:
             raise ValueError("Host Buffer descriptor identity differs from its resource")
 
     def close(self, _identity) -> None:
-        if self.resource._mapping_targets:
-            raise RuntimeError("Host Buffer is mapped; unmap every view before closing it")
+        raise RuntimeError("Host Buffer is owned by its Worker; use Worker.release_buffer")
 
 
 @dataclass
@@ -68,19 +66,14 @@ class HostDomainView:
             raise RuntimeError("Host mapping cleanup is unconfirmed")
         if not self.mapped_base:
             self.mapped_base = self.mapping.attach(cw, self.host_base, self.descriptor.nbytes)
-        try:
-            registry.register_attachment(
-                self.descriptor,
-                self.mapped_base,
-                mapping_ref=reference,
-                access=access,
-                profile=self.mapping.profile,
-                live=lambda: self.owner_live() and not self.closing and bool(self.mapped_base),
-            )
-        except BaseException:
-            # A failed registration can follow a committed native import.
-            self.closing = True
-            raise
+        registry.register_attachment(
+            self.descriptor,
+            self.mapped_base,
+            mapping_ref=reference,
+            access=access,
+            profile=self.mapping.profile,
+            live=lambda: self.owner_live() and not self.closing and bool(self.mapped_base),
+        )
 
 
 class HostDomainResource:
@@ -95,8 +88,6 @@ class HostDomainResource:
         spec: HostWindowSpec,
         identity,
         workers,
-        platform,
-        device,
         *,
         mapping,
         view_scope,
@@ -105,27 +96,27 @@ class HostDomainResource:
         self.spec = spec
         self.identity = identity
         self.workers = tuple(workers)
-        self.device = device
-        self.platform = platform
         self.mapping = mapping
         self.buffer: Buffer | None = None
         self._descriptor = None
-        self.published = False
-        self.views_released = False
         self.closed = False
         self._view_scope = view_scope
         self._view_control = view_control
         self._direct_view: HostDomainView | None = None
         self._next_reference = 1
         self._mapping_targets: dict[int, tuple[int, bool]] = {}
+        self._mapping_views: dict[int, tuple] = {}
         self._revoked_refs: set[int] = set()
 
+    @staticmethod
+    def _view_key(tensor: Tensor) -> tuple:
+        return (tuple(tensor.shapes), tuple(tensor.strides), int(tensor.dtype), int(tensor.byte_offset))
+
     def allocate(self):
-        buffer = self.mapping.backend.allocate(self.spec, self.identity, self.device, len(self.workers))
+        buffer = self.mapping.backend.allocate(self.spec, self.identity)
         self.buffer = buffer
         buffer._source_registration = (_BufferCloseGuard(self), self.identity)
         self._descriptor = buffer.to_descriptor()
-        self.views_released = not self._mapping_targets
         self._direct_view = HostDomainView(
             self._descriptor,
             int(buffer.base),
@@ -153,6 +144,7 @@ class HostDomainResource:
                 if route == (worker, False):
                     self._view_control(self, worker, ref, 0, unmap=True)
                     self._mapping_targets.pop(ref)
+                    self._mapping_views.pop(ref, None)
             if any(self._mapping_targets.get(ref) == (worker, True) for ref in self._revoked_refs):
                 raise RuntimeError("Host mapping cleanup is unconfirmed")
             if self._next_reference > 255:
@@ -161,6 +153,7 @@ class HostDomainResource:
             self._next_reference += 1
             mapped = tensor._with_mapping_ref(reference)
             self._mapping_targets[reference] = (worker, False)
+            self._mapping_views[reference] = self._view_key(tensor)
             self._revoked_refs.add(reference)
             try:
                 self._view_control(self, worker, reference, access, unmap=False)
@@ -175,11 +168,14 @@ class HostDomainResource:
                     self._mapping_targets[reference] = (worker, False)
                 else:
                     self._mapping_targets.pop(reference, None)
+                    self._mapping_views.pop(reference, None)
                 raise
 
     def unmap_view(self, tensor: Tensor):
         self._check_source(tensor)
         reference = tensor.mapping_ref
+        if self._mapping_views.get(reference) != self._view_key(tensor):
+            raise ValueError("Host Tensor is not the view that was mapped")
         route = self._mapping_targets.get(reference)
         if route is None:
             if reference in self._revoked_refs:
@@ -191,39 +187,46 @@ class HostDomainResource:
             self._revoked_refs.add(reference)
             self._view_control(self, worker, reference, 0, unmap=True)
             self._mapping_targets.pop(reference, None)
-            if not self._mapping_targets:
-                self.views_released = True
+            self._mapping_views.pop(reference, None)
 
     def validate(self, tensor, worker):
         self._check_source(tensor)
         reference = tensor.mapping_ref
         if not reference:
             raise ValueError("A5 Host arguments require an explicit mapped view")
-        if worker not in self.workers or (
-            reference in self._revoked_refs or self._mapping_targets.get(reference) != (worker, True)
+        if (
+            worker not in self.workers
+            or self._mapping_views.get(reference) != self._view_key(tensor)
+            or reference in self._revoked_refs
+            or self._mapping_targets.get(reference) != (worker, True)
         ):
             raise ValueError("Host Tensor requires a live explicit mapping for the target endpoint")
 
-    def copy(self, offset, value, *, writing):
-        size = len(value) if writing else value
-        if offset < 0 or size < 0 or offset > self.spec.nbytes or size > self.spec.nbytes - offset:
-            raise ValueError("Host copy exceeds the backing range")
-        if self.closed or self.buffer is None or self.buffer.closed:
-            raise ValueError("Host domain backing is not live")
-        base = self.buffer.base
-        if writing:
-            ctypes.memmove(base + offset, value, size)
-            return None
-        return ctypes.string_at(base + offset, size)
+    def _retry_unconfirmed_views(self) -> None:
+        for reference, (worker, acknowledged) in tuple(self._mapping_targets.items()):
+            if acknowledged:
+                continue
+            self._view_control(self, worker, reference, 0, unmap=True)
+            self._mapping_targets.pop(reference, None)
+            self._mapping_views.pop(reference, None)
 
-    def close(self):
+    def revoke_all(self) -> None:
+        for reference, (worker, _acknowledged) in tuple(self._mapping_targets.items()):
+            self._view_control(self, worker, reference, 0, unmap=True)
+            self._mapping_targets.pop(reference, None)
+            self._mapping_views.pop(reference, None)
+
+    def close(self, *, force: bool = False):
         if self.closed:
             return
-        if self._mapping_targets:
-            raise RuntimeError("Host domain owner retained: unmap every mapped view first")
+        if force:
+            self.revoke_all()
+        else:
+            self._retry_unconfirmed_views()
+            if self._mapping_targets:
+                raise RuntimeError("Host domain owner retained: unmap every mapped view first")
         if self.buffer is not None:
             self.buffer.closed = True
-        if self.published and not self.views_released:
-            raise RuntimeError("Host domain owner retained: view release is unconfirmed")
+            self.buffer._source_registration = None
         self.mapping.backend.release()
         self.closed = True
