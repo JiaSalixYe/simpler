@@ -13226,6 +13226,7 @@ class Worker:
 
     def map_view(self, tensor: Tensor, *, target=None, access=AccessMode.READWRITE) -> Tensor:
         """Establish a restricted A5 HostRegister device mapping for one view."""
+        self._retry_host_register_cleanup()
         if self.level != 2 or (target is not None and target != self.device_location):
             raise ValueError("map_view requires this Worker's device endpoint")
         entry = getattr(self, "_direct_host_domains", {}).get(tensor.buffer.identity)
@@ -13235,6 +13236,7 @@ class Worker:
 
     def unmap_view(self, tensor: Tensor) -> None:
         """Revoke one issued A5 HostRegister mapping."""
+        self._retry_host_register_cleanup()
         if self.level != 2:
             raise ValueError("unmap_view requires a direct L2 Worker")
         entry = getattr(self, "_direct_host_domains", {}).get(tensor.buffer.identity)
@@ -13242,15 +13244,33 @@ class Worker:
             raise ValueError("unmap_view requires an A5 Host buffer allocated by this Worker")
         entry[0].unmap_view(tensor)
 
+    def _retry_host_register_cleanup(self) -> None:
+        """Try pending HostRegister unregister before touching the backing.
+
+        A failed map can leave a registration that ChipWorker records after its
+        own cleanup failed. Releasing or remapping the shm before that range is
+        unregistered can double-register it or unmap backing still registered.
+        """
+        chip = self._chip_worker
+        retry = getattr(chip, "retry_host_register_cleanup", None)
+        if retry is not None and not retry():
+            raise RuntimeError("A5 HostRegister cleanup is pending; retry after the device is available")
+
     def _release_all_direct_host_domains(self) -> None:
         """Reclaim every direct-L2 HostRegister domain at Worker close.
 
-        Teardown has already drained accepted runs, so a mapped view can no
-        longer have a live consumer. Revoke each view explicitly rather than
-        relying on Buffer.close, then release the CPU backing.
+        The normal teardown path has drained accepted runs, so a mapped view can
+        no longer have a live consumer; revoke each view explicitly rather than
+        relying on Buffer.close, then release the CPU backing. If a prior native
+        run's completion is unproven, retain the backing and report the close as
+        incomplete instead of freeing memory the device may still read.
         """
+        self._retry_host_register_cleanup()
+        domains = getattr(self, "_direct_host_domains", {})
+        if self._source_context_failed and domains:
+            raise RuntimeError("A5 Host backing retained after unconfirmed device completion")
         errors: list[BaseException] = []
-        for identity, entry in list(getattr(self, "_direct_host_domains", {}).items()):
+        for identity, entry in list(domains.items()):
             resource, _mapping = entry
             try:
                 with self._child_prov_worker_lock(0), self._registry_lock:
@@ -13259,14 +13279,11 @@ class Worker:
                 errors.append(exc)
                 continue
             del self._direct_host_domains[identity]
-        chip = self._chip_worker
-        retry = getattr(chip, "retry_host_register_cleanup", None)
-        if retry is not None and not retry():
-            errors.append(RuntimeError("A5 HostRegister cleanup is pending; retry after the device is available"))
         if errors:
             raise errors[0]
 
     def _release_direct_host_domain(self, identity, *, raise_on_failure: bool = True) -> None:
+        self._retry_host_register_cleanup()
         entry = getattr(self, "_direct_host_domains", {}).get(identity)
         if entry is None:
             return

@@ -52,6 +52,11 @@ A5 HostRegister 使用 POSIX shm 分配，`HostWindowSpec.numa_id` 必须为 0�
 
 - 第一次 `map_view` 才执行 HostRegister；最后一次 `unmap_view` 才执行
   `aclrtHostUnregister`。CPU backing 一直保留到 `release_buffer`。
+- A5 HostRegister 只接受 owned execution context；borrowed context 在创建时显式拒绝。
+- 如果 native unregister 清理未确认，后续 map/release/close 会先重试；重试失败时保留
+  Buffer 和 backing，拒绝继续，不把它当作成功。
+- 若存在未证明完成的 native run，`Worker.close()` 保留 Host backing 并报告未完成，
+  不会在 chip run lane 完成证明前释放 Host 内存。
 - map 失败不会留下 grant；已发生的注册会尝试立即 unregister。
 - unmap/unregister 失败使记录保持 CLOSING，拒绝新的 map；重试 unmap 成功后才能
   重新映射并取得新引用。旧 Tensor 不会复活。

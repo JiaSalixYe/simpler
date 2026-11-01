@@ -570,3 +570,113 @@ def test_failed_map_with_failed_cleanup_is_retried_by_close(monkeypatch):
         if not resource.closed:
             resource._mapping_targets.clear()
             resource.close()
+
+
+def test_close_refuses_to_free_host_backing_when_completion_is_unproven():
+    class CloseChip(FakeChip):
+        def workspace_report(self):
+            return ("disabled", None)
+
+        def finalize(self):
+            self.finalized = True
+
+    chip = CloseChip()
+    chip.finalized = False
+    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_id=0)
+    worker._chip_worker = chip
+    worker._lifecycle = _Lifecycle.READY
+    buffer = worker.create_buffer(128, host_window=HostWindowSpec(128))
+    worker.map_view(buffer.tensor((32,), DataType.FLOAT32), access=AccessMode.READ)
+    worker._source_context_failed = True
+    try:
+        with pytest.raises(RuntimeError, match="unconfirmed device completion"):
+            worker.close()
+        assert chip.unmapped == []
+        assert not buffer.closed
+        assert worker._direct_host_domains
+        assert chip.finalized is False
+    finally:
+        worker._source_context_failed = False
+        if worker._direct_host_domains:
+            worker._release_all_direct_host_domains()
+        worker._close_chip_import_registry()
+        worker._lifecycle = _Lifecycle.CLOSED
+
+
+def test_pending_cleanup_is_retried_before_map_and_release():
+    class PendingChip(FakeChip):
+        def __init__(self):
+            super().__init__()
+            self.retry_ok = False
+            self.retry_calls = 0
+            self.maps_after_retry = 0
+
+        def retry_host_register_cleanup(self):
+            self.retry_calls += 1
+            return self.retry_ok
+
+        def host_register_map(self, host, nbytes):
+            self.maps_after_retry += 1
+            return super().host_register_map(host, nbytes)
+
+    chip = PendingChip()
+    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_id=0)
+    worker._chip_worker = chip
+    worker._lifecycle = _Lifecycle.READY
+    buffer = worker.create_buffer(128, host_window=HostWindowSpec(128))
+    native = buffer.tensor((32,), DataType.FLOAT32)
+    try:
+        with pytest.raises(RuntimeError, match="cleanup is pending"):
+            worker.map_view(native, access=AccessMode.READ)
+        assert chip.retry_calls == 1 and chip.maps_after_retry == 0
+        with pytest.raises(RuntimeError, match="cleanup is pending"):
+            worker.release_buffer(buffer)
+        assert not buffer.closed
+        chip.retry_ok = True
+        mapped = worker.map_view(native, access=AccessMode.READ)
+        assert chip.retry_calls >= 2 and chip.maps_after_retry == 1
+        worker.unmap_view(mapped)
+        worker.release_buffer(buffer)
+        assert buffer.closed
+    finally:
+        if buffer.identity in worker._direct_host_domains:
+            worker._direct_host_domains[buffer.identity][0]._mapping_targets.clear()
+            worker._release_direct_host_domain(buffer.identity, raise_on_failure=False)
+        worker._close_chip_import_registry()
+        worker._lifecycle = _Lifecycle.CLOSED
+
+
+def test_pending_cleanup_blocks_close_before_backing_release():
+    class PendingChip(FakeChip):
+        def __init__(self):
+            super().__init__()
+            self.retry_ok = False
+            self.retry_calls = 0
+
+        def retry_host_register_cleanup(self):
+            self.retry_calls += 1
+            return self.retry_ok
+
+        def workspace_report(self):
+            return ("disabled", None)
+
+        def finalize(self):
+            pass
+
+    chip = PendingChip()
+    worker = Worker(level=2, platform="a5", runtime="tensormap_and_ringbuffer", device_id=0)
+    worker._chip_worker = chip
+    worker._lifecycle = _Lifecycle.READY
+    buffer = worker.create_buffer(128, host_window=HostWindowSpec(128))
+    try:
+        with pytest.raises(RuntimeError, match="cleanup is pending"):
+            worker.close()
+        assert chip.retry_calls == 1
+        assert not buffer.closed
+        assert worker._direct_host_domains
+    finally:
+        chip.retry_ok = True
+        if worker._direct_host_domains:
+            worker._release_all_direct_host_domains()
+        worker._close_chip_import_registry()
+        worker._lifecycle = _Lifecycle.CLOSED
