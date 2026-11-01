@@ -80,6 +80,30 @@ static_assert(offsetof(CommGlobalDomainDescriptor, reserved) == 28, "CommGlobalD
 static_assert(offsetof(CommGlobalDomainDescriptor, handle) == 32, "CommGlobalDomainDescriptor.handle offset drift");
 #endif
 
+/**
+ * Optional same-build runtime entry: attach one Host backing to a local domain,
+ * without changing its members or rank descriptor table. Callers serialize this
+ * operation with domain creation/release; platforms may omit the symbol.
+ *
+ * The input reuses the COMM_GLOBAL_DOMAIN_VERSION descriptor envelope; it is
+ * not a rank-table row. Python/native layout and version changes must migrate
+ * together. This adds no new descriptor version or deprecation of existing APIs.
+ * A zero result supplies base_out. On failure, partial import state belongs to
+ * allocation_id and must be reclaimed through comm_detach_domain_host before
+ * another attach; a failed reclamation must not be treated as release success.
+ */
+int comm_attach_domain_host(
+    CommHandle h, uint64_t allocation_id, const CommGlobalDomainDescriptor *descriptor, uint64_t *base_out
+);
+
+/**
+ * Optional local Host-view teardown. The caller drains all users first.
+ * A failed cleanup retains its remaining stages and rejects further attaches;
+ * a successful cleanup permits a fresh attachment while retaining the domain's
+ * HBM windows and context. Domain release permanently closes attachment admission.
+ */
+int comm_detach_domain_host(CommHandle h, uint64_t allocation_id);
+
 /** Bit mask of DmaWorkspaceKind values this platform can provision. */
 uint32_t dma_workspace_supported_mask(void);
 
@@ -318,6 +342,12 @@ int comm_global_domain_import_host(
     uint64_t domain_id, uint32_t profile, const uint8_t *token, size_t token_size, size_t mapping_size,
     uint64_t *base_out
 );
+
+/** Detach one imported Host backing after its last accepted view retires.
+ * Same-build optional platform entry; failure retains cleanup state and revokes reuse.
+ * Host tokens never enter the rank descriptor table or CommContext windows.
+ */
+int comm_global_domain_detach_host(uint64_t domain_id, const uint8_t *token, size_t token_size);
 
 /**
  * Release a prepared or imported Global CommDomain. This is local teardown.

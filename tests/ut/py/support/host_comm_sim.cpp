@@ -10,7 +10,12 @@
  */
 #include <cassert>
 
+#include <sys/mman.h>
+static bool reject_unmap = false;
+static int checked_unmap(void *base, size_t size) { return reject_unmap ? -1 : munmap(base, size); }
+#define munmap checked_unmap
 #include "platform_comm/comm_sim.cpp"
+#undef munmap
 
 int main() {
     constexpr auto profile = COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM;
@@ -51,7 +56,8 @@ int main() {
         assert(*reinterpret_cast<uint8_t *>(host) == (rank == 0 ? 42 : 50));
         *reinterpret_cast<uint8_t *>(host) = static_cast<uint8_t>(50 + rank);
         assert(owner[0] == 50 + rank);
-        assert(global_domain_allocations.at(7 + rank)->peer_mappings.size() == 2);
+        assert(global_domain_allocations.at(7 + rank)->peer_mappings.size() == 1);
+        assert(global_domain_allocations.at(7 + rank)->host_mappings.size() == 1);
         assert(comm_global_domain_window(7 + rank, 2, &base, &size) != 0);
         for (uint32_t peer = 0; peer < 2; ++peer) {
             assert(comm_global_domain_window(7 + rank, peer, &base, &size) == 0);
@@ -60,7 +66,29 @@ int main() {
             assert(*reinterpret_cast<uint8_t *>(local[peer]) == 10 + peer);
         }
     }
+    reject_unmap = true;
+    const bool detach_refused = comm_global_domain_detach_host(7, token, name.size()) != 0;
+    const bool import_refused = comm_global_domain_import_host(7, profile, token, name.size(), bytes, &base) != 0;
+    const bool views_refused = comm_global_domain_release(7, 1) != 0;
+    reject_unmap = false;
+    if (!detach_refused || !import_refused || !views_refused) {
+        for (const auto &entry : global_domain_allocations)
+            shm_unlink(entry.second->shm_name.c_str());
+        shm_unlink(name.c_str());
+        return 1;
+    }
+    assert(!global_domain_allocations.at(7)->views_released);
+    assert(comm_global_domain_release(7, 2) != 0);
+    assert(comm_global_domain_release(7, 1) == 0);
+    assert(comm_global_domain_release(7, 2) == 0);
+    // The second domain still owns its independent Host import and HBM peers.
+    assert(comm_global_domain_detach_host(8, token, name.size()) == 0);
+    assert(global_domain_allocations.at(8)->host_mappings.empty());
+    assert(comm_global_domain_window(8, 1, &base, &size) == 0);
+    assert(comm_global_domain_import_host(8, profile, token, name.size(), bytes, &base) == 0);
+    assert(*reinterpret_cast<uint8_t *>(base) == 51);
     for (uint32_t rank = 0; rank < 2; ++rank) {
+        if (rank == 0) continue;
         assert(comm_global_domain_release(7 + rank, 2) != 0);
         assert(comm_global_domain_release(7 + rank, 1) == 0);
         assert(global_domain_allocations.at(7 + rank)->peer_mappings.empty());

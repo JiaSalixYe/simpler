@@ -6,17 +6,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Two-chip explicit Host views: MTE, PTO SDMA completion, and retained domains."""
+"""A3 Host Fabric L2/L3 views, grants, unmap and MTE/PTO SDMA completion."""
 
+import ctypes
 import struct
 from pathlib import Path
 
 import pytest
 from simpler.buffer import AccessMode
 from simpler.task_interface import (
-    ArgDirection as D,
-)
-from simpler.task_interface import (
+    ArgDirection,
     ChipCallable,
     CommBufferSpec,
     CoreCallable,
@@ -26,12 +25,60 @@ from simpler.task_interface import (
     TensorArgType,
     TensorTransfer,
 )
+from simpler.task_interface import (
+    ArgDirection as D,
+)
 from simpler.worker import Worker
 
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
-from tests.st.worker.comm_domain.host_domain_kernels import build_chip_callable
+
+HOST_RUNTIMES = (
+    pytest.param("tensormap_and_ringbuffer", marks=pytest.mark.runtime("tensormap_and_ringbuffer")),
+    pytest.param("host_build_graph", marks=pytest.mark.runtime("host_build_graph")),
+)
+
+
+def require_a3_host_fabric(platform):
+    if platform == "a2a3":
+        acl = ctypes.CDLL("libascendcl.so")
+        acl.aclrtGetSocName.restype = ctypes.c_char_p
+        soc = acl.aclrtGetSocName()
+        assert soc is not None, "aclrtGetSocName failed"
+        if soc.startswith(b"Ascend910B"):
+            pytest.skip(f"A3 Host Fabric is not qualified on {soc.decode()}")
+
+
+def build_chip_callable(platform, runtime="tensormap_and_ringbuffer", *, kernel_source=None):
+    root = Path(__file__).resolve().parents[4]
+    kernels = root / "examples/workers/l3/multi_chip_dispatch/kernels"
+    if runtime == "host_build_graph":
+        orchestration_source = (
+            root / "examples/workers/l4/compute_then_tload_mixed_l3/kernels/orchestration/local_add_orch.cpp"
+        )
+        func_name = "local_add_orchestration"
+    else:
+        orchestration_source = kernels / "orchestration/vector_add_orch.cpp"
+        func_name = "vector_add_orchestration"
+    compiler = KernelCompiler(platform=platform)
+    binary = compiler.compile_incore(
+        source_path=str(kernel_source if kernel_source is not None else kernels / "aiv/vector_add_kernel.cpp"),
+        core_type="aiv",
+        pto_isa_root=ensure_pto_isa_root(),
+        extra_include_dirs=compiler.get_orchestration_include_dirs(runtime),
+    )
+    if not platform.endswith("sim"):
+        binary = extract_text_section(binary)
+    signature = [ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT]
+    orchestration = compiler.compile_orchestration(runtime_name=runtime, source_path=str(orchestration_source))
+    return ChipCallable.build(
+        signature=signature,
+        func_name=func_name,
+        binary=orchestration,
+        children=[(0, CoreCallable.build(signature=signature, binary=binary))],
+    )
+
 
 N = 128 * 128
 SIZE = N * 4
@@ -61,22 +108,28 @@ def build_sdma(platform):
 
 
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
-@pytest.mark.runtime(RUNTIME)
 @pytest.mark.device_count(2)
-@pytest.mark.parametrize("engine", ["mte", pytest.param("sdma", marks=pytest.mark.sdma)])
+@pytest.mark.parametrize(
+    ("runtime", "engine"),
+    [
+        pytest.param(RUNTIME, "mte", marks=pytest.mark.runtime(RUNTIME)),
+        pytest.param("host_build_graph", "mte", marks=pytest.mark.runtime("host_build_graph")),
+        pytest.param(RUNTIME, "sdma", marks=[pytest.mark.runtime(RUNTIME), pytest.mark.sdma]),
+    ],
+)
 @pytest.mark.parametrize("host_output", [False, True])
-def test_host_domain_two_chip_transfer(st_platform, st_device_ids, engine, host_output):
+def test_host_domain_two_chip_transfer(st_platform, st_device_ids, engine, host_output, runtime):
     if engine == "sdma" and st_platform.endswith("sim"):
         pytest.skip("SDMA completion uses onboard device queues")
     worker = Worker(
         level=3,
         platform=st_platform,
-        runtime=RUNTIME,
+        runtime=runtime,
         device_ids=list(map(int, st_device_ids[:2])),
         num_sub_workers=0,
         enable_sdma=engine == "sdma",
     )
-    chip = worker.register(build_sdma(st_platform) if engine == "sdma" else build_chip_callable(st_platform))
+    chip = worker.register(build_sdma(st_platform) if engine == "sdma" else build_chip_callable(st_platform, runtime))
     request = dict(
         name="host",
         members=[0, 1],
@@ -88,6 +141,7 @@ def test_host_domain_two_chip_transfer(st_platform, st_device_ids, engine, host_
     domains = []
     try:
         worker.init()
+        require_a3_host_fabric(st_platform)
         results = [worker.create_buffer(SIZE) for _ in range(2)]
         for iteration in range(2):
             value = 3.0 + iteration
@@ -102,13 +156,17 @@ def test_host_domain_two_chip_transfer(st_platform, st_device_ids, engine, host_
                 orch.copy_to_host_domain(domain, data)
                 for rank in range(2):
                     orch.copy_to_domain(domain, rank, data, buffer="input")
-                for rank in range(2):
-                    host = domain.host().tensor(
-                        (N,), DataType.FLOAT32, byte_offset=(rank + 1) * SIZE if host_output else 0
+                views = [
+                    domain.map_view(
+                        domain.host().tensor(
+                            (N,), DataType.FLOAT32, byte_offset=(rank + 1) * SIZE if host_output else 0
+                        ),
+                        domain_rank=rank,
+                        access=AccessMode.WRITE if host_output else AccessMode.READ,
                     )
-                    mapped = domain.map_view(
-                        host, domain_rank=rank, access=AccessMode.WRITE if host_output else AccessMode.READ
-                    )
+                    for rank in range(2)
+                ]
+                for rank, mapped in enumerate(views):
                     ctx = domain.member(rank)
                     source = ctx.buffers["input"].tensor((N,), DataType.FLOAT32) if host_output else mapped
                     destination = mapped if host_output else ctx.buffers["output"].tensor((N,), DataType.FLOAT32)
@@ -116,7 +174,11 @@ def test_host_domain_two_chip_transfer(st_platform, st_device_ids, engine, host_
                     args.add_tensor(source, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
                     if engine == "mte":
                         args.add_tensor(source, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
-                    args.add_tensor(destination, TensorArgType.OUTPUT_EXISTING, transfer=TensorTransfer.NONE)
+                    args.add_tensor(
+                        destination,
+                        TensorArgType.INPUT if host_output and engine == "mte" else TensorArgType.OUTPUT_EXISTING,
+                        transfer=TensorTransfer.NONE,
+                    )
                     if engine == "sdma":
                         args.add_tensor(results[rank].tensor((N,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
                     orch.submit_next_level(chip, args, cfg, worker=rank)
@@ -143,16 +205,17 @@ def test_host_domain_two_chip_transfer(st_platform, st_device_ids, engine, host_
 
 
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
-@pytest.mark.runtime(RUNTIME)
+@pytest.mark.parametrize("runtime", HOST_RUNTIMES)
 @pytest.mark.device_count(2)
-def test_host_domain_release_after_accepted_tasks(st_platform, st_device_ids):
+def test_host_domain_release_after_accepted_tasks(st_platform, st_device_ids, runtime):
     worker = Worker(
-        level=3, platform=st_platform, runtime=RUNTIME, device_ids=list(map(int, st_device_ids[:2])), num_sub_workers=0
+        level=3, platform=st_platform, runtime=runtime, device_ids=list(map(int, st_device_ids[:2])), num_sub_workers=0
     )
-    chip = worker.register(build_chip_callable(st_platform))
+    chip = worker.register(build_chip_callable(st_platform, runtime))
     saved = []
     try:
         worker.init()
+        require_a3_host_fabric(st_platform)
         outputs = [worker.create_buffer(SIZE) for _ in range(2)]
 
         def submit(orch, _args, cfg):
@@ -164,10 +227,11 @@ def test_host_domain_release_after_accepted_tasks(st_platform, st_device_ids):
                 host_window=HostWindowSpec(SIZE),
             )
             orch.copy_to_host_domain(domain, struct.pack(f"<{N}f", *([7.0] * N)))
-            for rank in range(2):
-                view = domain.map_view(
-                    domain.host().tensor((N,), DataType.FLOAT32), domain_rank=rank, access=AccessMode.READ
-                )
+            views = [
+                domain.map_view(domain.host().tensor((N,), DataType.FLOAT32), domain_rank=rank, access=AccessMode.READ)
+                for rank in range(2)
+            ]
+            for rank, view in enumerate(views):
                 args = TaskArgs()
                 args.add_tensor(view, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
                 args.add_tensor(view, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
@@ -186,28 +250,14 @@ def test_host_domain_release_after_accepted_tasks(st_platform, st_device_ids):
 
 
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
-@pytest.mark.runtime(RUNTIME)
+@pytest.mark.parametrize("runtime", HOST_RUNTIMES)
 @pytest.mark.device_count(2)
-def test_device_selected_bf16_rows(st_platform, st_device_ids):
-    compiler = KernelCompiler(platform=st_platform)
-    binary = compiler.compile_incore(
-        source_path=str(Path(__file__).parent / "kernels/host_sparse_read.cpp"),
-        core_type="aiv",
-        pto_isa_root=ensure_pto_isa_root(),
-        extra_include_dirs=compiler.get_orchestration_include_dirs(RUNTIME),
-    )
-    if not st_platform.endswith("sim"):
-        binary = extract_text_section(binary)
-    orchestration = compiler.compile_orchestration(
-        runtime_name=RUNTIME,
-        source_path=str(ROOT / "examples/workers/l3/multi_chip_dispatch/kernels/orchestration/vector_add_orch.cpp"),
-    )
-    leaf = CoreCallable.build(signature=[D.IN, D.IN, D.OUT], binary=binary)
-    callable_obj = ChipCallable.build(
-        signature=[D.IN, D.IN, D.OUT], func_name="vector_add_orchestration", binary=orchestration, children=[(0, leaf)]
+def test_device_selected_bf16_rows(st_platform, st_device_ids, runtime):
+    callable_obj = build_chip_callable(
+        st_platform, runtime, kernel_source=Path(__file__).parent / "kernels/host_sparse_read.cpp"
     )
     worker = Worker(
-        level=3, platform=st_platform, runtime=RUNTIME, device_ids=list(map(int, st_device_ids[:2])), num_sub_workers=0
+        level=3, platform=st_platform, runtime=runtime, device_ids=list(map(int, st_device_ids[:2])), num_sub_workers=0
     )
     chip = worker.register(callable_obj)
     table_size = 128 * 256 * 2
@@ -216,6 +266,7 @@ def test_device_selected_bf16_rows(st_platform, st_device_ids):
     saved = []
     try:
         worker.init()
+        require_a3_host_fabric(st_platform)
         ids = [worker.create_buffer(6 * 4) for _ in range(2)]
         results = [worker.create_buffer(output_size) for _ in range(2)]
         for rank in range(2):
@@ -238,11 +289,14 @@ def test_device_selected_bf16_rows(st_platform, st_device_ids):
                     saved.append(domain)
                 # CPU initialization updates the Host backing, not a device replica.
                 orch.copy_to_host_domain(domain, struct.pack(f"<{len(table)}H", *table))
-                for rank in range(2):
-                    args = TaskArgs()
-                    view = domain.map_view(
+                views = [
+                    domain.map_view(
                         domain.host().tensor((128, 256), DataType.BFLOAT16), domain_rank=rank, access=AccessMode.READ
                     )
+                    for rank in range(2)
+                ]
+                for rank, view in enumerate(views):
+                    args = TaskArgs()
                     args.add_tensor(view, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
                     args.add_tensor(ids[rank].tensor((6,), DataType.UINT32), TensorArgType.INPUT)
                     args.add_tensor(results[rank].tensor((6, 256), DataType.BFLOAT16), TensorArgType.OUTPUT_EXISTING)
@@ -253,5 +307,56 @@ def test_device_selected_bf16_rows(st_platform, st_device_ids):
                 expected = [table[r * 256 + c] if r < 128 else 0 for r in rows[rank] for c in range(256)]
                 assert list(struct.unpack_from("<1536H", results[rank].shm.buf)) == expected
         saved[0].release()
+    finally:
+        worker.close()
+
+
+@pytest.mark.platforms(["a2a3sim", "a2a3"])
+@pytest.mark.parametrize("runtime", HOST_RUNTIMES)
+@pytest.mark.device_count(1)
+@pytest.mark.parametrize("mixed", [False, True], ids=["mapped", "native-and-mapped"])
+def test_direct_host_fabric_two_live_buffers(st_platform, st_device_ids, mixed, runtime):
+    worker = Worker(level=2, platform=st_platform, runtime=runtime, device_id=int(st_device_ids[0]))
+    chip = worker.register(build_chip_callable(st_platform, runtime))
+    try:
+        worker.init()
+        require_a3_host_fabric(st_platform)
+        sources = [worker.create_buffer(SIZE, host_window=HostWindowSpec(SIZE)) for _ in range(2)]
+        result = worker.create_buffer(SIZE)
+        for iteration, source in enumerate(sources):
+            payload = struct.pack(f"<{N}f", *([float(iteration + 2)] * N))
+            ctypes.memmove(source.base, payload, SIZE)
+            native = source.tensor((N,), DataType.FLOAT32)
+            view = worker.map_view(native)
+            assert native.mapping_ref == 0 and view.mapping_ref != 0
+            assert native.buffer.identity == view.buffer.identity
+            args = TaskArgs()
+            args.add_tensor(
+                native if mixed else view,
+                TensorArgType.INPUT,
+                transfer=TensorTransfer.H2D if mixed else TensorTransfer.NONE,
+            )
+            args.add_tensor(view, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
+            args.add_tensor(result.tensor((N,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+            worker.run(chip, args)
+            assert struct.unpack_from(f"<{N}f", result.shm.buf) == (float(2 * (iteration + 2)),) * N
+            worker.unmap_view(view)
+            with pytest.raises(ValueError, match="live explicit mapping"):
+                worker.run(chip, args)
+            remapped = worker.map_view(native, access=AccessMode.READ)
+            assert remapped.mapping_ref != view.mapping_ref
+            retry = TaskArgs()
+            retry.add_tensor(
+                native if mixed else remapped,
+                TensorArgType.INPUT,
+                transfer=TensorTransfer.H2D if mixed else TensorTransfer.NONE,
+            )
+            retry.add_tensor(remapped, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
+            retry.add_tensor(result.tensor((N,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+            worker.run(chip, retry)
+            assert struct.unpack_from(f"<{N}f", result.shm.buf) == (float(2 * (iteration + 2)),) * N
+            worker.release_buffer(source)
+            with pytest.raises(ValueError):
+                worker.map_view(native)
     finally:
         worker.close()

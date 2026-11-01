@@ -4,19 +4,22 @@
 
 ## The timeout race decides what you see
 
-Three watchdogs compete, and whichever fires first determines whether you get a
-clean `-100` with a `sub_class`, or a masked `507018`:
+Three timeout mechanisms can affect whether a stall surfaces as a classified
+`-100` with a `sub_class`, a Host wait timeout, or an execution error such as
+`507018`. Their configured budgets alone do not identify which mechanism fired:
 
 - the scheduler no-progress timeout (`SIMPLER_SCHEDULER_TIMEOUT_MS`),
 - the STARS op-execute timeout (`SIMPLER_OP_EXECUTE_TIMEOUT_US`, ~45 s, kills `aicpu-sd`),
 - the host stream-sync timeout (`SIMPLER_STREAM_SYNC_TIMEOUT_MS`).
 
 **A 45 s op-execute kill is not proof of a deadlock** — the kernel may simply be
-slow. To find out which, order the race deliberately. The STs do exactly this, and
-the technique transfers:
+slow. The STs configure different budgets to exercise the diagnostic paths:
 
-- To make the **scheduler** win (get a `sub_class`), squeeze it below the others:
-  `SCHEDULER=2000ms < OP_EXECUTE=3s < STREAM_SYNC=4000ms` (`aicore_hang` case).
+- To give the **scheduler** an earlier budget for publishing a `sub_class`:
+  `SCHEDULER=2000ms`, requested `OP_EXECUTE=3s`, `STREAM_SYNC=6000ms`
+  (`aicore_hang` case). ACL may adjust the operator value; owned initialization
+  checks that the reported value remains strictly between the other budgets.
+  This numeric ordering does not establish which timer actually fires first.
 - To let a **slow-but-alive** path finish, push the others out of the way:
   `SCHEDULER=30000ms`, `OP_EXECUTE=30s`, `STREAM_SYNC=40000ms` — this is how the
   `tensor_wait_timeout` case lets the 15 s tensor-data wait land code 8 instead of
@@ -56,6 +59,22 @@ when its continuous no-progress time reaches half the scheduler timeout. The
 snapshot includes that thread's cores, running tasks, kernels and COND state.
 Progress on that thread rearms its warning; other threads neither suppress nor
 rearm it. With INFO disabled, the logging backend filters out these messages.
+
+For A5 `tensormap_and_ringbuffer`, each busy core also reports `cond_raw`,
+`cond_tok`, `running_tok`, `pending_tok`, `cond_match` and `dmb_low`.
+`cond_match` compares the sampled COND token with the copied scheduler tokens;
+it is `running`, `pending` or `other`. A FIN can belong to either slot, and a
+running FIN with an ordinary pending task can remain visible while the scheduler
+waits for pending ACK/FIN. FIN alone does not establish a completion-poll bug.
+
+`dmb_low` is the low 32 bits of the publication register, not the high-word
+doorbell. Seeing the pending token there proves neither pickup nor execution:
+the dispatcher can read a payload and wait on argument preparation or its gate
+before posting ACK. `snapshot=best_effort` also matters: registers are sampled
+separately, and a shutdown dump reads other scheduler threads' mutable state
+without a quiescence acknowledgement. These fields are observations, not an
+atomic state snapshot or a diagnosis of a GM-read stall. They do not add pending
+task/payload traversal or change the completion protocol.
 
 Local warnings do not scan shared task rings, acquire the AsyncWaitList lock, or
 coordinate through a shared warning latch. Global `TASK`/`SUMMARY` and `ASYNC_WAIT`

@@ -332,6 +332,14 @@ public:
     /// using the persistent bootstrap pair report 0.
     size_t run_stream_set_create_count() const;
 
+    /// Which device-side scheduler the most recent bind selected
+    /// (SCHEDULER_RUNTIME_MODE_*); 0 when none was published. Only the a5
+    /// host_build_graph runtime publishes one.
+    uint32_t last_scheduler_runtime_mode() const;
+
+    /// How many scheduler selections this worker's binds have published.
+    size_t scheduler_mode_publish_count() const;
+
     uint64_t malloc(size_t size);
     void free(uint64_t ptr);
     void copy_to(uint64_t dst, uint64_t src, size_t size);
@@ -397,6 +405,10 @@ public:
         uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
         size_t window_size
     );
+    uint64_t
+    comm_attach_domain_host(uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint8_t> &descriptor);
+    void comm_detach_domain_host(uint64_t comm_handle, uint64_t allocation_id);
+    int host_backing_process_identity() const;
 
     /// Pair to `comm_alloc_domain_windows`: collectively free the per-rank
     /// pool and the device CommContext, then drop the allocation record.
@@ -412,6 +424,7 @@ public:
     uint64_t comm_global_domain_import_host(
         uint64_t domain_id, uint32_t profile, const std::vector<uint8_t> &token, size_t mapping_size
     );
+    void comm_global_domain_detach_host(uint64_t domain_id, const std::vector<uint8_t> &token);
     void comm_global_domain_release(uint64_t domain_id, uint32_t stage = 0);
     std::pair<uint64_t, size_t> comm_global_domain_window(uint64_t domain_id, uint32_t slot);
     void comm_barrier(uint64_t comm_handle);
@@ -594,12 +607,15 @@ private:
     using CommDeriveContextFn = int (*)(void *, const uint32_t *, size_t, uint32_t, size_t, size_t, uint64_t *);
     using CommAllocDomainWindowsFn =
         int (*)(void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint64_t *, uint64_t *, size_t *);
+    using CommAttachDomainHostFn = int (*)(void *, uint64_t, const CommGlobalDomainDescriptor *, uint64_t *);
+    using CommDetachDomainHostFn = int (*)(void *, uint64_t);
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
     using CommGlobalDomainPrepareFn =
         int (*)(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *);
     using CommGlobalDomainImportFn = int (*)(uint64_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *);
     using CommGlobalDomainReleaseFn = int (*)(uint64_t, uint32_t);
     using CommGlobalDomainWindowFn = decltype(&::comm_global_domain_window);
+    using CommGlobalDomainDetachHostFn = decltype(&::comm_global_domain_detach_host);
     using CommGlobalDomainImportHostFn = decltype(&::comm_global_domain_import_host);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
@@ -714,6 +730,12 @@ private:
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_run_stream_set_create_count_fn_ = nullptr;
+    // Resolved optionally rather than through `RuntimeModule::required`: only the a5
+    // host_build_graph module records a scheduler selection, so a hard
+    // requirement would oblige every other runtime to export a stub.
+    using GetLastSchedulerRuntimeModeFn = uint32_t (*)(void *);
+    GetLastSchedulerRuntimeModeFn get_last_scheduler_runtime_mode_fn_ = nullptr;
+    GetAicpuDlopenCountFn get_scheduler_mode_publish_count_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
     ExecutionEnvironmentReleasableFn execution_environment_releasable_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
@@ -725,11 +747,14 @@ private:
     CommGetWindowSizeFn comm_get_window_size_fn_ = nullptr;
     CommDeriveContextFn comm_derive_context_fn_ = nullptr;
     CommAllocDomainWindowsFn comm_alloc_domain_windows_fn_ = nullptr;
+    CommAttachDomainHostFn comm_attach_domain_host_fn_ = nullptr;
+    CommDetachDomainHostFn comm_detach_domain_host_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommGlobalDomainPrepareFn comm_global_domain_prepare_fn_ = nullptr;
     CommGlobalDomainImportFn comm_global_domain_import_fn_ = nullptr;
     CommGlobalDomainReleaseFn comm_global_domain_release_fn_ = nullptr;
     CommGlobalDomainWindowFn comm_global_domain_window_fn_ = nullptr;
+    CommGlobalDomainDetachHostFn comm_global_domain_detach_host_fn_ = nullptr;
     CommGlobalDomainImportHostFn comm_global_domain_import_host_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;

@@ -355,7 +355,9 @@ class Orchestrator:
             prov_guard = worker._child_prov_lock
         with prov_guard:
             if needs_prov:
-                worker._child_prov_check_dispatch_locked(c_args, cpp_worker_id, api="submit_next_level")
+                worker._child_prov_check_dispatch_locked(
+                    c_args, cpp_worker_id, api="submit_next_level", sidecar=remote_sidecar
+                )
                 remote_sidecar = worker._prepare_buffer_references(c_args, remote_sidecar, cpp_worker_id)
             final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
             if worker is not None:
@@ -465,7 +467,12 @@ class Orchestrator:
         with prov_guard:
             for index, c_args in member_checks:
                 assert worker is not None
-                worker._child_prov_check_dispatch_locked(c_args, worker_ids[index], api="submit_next_level_group")
+                worker._child_prov_check_dispatch_locked(
+                    c_args,
+                    worker_ids[index],
+                    api="submit_next_level_group",
+                    sidecar=remote_sidecars[index] if remote_sidecars is not None else None,
+                )
                 prepared = worker._prepare_buffer_references(
                     c_args, remote_sidecars[index] if remote_sidecars is not None else None, worker_ids[index]
                 )
@@ -722,7 +729,7 @@ class Orchestrator:
         ):
             return self._copy_domain_locked(handle, rank, data, buffer, offset, writing=writing, node=node)
 
-    def _copy_domain_locked(self, handle, rank, data, buffer, offset, *, writing, node=None):
+    def _copy_domain_locked(self, handle, rank, data, buffer, offset, *, writing, node=None):  # noqa: PLR0912 -- one range/order gate for local and global staging
         assert self._worker is not None
         if not handle.borrowed:
             if handle._ref is None or handle._ref.owner_instance_id != self._worker._owner_instance_id:
@@ -731,18 +738,23 @@ class Orchestrator:
         size = len(data) if writing else data
         handle._require_live()
         if rank is None:
-            host = handle.host(node)
-            if offset < 0 or size <= 0 or offset > host.nbytes or size > host.nbytes - offset:
-                raise ValueError("Host domain copy exceeds the backing range")
             with self._control_admission("Host domain copy"):
-                if writing:
-                    self._worker._copy_to_global_domain(handle, None, data, offset, node=0 if node is None else node)
-                    return None
-                return self._worker._copy_from_global_domain(
-                    handle, None, size, offset, node=0 if node is None else node
-                )
+                if handle._host_resource is not None:
+                    if node is not None:
+                        raise ValueError("local Host window does not select a node")
+                    return handle._host_resource.copy(offset, data, writing=writing)
+                if node is None:
+                    raise ValueError("global Host copy requires a node worker id")
+                if offset < 0 or size < 0 or offset + size > handle.host(node).nbytes:
+                    raise ValueError("Host copy exceeds backing range")
+                return self._worker._copy_domain_bytes(handle, None, data, offset, node=node, writing=writing)
         absolute = self._global_copy_range(handle, buffer=buffer, offset=offset, nbytes=size)
         handle.member(rank)
+        if not handle.workers and not handle.borrowed and not handle._host_buffers:
+            if writing:
+                self._worker._copy_to_global_domain(handle, rank, data, absolute)
+                return None
+            return self._worker._copy_from_global_domain(handle, rank, size, absolute)
         with self._control_admission("domain copy"):
             if not handle.workers or handle.borrowed or handle._host_buffers:
                 if writing:

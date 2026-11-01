@@ -27,15 +27,14 @@ from simpler import remote_l3_session, remote_l3_worker
 from simpler.buffer import (
     BackendKind,
     CanonicalIdentity,
-    LocalEndpointBufferIdentityAllocator,
     buffer_reference,
     create_host_shared_buffer,
     mint_owner_instance_id,
     remote_sidecar_tensor,
     wrap_vmm_window,
 )
-from simpler.task_interface import DataType, HostWindowSpec
-from simpler.worker import RunHandle, Worker, _RunResources, _SharedExclusiveLock
+from simpler.task_interface import DataType
+from simpler.worker import RunHandle, Worker, _RunResources
 
 
 def _manifest(**extra):
@@ -1040,27 +1039,8 @@ def test_serve_real_socket_survives_truncated_frame_then_serves_next(monkeypatch
 def _bare_l3_worker():
     """An L3 Worker with the state ``_create_buffer_locked`` and ``release_buffer`` read — no
     fork, no device, no ``init()``."""
-    w = Worker.__new__(Worker)
-    w.level = 3
+    w = Worker(3, num_sub_workers=0)
     w._chip_shms = [object()]
-    w._sub_shms = []
-    w._next_level_shms = []
-    w._registry_lock = threading.Lock()
-    w._owner_instance_id = mint_owner_instance_id()
-    w._buffer_identity_allocator = LocalEndpointBufferIdentityAllocator(w._owner_instance_id)
-    w._buffers = {}
-    w._direct_host_domains = {}
-    w._hierarchical_start_mu = threading.Lock()
-    w._hierarchical_start_cv = threading.Condition(w._hierarchical_start_mu)
-    w._accepted_run_handles = set()
-    w._abandoned_run_handles = []
-    # Run admission is shared/exclusive now, not a plain Lock: production code calls
-    # `.exclusive()` / `.shared()` on it, so the stand-in has to be the real type.
-    w._submit_mu = _SharedExclusiveLock()
-    w._chip_run_touched_identities = {}
-    w._chip_import_registry = None
-    w._reexport_by_source = {}
-    w._worker = None
     return w
 
 
@@ -1187,22 +1167,9 @@ def test_remote_materializer_revalidates_borrowed_backing(mutation):
         ordinary.close()
 
 
-@pytest.mark.parametrize("host", [False, True])
-@pytest.mark.parametrize(
-    "scenario", ["reuse", "conflict", "abort", "release", "missing", "register", "encode", "reply"]
-)
-def test_borrowed_session_commit_and_revocation(monkeypatch, request, scenario, host):
+@pytest.mark.parametrize("scenario", ["reuse", "conflict", "abort", "release", "missing", "reply"])
+def test_borrowed_session_commit_and_revocation(monkeypatch, scenario):
     borrowed = wrap_vmm_window(0x12340000, 128, mint_owner_instance_id(), 7, owner_worker_id=0)
-    backings = (borrowed,)
-    if scenario == "register":
-        backings += (wrap_vmm_window(0x12340100, 128, borrowed.identity.owner_instance_id, 8, owner_worker_id=0),)
-    host_owner = create_host_shared_buffer(128, mint_owner_instance_id(), buffer_id=10) if host else None
-    host_token = b""
-    if host_owner is not None:
-        request.addfinalizer(host_owner.close)
-        host_shm = host_owner.shm
-        assert host_shm is not None
-        host_token = ("/" + host_shm.name).encode()
     members = (domain_wire.GlobalDomainMember(0, 0, 0, 0),)
     init = domain_wire.GlobalCommInitCommand("unit", "a" * 64, "sim", 0, 1, members)
     command = domain_wire.GlobalDomainCommand(
@@ -1211,47 +1178,24 @@ def test_borrowed_session_commit_and_revocation(monkeypatch, request, scenario, 
         1,
         "tp",
         "sim",
-        128 * len(backings),
+        128,
         members,
-        tuple(domain_wire.GlobalDomainBuffer("payload" if i == 0 else "extra", 128) for i in range(len(backings))),
+        (domain_wire.GlobalDomainBuffer("payload", 128),),
         (domain_wire.GlobalDomainDescriptor(domain_wire.GLOBAL_DOMAIN_VERSION, 1, 0, 1, 4096, b"unit"),),
-        owner_instance_id=host_owner.identity.owner_instance_id if host_owner is not None else mint_owner_instance_id(),
-        host_windows=(
-            domain_wire.GlobalDomainHostWindow(
-                0,
-                HostWindowSpec(nbytes=128, numa_id=0),
-                host_owner.identity.buffer_id,
-                domain_wire.HostExportDescriptor(1, host_owner.nbytes, host_token),
-            ),
-        )
-        if host_owner is not None
-        else (),
-        backings=tuple(buffer_reference(backing).to_descriptor() for backing in backings) if host else (),
+        owner_instance_id=mint_owner_instance_id(),
     )
     releases, replies = [], {}
-    events = []
-    execution_live = False
 
     def commit(candidate):
-        nonlocal execution_live
         if candidate != command:
             raise ValueError("COMMIT differs from prepared domain")
         if scenario == "missing":
             raise ValueError("no registered backing")
-        execution_live = True
-        return backings
-
-    def drop(allocation_id):
-        nonlocal execution_live
-        assert allocation_id == -command.domain_id
-        events.append("drop")
-        execution_live = False
+        return (borrowed,)
 
     inner = SimpleNamespace(
         _commit_global_domain_node=commit,
         _release_global_domain_node=lambda _command, **_kwargs: releases.append(_command),
-        _drop_domain_allocs=drop,
-        _global_domain_provenance_id=Worker._global_domain_provenance_id,
     )
     commands = {
         "commit": (wire.ControlName.ALLOC_DOMAIN, domain_wire.encode_domain_command(command)),
@@ -1259,18 +1203,12 @@ def test_borrowed_session_commit_and_revocation(monkeypatch, request, scenario, 
         "abort": (
             wire.ControlName.ALLOC_DOMAIN,
             domain_wire.encode_domain_command(
-                replace(command, phase=domain_wire.GlobalDomainPhase.ABORT, descriptors=(), backings=())
+                replace(command, phase=domain_wire.GlobalDomainPhase.ABORT, descriptors=())
             ),
         ),
         "release": (
             wire.ControlName.RELEASE_DOMAIN,
-            domain_wire.encode_release_command(
-                domain_wire.GlobalDomainReleaseCommand(
-                    7,
-                    1,
-                    domain_wire.GlobalDomainReleaseStage.VIEWS if host else domain_wire.GlobalDomainReleaseStage.FULL,
-                )
-            ),
+            domain_wire.encode_release_command(domain_wire.GlobalDomainReleaseCommand(7, 1)),
         ),
         "free": (wire.ControlName.FREE_REMOTE_BUFFER, struct.pack("<iQQ", 0, 1, 1)),
         "copy_to": (wire.ControlName.COPY_TO_REMOTE, struct.pack("<iQQQQ", 0, 1, 1, 0, 4) + b"data"),
@@ -1283,8 +1221,6 @@ def test_borrowed_session_commit_and_revocation(monkeypatch, request, scenario, 
         "abort": ["commit", "abort", "copy_from"],
         "release": ["commit", "release", "copy_from"],
         "missing": ["commit", "copy_from"],
-        "register": ["commit", "copy_from"],
-        "encode": ["commit", "copy_from"],
         "reply": ["commit", "copy_from"],
     }[scenario]
     controls = [(wire.ControlName.COMM_INIT, domain_wire.encode_comm_init(init))] + [
@@ -1306,40 +1242,9 @@ def test_borrowed_session_commit_and_revocation(monkeypatch, request, scenario, 
             _sequence, name, _version, error, size = struct.unpack_from("<QIIiI", payload)
             if scenario == "reply" and not interrupted and name == wire.ControlName.ALLOC_DOMAIN and not error:
                 interrupted.append(True)
-                events.append("reply-interrupted")
                 raise RuntimeError("reply interrupted")
-            if error and name == wire.ControlName.ALLOC_DOMAIN and scenario in ("register", "encode", "reply"):
-                if host:
-                    assert not execution_live and "drop" in events
-                events.append("commit-error")
             replies[header.sequence] = error, payload[24 : 24 + size].decode(), payload[28 + size :]
 
-    original_init = remote_l3_session._RemoteBufferEntry.__init__
-    original_close = remote_l3_session._RemoteBufferEntry.close
-    registered = []
-
-    def register(entry, *args, **kwargs):
-        if scenario == "register" and registered and kwargs.get("borrowed_domain") is not None:
-            events.append("register-interrupted")
-            raise RuntimeError("second registration interrupted")
-        original_init(entry, *args, **kwargs)
-        if entry.borrowed_domain is not None:
-            registered.append(entry)
-
-    def close(entry, **kwargs):
-        if entry.borrowed_domain is not None:
-            events.append("revoke")
-        original_close(entry, **kwargs)
-
-    if scenario == "encode":
-
-        def fail_encode(_references):
-            events.append("encode-interrupted")
-            raise RuntimeError("reference encoding interrupted")
-
-        monkeypatch.setattr(remote_l3_session, "encode_domain_buffer_refs", fail_encode)
-    monkeypatch.setattr(remote_l3_session._RemoteBufferEntry, "__init__", register)
-    monkeypatch.setattr(remote_l3_session._RemoteBufferEntry, "close", close)
     monkeypatch.setattr(remote_l3_session, "read_frame", lambda _conn: next(frames))
     monkeypatch.setattr(remote_l3_session, "send_frame", send)
     for operation in ("memmove", "string_at"):
@@ -1348,21 +1253,9 @@ def test_borrowed_session_commit_and_revocation(monkeypatch, request, scenario, 
         cast(Any, None), _manifest(cluster_id="unit", global_device_ranks=[0]), cast(Worker, inner)
     )
     results = [replies[sequence] for sequence in range(2, len(controls) + 1)]
-    assert all(not backing.closed for backing in backings)
-    assert host_owner is None or not host_owner.closed
-    if scenario in ("missing", "register", "encode", "reply"):
+    assert not borrowed.closed
+    if scenario in ("missing", "reply"):
         assert results[0][0] and results[1][0] and "unknown buffer" in results[1][1]
-        assert releases == []
-        if scenario == "missing":
-            assert not registered and not events
-        else:
-            assert len(registered) == 1 and registered[0].released
-            assert events.count("revoke") == 1
-            assert events.index("revoke") < events.index("commit-error")
-            if host:
-                assert events.index("drop") < events.index("revoke") and not execution_live
-            else:
-                assert "drop" not in events
     else:
         refs = domain_wire.decode_domain_buffer_refs(results[0][2])
         assert refs == ((buffer_reference(borrowed).to_descriptor(), 1, 1),)

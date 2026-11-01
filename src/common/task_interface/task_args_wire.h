@@ -111,7 +111,7 @@ public:
 };
 
 // The mailbox argument slot reserves one byte of the view padding for the invocation request.
-// Tensor itself remains a view: standalone Tensor serialization leaves all three bytes padding.
+// Byte 142 carries mapping_ref; byte 143 is reserved and must be zero.
 inline constexpr size_t TASK_ARG_TRANSFER_OFFSET = offsetof(Tensor, _pad);
 static_assert(TASK_ARG_TRANSFER_OFFSET == 141, "mailbox transfer offset is wire ABI");
 
@@ -170,7 +170,8 @@ struct TaskArgsView {
 // total bytes used:           8 + 144T + 8S
 //
 // Each slot carries the self-describing `Tensor` view and its invocation transfer, so a
-// consumer resolves it with no prior handshake. A chip child materializes each one to a
+// consumer resolves ordinary backends lazily; REMOTE_SIDECAR requires an explicit binding.
+// A chip child materializes each one to a
 // `ChipTensor` (address-bearing) and assembles a `ChipStorageTaskArgs` for the runtime.so ABI.
 
 inline constexpr size_t TASK_ARGS_BLOB_HEADER_SIZE = 8;

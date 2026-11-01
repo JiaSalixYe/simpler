@@ -38,7 +38,7 @@ from simpler.worker import RemoteCallable
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
-from tests.st.worker.comm_domain.test_host_sparse_sdma import SIZE, N, build_sparse_sdma
+from tests.st.worker.comm_domain.test_host_domain import SIZE, N
 
 MODULE = "tests.st.worker.comm_domain.host_domain_matrix"
 WINDOW = 4096
@@ -304,6 +304,51 @@ def run_matrix(worker, nodes, kernel, route):
 
 
 _SPARSE = {}
+
+
+def build_sparse_sdma(platform):
+    compiler = KernelCompiler(platform=platform)
+    include = compiler.get_orchestration_include_dirs("tensormap_and_ringbuffer")
+    sources = [
+        Path(__file__).parent / "kernels/host_sparse_sdma.cpp",
+        Path(__file__).resolve().parents[4]
+        / "examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/kernels/aiv/kernel_consumer.cpp",
+    ]
+    children = []
+    for index, source in enumerate(sources):
+        binary = compiler.compile_incore(
+            source_path=str(source), core_type="aiv", pto_isa_root=ensure_pto_isa_root(), extra_include_dirs=include
+        )
+        children.append(
+            (
+                index,
+                CoreCallable.build(
+                    signature=(
+                        [ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT]
+                        if index == 0
+                        else [ArgDirection.IN, ArgDirection.OUT]
+                    ),
+                    binary=extract_text_section(binary),
+                ),
+            )
+        )
+    orchestration = compiler.compile_orchestration(
+        runtime_name="tensormap_and_ringbuffer",
+        source_path=str(Path(__file__).parent / "kernels/host_sparse_sdma_orch.cpp"),
+    )
+    return ChipCallable.build(
+        signature=[
+            ArgDirection.IN,
+            ArgDirection.IN,
+            ArgDirection.IN,
+            ArgDirection.OUT,
+            ArgDirection.OUT,
+            ArgDirection.OUT,
+        ],
+        func_name="host_sparse_sdma",
+        binary=orchestration,
+        children=children,
+    )
 
 
 def sparse_node_orch(orch, args, cfg):

@@ -923,6 +923,14 @@ int simpler_init(
 );
 
 /**
+ * Required runtime entry for initialization diagnostics; NULL means no detail.
+ * The context owns the returned string; copy it before cleanup, destruction,
+ * or another initialization attempt. Initialization and cleanup are serialized
+ * by the caller. Backends with no detail still export this entry and return NULL.
+ */
+const char *simpler_get_init_error_ctx(DeviceContextHandle ctx);
+
+/**
  * Release all device resources held by the context.
  * Must be called before destroy_device_context() / dlclose(). Returns an error
  * without teardown while a prepared native run remains unfinalized.
@@ -1308,6 +1316,27 @@ size_t get_host_dlopen_count(DeviceContextHandle ctx);
  * bootstrap pair.
  */
 size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
+
+/**
+ * Which device-side scheduler the most recent bind on `ctx` selected, as a
+ * SCHEDULER_RUNTIME_MODE_* value; 0 means no bind has published a selection.
+ *
+ * Optional: ChipWorker resolves it with a bare dlsym, so a module that does not
+ * export it is a fact about the backend rather than a stale build. Only the a5
+ * host_build_graph runtime publishes a selection — every other arch and runtime
+ * reports 0 because nothing ever calls the recording hook.
+ *
+ * The value is latched by the runner, not read back from the runtime: the
+ * launch descriptor's copy is cleared when a run releases its bindings.
+ */
+uint32_t get_last_scheduler_runtime_mode(DeviceContextHandle ctx);
+
+/**
+ * How many times a bind on `ctx` has published a scheduler selection. Separates
+ * "this bind selected again" from "the latch still holds an older run's value",
+ * which a mode alone cannot express. Optional, like the getter above.
+ */
+size_t get_scheduler_mode_publish_count(DeviceContextHandle ctx);
 
 /**
  * Copy out what this context's `finalize_device` observed about its own device

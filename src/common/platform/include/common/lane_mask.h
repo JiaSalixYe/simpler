@@ -92,6 +92,7 @@ public:
         return false;
     }
     SIMPLER_LANE_AICORE constexpr bool is_empty() const { return bits_ == 0; }
+    SIMPLER_LANE_AICORE constexpr bool is_aic() const { return bits_ == kAic; }
     SIMPLER_LANE_AICORE constexpr bool is_full() const { return bits_ == kAll; }
     SIMPLER_LANE_AICORE constexpr bool is_mix() const { return count() >= 2; }
     SIMPLER_LANE_AICORE constexpr bool is_valid() const { return (bits_ & ~kAll) == 0; }
@@ -111,10 +112,34 @@ public:
     SIMPLER_LANE_AICORE constexpr int rank_of(SubtaskSlot slot) const {
         return (slot != SubtaskSlot::AIC && has_aic()) + (slot == SubtaskSlot::AIV1 && has_aiv0());
     }
+    SIMPLER_LANE_AICORE constexpr LaneMask merged_with(LaneMask other) const {
+        LaneMask merged = *this;
+        merged.bits_ |= other.bits_;
+        return merged;
+    }
+    SIMPLER_LANE_AICORE constexpr bool contains(LaneMask other) const { return (bits_ & other.bits_) == other.bits_; }
+
     SIMPLER_LANE_AICORE constexpr bool operator==(LaneMask other) const { return bits_ == other.bits_; }
     SIMPLER_LANE_AICORE constexpr bool operator!=(LaneMask other) const { return bits_ != other.bits_; }
 
+    // The byte wire structs already store and a reader memcpy's back, so this
+    // is what a serialized lane set is. Scheduling decisions take the queries
+    // above instead; this exists for carrying the value across a boundary that
+    // cannot hold the type.
+    SIMPLER_LANE_AICORE constexpr uint8_t raw() const { return bits_; }
+
 private:
+    static constexpr int kBitWidth = SUBTASK_SLOT_COUNT;
+    SIMPLER_LANE_AICORE constexpr uint8_t bits() const { return bits_; }
+    SIMPLER_LANE_AICORE static constexpr LaneMask from_low_bits(uintptr_t word) {
+        LaneMask lanes;
+        lanes.bits_ = static_cast<uint8_t>(word & kAll);
+        return lanes;
+    }
+    template <typename, typename, int>
+    friend class TaggedPtr;
+    friend class LaneDemandCounter;
+
     static constexpr uint8_t kAic = 1u << 0;
     static constexpr uint8_t kAiv0 = 1u << 1;
     static constexpr uint8_t kAiv1 = 1u << 2;

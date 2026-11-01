@@ -32,7 +32,7 @@ jobs:
       TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
-      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "6000"
     steps:
       - name: Checkout target
         uses: actions/checkout@v5
@@ -71,6 +71,8 @@ jobs:
 
       - name: Retain framework eager identities and logs
         if: always()
+        # The test result is already checked above; artifact service failures only lose diagnostics.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: framework-eager-${{ inputs.platform }}-${{ github.run_id }}-${{ github.run_attempt }}

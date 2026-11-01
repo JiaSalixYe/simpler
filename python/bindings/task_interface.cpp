@@ -56,6 +56,7 @@
 #include <utility>
 #include <vector>
 
+#include "host_backing_owner.h"
 #include "arg_direction.h"
 #include "callable.h"
 #include "callable_protocol.h"
@@ -104,6 +105,8 @@ NativeRunProvenance make_run_provenance(
     provenance.group_size = group_size;
     return provenance;
 }
+
+using simpler::host::HostBackingOwner;
 
 struct LocalAclMemLocation {
     uint32_t id{0};
@@ -195,7 +198,7 @@ public:
             return;
         }
         int rc = aclInit(nullptr);
-        if (rc != kAclSuccess && rc != kAclErrorRepeatInitialize) {
+        if (rc != kAclSuccess && rc != kAclRepeatInitialize) {
             throw std::runtime_error("aclInit failed with code " + std::to_string(rc));
         }
         initialized_ = true;
@@ -312,46 +315,9 @@ public:
         }
     }
 
-    void require_host_fabric() const {
-        using SocName = const char *(*)();
-        auto soc_name = reinterpret_cast<SocName>(resolve_symbol("aclrtGetSocName"));
-        const char *soc = soc_name();
-        if (!soc || std::strncmp(soc, "Ascend910_93", 12) != 0)
-            throw std::runtime_error("Host Fabric backing requires an A3 device");
-        (void)resolve_symbol("aclrtMemExportToShareableHandleV2");
-        (void)resolve_symbol("aclrtReserveMemAddressNoUCMemory");
-    }
-
-    void export_fabric(void *handle, void *token) const {
-        using Export = int (*)(void *, uint64_t, int, void *);
-        constexpr uint64_t export_flags = 0;
-        constexpr int fabric_handle_type = 2;
-        auto export_handle = reinterpret_cast<Export>(resolve_symbol("aclrtMemExportToShareableHandleV2"));
-        acl_check(export_handle(handle, export_flags, fabric_handle_type, token), "Fabric export");
-    }
-
-    int fabric_process_id() const {
-        using GetPid = int (*)(int32_t *);
-        int32_t pid = 0;
-        auto get_pid = reinterpret_cast<GetPid>(resolve_symbol("aclrtDeviceGetBareTgid"));
-        acl_check(get_pid(&pid), "Fabric process identity");
-        if (pid <= 0) throw std::runtime_error("Invalid Fabric process identity");
-        return pid;
-    }
-
-    void authorize_fabric(void *token, std::vector<int32_t> pids) const {
-        if (pids.empty() || std::any_of(pids.begin(), pids.end(), [](int32_t pid) {
-                return pid <= 0;
-            }))
-            throw std::invalid_argument("Fabric authorization requires positive process identities");
-        using Authorize = int (*)(void *, int, int32_t *, size_t);
-        auto authorize = reinterpret_cast<Authorize>(resolve_symbol("aclrtMemSetPidToShareableHandleV2"));
-        acl_check(authorize(token, 2, pids.data(), pids.size()), "Fabric process authorization");
-    }
-
 private:
     static constexpr int kAclSuccess = 0;
-    static constexpr int kAclErrorRepeatInitialize = 100002;
+    static constexpr int kAclRepeatInitialize = 100002;
     static constexpr int kAclMemcpyHostToDevice = 1;
     static constexpr int kAclMemcpyDeviceToHost = 2;
     static constexpr int kAclMemHandleTypeNone = 0;
@@ -397,73 +363,6 @@ AclRuntimeApi &acl_api() {
     });
     return *api;
 }
-
-// Explicitly released by the node domain after every imported view is acknowledged gone.
-// Destruction cannot prove that acknowledgement and therefore does not free the allocation.
-class HostDomainMemory {
-public:
-    nb::tuple allocate(int device, uint32_t numa, uint64_t logical_bytes) {
-        if (handle_ || base_ || !logical_bytes) throw std::invalid_argument("Host allocation is not empty");
-        auto &api = acl_api();
-        api.bind_device_with_check(device);
-        api.require_host_fabric();
-        device_ = device;
-        LocalAclPhysicalMemProp prop{};
-        constexpr int p2p_huge = 16, host_numa = 4;
-        prop.memAttr = p2p_huge;
-        prop.location = {numa, host_numa};
-        size_t granularity = 0;
-        check(api.aclrtMemGetAllocationGranularity(&prop, 0, &granularity), "Host granularity");
-        if (!granularity || logical_bytes > SIZE_MAX - (granularity - 1))
-            throw std::invalid_argument("Host allocation extent overflow");
-        size_ = (logical_bytes + granularity - 1) / granularity * granularity;
-        check(api.aclrtMallocPhysical(&handle_, size_, &prop, 0), "Host physical allocation");
-        check(api.aclrtReserveMemAddress(&base_, size_, 0, nullptr, 1), "Host VA reservation");
-        check(api.aclrtMapMem(base_, size_, 0, handle_, 0), "Host owner mapping");
-        mapped_ = true;
-        std::memset(base_, 0, logical_bytes);
-        api.export_fabric(handle_, token_.data());
-        return nb::make_tuple(size_, nb::bytes(reinterpret_cast<const char *>(token_.data()), token_.size()));
-    }
-    void authorize(const std::vector<int32_t> &pids) {
-        if (!mapped_ || !handle_) throw std::invalid_argument("Host owner has no live allocation");
-        auto &api = acl_api();
-        api.bind_device_with_check(device_);
-        api.authorize_fabric(token_.data(), pids);
-    }
-    uint64_t base() const {
-        if (!mapped_ || !base_) throw std::invalid_argument("Host owner has no live mapping");
-        return reinterpret_cast<uint64_t>(base_);
-    }
-    void release() {
-        if (!base_ && !handle_) return;
-        auto &api = acl_api();
-        api.bind_device_with_check(device_);
-        if (mapped_) {
-            check(api.aclrtUnmapMem(base_), "Host unmap");
-            mapped_ = false;
-        }
-        if (base_) {
-            check(api.aclrtReleaseMemAddress(base_), "Host VA release");
-            base_ = nullptr;
-        }
-        if (handle_) {
-            check(api.aclrtFreePhysical(handle_), "Host physical free");
-            handle_ = nullptr;
-        }
-    }
-
-private:
-    int device_ = -1;
-    void *base_ = nullptr;
-    void *handle_ = nullptr;
-    bool mapped_ = false;
-    uint64_t size_ = 0;
-    std::array<uint8_t, 128> token_{};
-    static void check(int rc, const char *op) {
-        if (rc) throw std::runtime_error(std::string(op) + " failed with code " + std::to_string(rc));
-    }
-};
 
 std::string region_shm_name_for_open(const std::string &token) {
     if (token.empty()) {
@@ -1881,7 +1780,8 @@ CtypesFormat classify_ctypes_format(const char *format) {
 }
 
 // Resolve one wire tensor onto a local base and build the address-bearing device POD.
-// Mapping attachments use (identity, selector); plain views use the backing identity.
+// `resolved` maps CanonicalIdentity -> (local_base, address_space); the caller populates it by
+// materializing each embedded descriptor.
 ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict resolved) {
     uint64_t elem = get_element_size(r.dtype);
     if (elem == 0) {
@@ -2151,15 +2051,20 @@ BufferDescriptor decode_buffer_descriptor_wire(const uint8_t *raw, size_t size) 
 #endif
 
 NB_MODULE(_task_interface, m) {
-    m.def("_fabric_process_id", [] {
-        return acl_api().fabric_process_id();
-    });
-    nb::class_<HostDomainMemory>(m, "_HostDomainMemory")
-        .def(nb::init<>())
-        .def("allocate", &HostDomainMemory::allocate)
-        .def("authorize", &HostDomainMemory::authorize)
-        .def_prop_ro("base", &HostDomainMemory::base)
-        .def("release", &HostDomainMemory::release);
+    nb::class_<HostBackingOwner>(m, "_HostDomainMemory")
+        .def(nb::init<const std::string &>())
+        .def(
+            "allocate",
+            [](HostBackingOwner &owner, int device, uint32_t numa, uint64_t nbytes) {
+                const auto [size, token] = owner.allocate(device, numa, nbytes);
+                return nb::make_tuple(size, nb::bytes(reinterpret_cast<const char *>(token.data()), token.size()));
+            }
+        )
+        .def("require_mapping_support", &HostBackingOwner::require_mapping_support)
+        .def("authorize", &HostBackingOwner::authorize)
+        .def_prop_ro("base", &HostBackingOwner::base)
+        .def("release", &HostBackingOwner::release)
+        .def("process_identity", &HostBackingOwner::process_identity);
     m.doc() = "Nanobind bindings for task_interface (DataType, Buffer/Tensor wire ABI, ChipTensor, TaskArgs variants)";
 
     // Source commit this extension was compiled from; "" when git was
@@ -2600,11 +2505,12 @@ NB_MODULE(_task_interface, m) {
         .def_ro("mapping_ref", &Tensor::mapping_ref)
         .def(
             "_with_mapping_ref",
-            [](const Tensor &self, int reference) {
-                if (reference <= 0 || reference > UINT8_MAX)
-                    throw std::invalid_argument("mapping reference must be in [1, 255]");
+            [](const Tensor &self, uint8_t reference) {
+                if (!reference) throw std::invalid_argument("mapping reference must be nonzero");
+                if (self.mapping_ref && self.mapping_ref != reference)
+                    throw std::invalid_argument("mapping reference is immutable; map the native Tensor explicitly");
                 Tensor mapped = self;
-                mapped.mapping_ref = static_cast<uint8_t>(reference);
+                mapped.mapping_ref = reference;
                 validate_tensor(mapped);
                 return mapped;
             },
@@ -3061,7 +2967,6 @@ NB_MODULE(_task_interface, m) {
                 for (int32_t i = 0; i < n; ++i) {
                     if (self.tensor(i).mapping_ref) return true;
                     const auto backend = static_cast<BackendKind>(self.tensor(i).buffer.backend_kind);
-                    if (self.tensor(i).mapping_ref) return true;
                     if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW) return true;
                 }
                 return false;
@@ -4179,6 +4084,22 @@ NB_MODULE(_task_interface, m) {
             "Platforms using the persistent bootstrap pair report 0."
         )
         .def_prop_ro(
+            "scheduler_runtime_mode", &ChipWorker::last_scheduler_runtime_mode,
+            "Which device-side scheduler the most recent bind selected, as a "
+            "SCHEDULER_RUNTIME_MODE_* value: 1 = resident pending, 2 = resident "
+            "ready, 3 = legacy (graph task present), 4 = legacy (unsupported task "
+            "shape). 0 means no selection was ever published -- which is the "
+            "value every runtime other than the a5 host_build_graph one reports, "
+            "because only it selects between schedulers. Latched by the runner: "
+            "the runtime's own copy is cleared when a run releases its bindings."
+        )
+        .def_prop_ro(
+            "scheduler_mode_publish_count", &ChipWorker::scheduler_mode_publish_count,
+            "How many times this worker's binds have published a scheduler "
+            "selection. Tells 'this bind selected again' apart from 'the latch "
+            "still holds an earlier run's value', which the mode alone cannot."
+        )
+        .def_prop_ro(
             "committed_device_memory", &ChipWorker::committed_device_memory,
             "Total device HBM (bytes) currently committed by this worker's "
             "MemoryAllocator (user tensors + pooled arenas + runtime buffers). "
@@ -4251,6 +4172,20 @@ NB_MODULE(_task_interface, m) {
             nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
         )
+        .def("host_backing_process_identity", &ChipWorker::host_backing_process_identity)
+        .def(
+            "comm_detach_domain_host", &ChipWorker::comm_detach_domain_host, nb::arg("comm_handle"),
+            nb::arg("allocation_id"), "Release a drained Host view while retaining its domain and HBM windows."
+        )
+        .def(
+            "comm_attach_domain_host",
+            [](ChipWorker &self, uint64_t handle, uint64_t allocation, nb::bytes descriptor) {
+                const auto *begin = reinterpret_cast<const uint8_t *>(descriptor.c_str());
+                return self.comm_attach_domain_host(
+                    handle, allocation, std::vector<uint8_t>(begin, begin + descriptor.size())
+                );
+            }
+        )
         .def(
             "comm_global_domain_prepare",
             [](ChipWorker &self, uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size,
@@ -4288,6 +4223,17 @@ NB_MODULE(_task_interface, m) {
             },
             nb::arg("domain_id"), nb::arg("profile"), nb::arg("token"), nb::arg("mapping_size"),
             "Import a raw Host export and return its device view."
+        )
+        .def(
+            "comm_global_domain_detach_host",
+            [](ChipWorker &self, uint64_t domain_id, nb::bytes token) {
+                self.comm_global_domain_detach_host(
+                    domain_id, std::vector<uint8_t>(
+                                   reinterpret_cast<const uint8_t *>(token.c_str()),
+                                   reinterpret_cast<const uint8_t *>(token.c_str()) + token.size()
+                               )
+                );
+            }
         )
         .def(
             "comm_global_domain_release", &ChipWorker::comm_global_domain_release, nb::arg("domain_id"),
@@ -4332,8 +4278,7 @@ NB_MODULE(_task_interface, m) {
         "Materialize a TaskArgs held in this process into the runtime.so-ABI ChipStorageTaskArgs "
         "POD — the sole path to that POD, whether the args are an L2 leaf's own or a chip child's "
         "read back from its mailbox with read_args_from_blob. Each tensor's embedded buffer "
-        "identity (or (identity, mapping_ref) for mapped views) is resolved via `resolved` to (local_base, "
-        "address_space); "
+        "identity is resolved via `resolved` {CanonicalIdentity: (local_base, address_space)}; "
         "addr = base + byte_offset. The caller pre-populates `resolved` by materializing each "
         "embedded descriptor on first receipt. Strided views (transpose / permute / step-slice) "
         "materialize to strided ChipTensors. Rejects an unknown identity and a non-dtype-aligned "

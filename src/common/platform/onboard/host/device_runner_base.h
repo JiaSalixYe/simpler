@@ -326,6 +326,10 @@ public:
     /** True only after simpler_init succeeds and before teardown begins. */
     bool program_initialized() const { return program_initialized_; }
     void set_program_initialized(bool initialized) { program_initialized_ = initialized; }
+    const char *initialization_error() const {
+        return initialization_error_.empty() ? nullptr : initialization_error_.c_str();
+    }
+    void clear_initialization_error() { initialization_error_.clear(); }
 
     /** Context-lifetime streams and events, live only in kernel mode. */
     KernelExecutionState &kernel_execution_state() { return kernel_exec_state_; }
@@ -1435,6 +1439,27 @@ public:
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
     /**
+     * Which device-side scheduler the most recent bind selected, as a
+     * SCHEDULER_RUNTIME_MODE_* value, or 0 when no bind has published one.
+     *
+     * Latched rather than read back from the runtime: the launch descriptor's
+     * copy is cleared when a run releases its bindings, so by the time a caller
+     * could look it is already 0. Never cleared here — a later bind overwrites
+     * it, and `scheduler_mode_publish_count()` is what distinguishes "this bind
+     * chose again" from "nothing has changed since the last one".
+     */
+    uint32_t last_scheduler_runtime_mode() const {
+        return last_scheduler_runtime_mode_.load(std::memory_order_relaxed);
+    }
+    size_t scheduler_mode_publish_count() const {
+        return scheduler_mode_publish_total_.load(std::memory_order_relaxed);
+    }
+    void record_scheduler_runtime_mode(uint32_t mode) {
+        last_scheduler_runtime_mode_.store(mode, std::memory_order_relaxed);
+        scheduler_mode_publish_total_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /**
      * Number of run stream generations this runner has created. AICPU streams
      * belong to pipeline slots, while an AICore stream is reused only for the
      * same AICore image. Arches whose runs use the persistent pair report 0.
@@ -2161,7 +2186,7 @@ protected:
      * timeout may differ from the requested value due to hardware timer
      * granularity.
      */
-    void configure_aicore_op_timeout();
+    int configure_aicore_op_timeout();
 
     PersistentArgsOps persistent_args_ops();
     int register_callable_on_device(int32_t callable_id, rtStream_t control_stream);
@@ -2891,6 +2916,9 @@ protected:
     // Same re-register semantics as `aicpu_dlopen_total_`, but for hbg
     // variants.
     size_t host_dlopen_total_{0};
+    // Written on the bind path, read by the caller's thread.
+    std::atomic<uint32_t> last_scheduler_runtime_mode_{0};
+    std::atomic<size_t> scheduler_mode_publish_total_{0};
     struct NativeRunReservation {
         const void *owner{nullptr};
         uint32_t pipeline_slot{0};
@@ -2961,6 +2989,9 @@ protected:
     uint32_t max_cube_cores_{0};
     uint32_t max_vector_cores_{0};
     HostRuntimeTimeoutConfig timeout_config_{PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS};
+    // Owned execution retains the first configuration result until device close.
+    int timeout_configuration_rc_{PTO_RUNTIME_ERR_INVALID_STATE};
+    std::string initialization_error_;
 
     // Executor binaries — populated once via `set_executors()` during
     // simpler_init. `aicore_kernel_binary_` is consumed once by

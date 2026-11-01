@@ -6,7 +6,12 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Platform-specific Host backing; domain identity and lifetime live in host_domain."""
+"""Host allocation backend; resource identity and lifetime live in host_domain.
+
+Local exports reuse the native global descriptor v2 envelope, not rank membership.
+Its version/profile rules are checked by both Python and comm_attach_domain_host;
+changing that envelope requires a paired Python/native migration.
+"""
 
 import os
 
@@ -18,7 +23,8 @@ from .global_comm_domain import (
     GLOBAL_DOMAIN_PROFILE_A3_FABRIC,
     GLOBAL_DOMAIN_PROFILE_IDS,
     GLOBAL_DOMAIN_PROFILE_SIM,
-    HostExportDescriptor,
+    GLOBAL_DOMAIN_VERSION,
+    GlobalDomainDescriptor,
 )
 
 
@@ -26,7 +32,7 @@ class SharedHostBacking:
     profile = AdapterProfile.HOST_SHM_MAP
     attachment_profile = AdapterProfile.HOST_SHM_MAP
 
-    def __init__(self):
+    def __init__(self, *, host_runtime_path=None):
         self.shared = None
 
     @staticmethod
@@ -36,7 +42,7 @@ class SharedHostBacking:
     def authorize(self, identities):
         pass
 
-    def allocate(self, spec, identity, device):
+    def allocate(self, spec, identity, device, rank_count):
         page_size = os.sysconf("SC_PAGE_SIZE")
         mapping_size = (spec.nbytes + page_size - 1) // page_size * page_size
         self.shared = create_host_shared_buffer(
@@ -45,8 +51,11 @@ class SharedHostBacking:
             identity.buffer_id,
             generation=identity.generation,
         )
-        return self.shared.base, HostExportDescriptor(
+        return self.shared.base, GlobalDomainDescriptor(
+            GLOBAL_DOMAIN_VERSION,
             GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_SIM],
+            0,
+            rank_count,
             mapping_size,
             self.shared.body,
         )
@@ -60,22 +69,25 @@ class A3HostBacking:
     profile = AdapterProfile.HOST_VMM_MAP
     attachment_profile = AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT
 
-    def __init__(self):
-        self.native = _HostDomainMemory()
+    def __init__(self, *, host_runtime_path=None):
+        if host_runtime_path is None:
+            raise ValueError("Host backing requires an initialized platform runtime")
+        self.native = _HostDomainMemory(str(host_runtime_path))
+        self.native.require_mapping_support()
 
-    def allocate(self, spec, identity, device):
+    def allocate(self, spec, identity, device, rank_count):
         size, token = self.native.allocate(device, spec.numa_id, spec.nbytes)
-        return self.native.base, HostExportDescriptor(
+        return self.native.base, GlobalDomainDescriptor(
+            GLOBAL_DOMAIN_VERSION,
             GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_A3_FABRIC],
+            0,
+            rank_count,
             size,
             token,
         )
 
-    @staticmethod
-    def process_identity():
-        from _task_interface import _fabric_process_id  # noqa: PLC0415
-
-        return _fabric_process_id()
+    def process_identity(self):
+        return self.native.process_identity()
 
     def authorize(self, identities):
         self.native.authorize(identities)
@@ -87,10 +99,13 @@ class A3HostBacking:
 _HOST_BACKENDS = {"a2a3sim": SharedHostBacking, "a2a3": A3HostBacking}
 
 
-def host_process_identity(platform):
+def host_process_identity(platform, chip_worker=None):
     """Optional Host identity piggybacks on the existing HBM communicator handshake."""
-    backend = _HOST_BACKENDS.get(platform)
-    return backend.process_identity() if backend is not None else 0
+    if platform == "a2a3":
+        if chip_worker is None:
+            raise ValueError("Host identity requires the initialized chip endpoint")
+        return chip_worker.host_backing_process_identity()
+    return 0
 
 
 def host_backing_type(platform):
@@ -101,20 +116,9 @@ def host_backing_type(platform):
         raise ValueError(f"Host domain backing is not implemented for {platform!r}") from None
 
 
-def host_attachment_profile(descriptor: HostExportDescriptor, platform: str) -> AdapterProfile:
+def host_attachment_profile(descriptor: GlobalDomainDescriptor, platform: str) -> AdapterProfile:
     expected = GLOBAL_DOMAIN_PROFILE_SIM if platform == "a2a3sim" else GLOBAL_DOMAIN_PROFILE_A3_FABRIC
     backend = host_backing_type(platform)
     if descriptor.profile_id != GLOBAL_DOMAIN_PROFILE_IDS[expected]:
         raise ValueError("Host attachment descriptor does not match the platform backend")
     return backend.attachment_profile
-
-
-def host_authorization_targets(profile, identities):
-    """Normalize the selected transport's authorization identities for domain exchange."""
-    if profile == GLOBAL_DOMAIN_PROFILE_SIM:
-        return (1,) * len(identities)
-    if profile != GLOBAL_DOMAIN_PROFILE_A3_FABRIC:
-        raise ValueError("Host authorization profile is not implemented")
-    if not identities or any(pid <= 0 for pid in identities):
-        raise ValueError("Host prepare reply has invalid Fabric process IDs")
-    return tuple(identities)

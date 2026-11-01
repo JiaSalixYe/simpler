@@ -364,6 +364,14 @@ static int acquire_scheduler_state_storage(
     }
 }
 
+static void record_scheduler_runtime_mode(void *runner_ctx, uint32_t pipeline_slot, uint32_t mode) {
+    (void)pipeline_slot;
+    if (runner_ctx == nullptr) return;
+    try {
+        static_cast<DeviceRunnerBase *>(runner_ctx)->record_scheduler_runtime_mode(mode);
+    } catch (...) {}
+}
+
 static int
 acquire_graph_staging(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **staging_out) {
     if (runner_ctx == nullptr) return -1;
@@ -634,6 +642,7 @@ static const HostApiOps g_host_api_ops = {
     .publish_graph_section = publish_graph_section,
     .get_graph_definition_staging = get_graph_definition_staging,
     .acquire_scheduler_state_storage = acquire_scheduler_state_storage,
+    .record_scheduler_runtime_mode = record_scheduler_runtime_mode,
     .acquire_sm_mirror = acquire_sm_mirror,
     .acquire_run_image_staging = acquire_run_image_staging,
     .setup_static_arena = setup_static_arena_wrapper,
@@ -833,6 +842,10 @@ int simpler_execution_environment_releasable_ctx(DeviceContextHandle ctx) {
     }
 }
 
+const char *simpler_get_init_error_ctx(DeviceContextHandle ctx) {
+    return ctx == nullptr ? nullptr : static_cast<DeviceRunnerBase *>(ctx)->initialization_error();
+}
+
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
@@ -871,6 +884,7 @@ int simpler_init(
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
     runner->set_program_initialized(false);
+    runner->clear_initialization_error();
 
     // Admitted, so the proof is already spent: every step from here on is a
     // post-consume one, and each exit records that this context is no longer
@@ -1343,7 +1357,7 @@ static void emit_device_boundary_marks(OnboardNativeRunContext *state) {
         state->runner->run_boundary_mark(RunBoundaryMarks::Position::WholeOperatorEnd, state->identity());
     char attrs[SIMPLER_HOST_SPAN_ATTRIBUTES_CAPACITY];
     (void)std::snprintf(
-        attrs, sizeof(attrs), "clk=dev dev_id=%d aic_start=%llu aic_rc=%d wo_end=%llu wo_rc=%d ts_hz=%llu",
+        attrs, sizeof(attrs), "clk=host dev_id=%d aic_start=%llu aic_rc=%d wo_end=%llu wo_rc=%d ts_hz=%llu",
         state->runner->device_id(), static_cast<unsigned long long>(start.available ? start.timestamp : 0), start.rc,
         static_cast<unsigned long long>(end.available ? end.timestamp : 0), end.rc,
         static_cast<unsigned long long>(PLATFORM_ACL_EVENT_TIMESTAMP_FREQ_HZ)
@@ -2730,6 +2744,24 @@ size_t get_host_dlopen_count(DeviceContextHandle ctx) {
     if (ctx == NULL) return 0;
     try {
         return static_cast<DeviceRunnerBase *>(ctx)->host_dlopen_count();
+    } catch (...) {
+        return 0;
+    }
+}
+
+uint32_t get_last_scheduler_runtime_mode(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->last_scheduler_runtime_mode();
+    } catch (...) {
+        return 0;
+    }
+}
+
+size_t get_scheduler_mode_publish_count(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->scheduler_mode_publish_count();
     } catch (...) {
         return 0;
     }

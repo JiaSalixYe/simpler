@@ -128,7 +128,7 @@ from _task_interface import (
 )
 
 from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
-from .comm_domain import CommDomainRef, HostWindowSpec, domain_mapping_ref
+from .comm_domain import CommDomainRef, HostWindowSpec
 from .comm_endpoints import DEVICE_AICPU
 
 
@@ -162,19 +162,18 @@ def _materialize_chip_task_args(
     """
     if not isinstance(args, TaskArgs):
         raise TypeError("chip argument materialization requires address-free TaskArgs")
-    if target is not None:
-        for i in range(args.tensor_count()):
-            tensor = args.tensor(i)
-            if tensor.mapping_ref:
-                access = {
-                    ArgDirection.IN: AccessMode.READ,
-                    ArgDirection.OUT: AccessMode.WRITE,
-                    ArgDirection.INOUT: AccessMode.READWRITE,
-                }.get(target.sig(i) if i < target.sig_count else None)
-                if access is None:
-                    raise ValueError("mapped argument requires a declared callable direction")
-                registry.require_mapping_access(tensor, access)
-    resolved = registry.materialize_args(args, check_tags=target is None)
+    for i in range(args.tensor_count()):
+        tensor = args.tensor(i)
+        if tensor.mapping_ref:
+            access = {
+                ArgDirection.IN: AccessMode.READ,
+                ArgDirection.OUT: AccessMode.WRITE,
+                ArgDirection.INOUT: AccessMode.READWRITE,
+            }.get(target.sig(i) if target is not None and i < target.sig_count else None)
+            if access is None:
+                raise ValueError("mapped argument requires a declared callable direction")
+            registry.require_mapping_access(tensor, access)
+    resolved = registry.materialize_args(args)
     return _ti_module.materialize_task_args(args, resolved)
 
 
@@ -1187,7 +1186,9 @@ class CommDomainHandle:
         "_config",
         "_ref",
         "requested_window_size",
+        "_host_resource",
         "_host_buffers",
+        "_mapping_records",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1209,6 +1210,7 @@ class CommDomainHandle:
         _domain_ranks: dict[int, int] | None = None,
         ref: CommDomainRef | None = None,
         host_buffers=None,
+        _mapping_records=None,
         requested_window_size: int | None = None,
         _release_scope: Callable[[CommDomainHandle], contextlib.AbstractContextManager] = contextlib.nullcontext,
     ) -> None:
@@ -1230,7 +1232,9 @@ class CommDomainHandle:
         self.retain_after_run = bool(retain_after_run)
         self.attachments = tuple(attachments)
         self._config = None
+        self._host_resource = None
         self._host_buffers = dict(host_buffers or {})
+        self._mapping_records = _mapping_records or {}
         self._released = False
         self._freed = False
         self._ref = ref
@@ -1244,41 +1248,43 @@ class CommDomainHandle:
         if self._released:
             raise RuntimeError(f"CommDomainHandle({self.name!r}) is already released")
 
-    def member(self, domain_rank: int) -> GlobalDomainMember:
-        """Return rank-ordered topology and ordinary Buffer slices."""
-        self._require_live()
-        rank = int(domain_rank)
-        if rank < 0 or rank >= len(self.members):
-            raise IndexError(f"domain rank {rank} is out of range")
-        return self.members[rank]
-
     def host(self, node_worker_id: int | None = None) -> Buffer:
-        """The node's logical DRAM pool; every chip consumes the same backing identity."""
+        """Return a native Host backing; global domains require its node id."""
         self._require_live()
-        if self.workers and self._host_buffers and not self.borrowed:
+        if self._host_resource is not None:
             if node_worker_id is not None:
                 raise ValueError("local Host window does not select a node")
-            return next(iter(self._host_buffers.values()))
+            return self._host_resource.buffer
         if node_worker_id is None:
             raise ValueError("global Host window requires a node worker id")
         return self._host_buffers[operator.index(node_worker_id)]
 
     def map_view(self, tensor: Tensor, *, domain_rank: int, access=AccessMode.READWRITE) -> Tensor:
-        """Select a granted chip attachment while preserving the source backing."""
-        domain_rank = operator.index(domain_rank)
+        """Establish only the requested grant at this node's target endpoint."""
+        self._require_live()
+        member = self.member(domain_rank)
+        if self._host_resource is not None:
+            return self._host_resource.map_view(tensor, member.local_worker_id, access=access)
         self.local_context(domain_rank)
-        if self.workers and self._host_buffers and not self.borrowed and isinstance(tensor, Tensor):
-            if tensor.mapping_ref:
-                raise ValueError("map_view requires the native Tensor view")
-        if not isinstance(tensor, Tensor) or not any(
-            tensor.buffer == buffer.to_descriptor()
-            for buffer in (
-                *self._host_buffers.values(),
-                *(b for member in self.members for b in member.buffers.values()),
-            )
-        ):
+        resource = self._mapping_records.get(tensor.buffer.identity)
+        if resource is None:
             raise ValueError("map_view requires this domain's exact backing")
-        return tensor._with_mapping_ref(domain_mapping_ref(domain_rank, access))
+        return resource.map_view(tensor, member.local_worker_id, access=access)
+
+    def unmap_view(self, tensor: Tensor) -> None:
+        """Revoke one mapping after accepted users retire; failed cleanup stays closed."""
+        self._require_live()
+        resource = self._host_resource or self._mapping_records.get(tensor.buffer.identity)
+        if resource is None:
+            raise ValueError("unmap_view requires this domain's backing")
+        resource.unmap_view(tensor)
+
+    def member(self, domain_rank: int) -> GlobalDomainMember:
+        self._require_live()
+        rank = operator.index(domain_rank)
+        if not 0 <= rank < len(self.members):
+            raise IndexError(f"domain rank {rank} is out of range")
+        return self.members[rank]
 
     def local_context(self, domain_rank: int) -> ChipDomainContext:
         """Return this creator's local chip mapping; L4 creators hold no such mappings."""
@@ -2108,6 +2114,16 @@ class ChipWorker:
     def run_stream_set_create_count(self):
         """Number of AICore run streams the bound runner has created."""
         return self._impl.run_stream_set_create_count
+
+    @property
+    def scheduler_runtime_mode(self) -> int:
+        """SCHEDULER_RUNTIME_MODE_* of the most recent bind; 0 if none published."""
+        return self._impl.scheduler_runtime_mode
+
+    @property
+    def scheduler_mode_publish_count(self) -> int:
+        """How many binds have published a scheduler selection."""
+        return self._impl.scheduler_mode_publish_count
 
     @property
     def pipeline_depth(self):

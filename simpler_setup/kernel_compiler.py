@@ -388,8 +388,9 @@ class KernelCompiler:
         """Sources needed when public AICPU helper headers are used by orchestration SOs."""
         variant = "sim" if self.platform.endswith("sim") else "onboard"
         source_dir = self.project_root / "src" / "common" / "platform" / variant / "aicpu"
+        cache_dir = source_dir if variant == "sim" else self.platform_dir / "onboard" / "aicpu"
         return [
-            str(source_dir / "cache_ops.cpp"),
+            str(cache_dir / "cache_ops.cpp"),
             str(source_dir / "device_time.cpp"),
         ]
 
@@ -703,7 +704,9 @@ class KernelCompiler:
         out-of-line template instantiations into the single output ``.text``.
 
         The linked image is position-independent: ``--image-base`` does not
-        change the emitted ``.text`` bytes.
+        change the emitted ``.text`` bytes. A separate allocated ``.rodata``
+        still lies outside the text-only payload; the extractor rejects such
+        images, including linked jump tables with no remaining relocations.
         """
         assert self.ccec is not None, "incore linking is only available for hardware platforms"
         linked_path = self._make_temp_path(

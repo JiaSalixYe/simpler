@@ -18,6 +18,7 @@
 #include "host_log.h"
 #include "pipeline_contract.h"
 #include "runtime_module.h"
+#include "host_backing_owner.h"
 #include "host/raii_scope_guard.h"
 
 #include <dlfcn.h>
@@ -321,6 +322,7 @@ void ChipWorker::init(
     KernelInitFn kernel_init_fn = nullptr;
     KernelPrepareCallableFn kernel_prepare_callable_fn = nullptr;
     KernelLaunchFn kernel_launch_fn = nullptr;
+    decltype(&simpler_get_init_error_ctx) get_init_error = nullptr;
     try {
         create_device_context_fn_ = module->required<CreateDeviceContextFn>("create_device_context");
         destroy_device_context_fn_ = module->required<DestroyDeviceContextFn>("destroy_device_context");
@@ -339,6 +341,7 @@ void ChipWorker::init(
         get_runtime_size_fn_ = module->required<GetRuntimeSizeFn>("get_runtime_size");
         get_runtime_alignment_fn_ = module->required<GetRuntimeAlignmentFn>("get_runtime_alignment");
         simpler_init_fn_ = module->required<SimplerInitFn>("simpler_init");
+        get_init_error = module->required<decltype(&simpler_get_init_error_ctx)>("simpler_get_init_error_ctx");
         register_callable_fn_ = module->required<SimplerRegisterCallableFn>("simpler_register_callable");
         // Optional: a runtime built before versioned registration exports
         // nothing, and a null pointer is the refusal.
@@ -416,6 +419,12 @@ void ChipWorker::init(
         get_host_dlopen_count_fn_ = module->required<GetAicpuDlopenCountFn>("get_host_dlopen_count");
         get_run_stream_set_create_count_fn_ =
             module->required<GetAicpuDlopenCountFn>("get_run_stream_set_create_count");
+        // Optional: only the a5 host_build_graph module records a scheduler
+        // selection, so a null here is a fact about the backend.
+        get_last_scheduler_runtime_mode_fn_ =
+            module->optional<GetLastSchedulerRuntimeModeFn>("get_last_scheduler_runtime_mode");
+        get_scheduler_mode_publish_count_fn_ =
+            module->optional<GetAicpuDlopenCountFn>("get_scheduler_mode_publish_count");
         finalize_device_fn_ = module->required<FinalizeDeviceFn>("finalize_device");
         if (sim_context_path.empty()) {
             execution_environment_releasable_fn_ =
@@ -445,11 +454,15 @@ void ChipWorker::init(
         comm_get_window_size_fn_ = module->required<CommGetWindowSizeFn>("comm_get_window_size");
         comm_derive_context_fn_ = module->required<CommDeriveContextFn>("comm_derive_context");
         comm_alloc_domain_windows_fn_ = module->required<CommAllocDomainWindowsFn>("comm_alloc_domain_windows");
+        comm_attach_domain_host_fn_ = module->optional<CommAttachDomainHostFn>("comm_attach_domain_host");
+        comm_detach_domain_host_fn_ = module->optional<CommDetachDomainHostFn>("comm_detach_domain_host");
         comm_release_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_release_domain_windows");
         comm_global_domain_prepare_fn_ = module->required<CommGlobalDomainPrepareFn>("comm_global_domain_prepare");
         comm_global_domain_import_fn_ = module->required<CommGlobalDomainImportFn>("comm_global_domain_import");
         comm_global_domain_release_fn_ = module->required<CommGlobalDomainReleaseFn>("comm_global_domain_release");
         comm_global_domain_window_fn_ = module->required<CommGlobalDomainWindowFn>("comm_global_domain_window");
+        comm_global_domain_detach_host_fn_ =
+            module->optional<CommGlobalDomainDetachHostFn>("comm_global_domain_detach_host");
         comm_global_domain_import_host_fn_ =
             module->optional<CommGlobalDomainImportHostFn>("comm_global_domain_import_host");
         comm_barrier_fn_ = module->required<CommBarrierFn>("comm_barrier");
@@ -565,6 +578,7 @@ void ChipWorker::init(
     bool borrowed_init_attempted = false;
     bool program_init_attempted = false;
     int init_rc = 0;
+    std::string init_error_detail;
     try {
         std::vector<uint8_t> aicpu_bytes = read_binary_file(aicpu_path);
         std::vector<uint8_t> aicore_bytes = read_binary_file(aicore_path);
@@ -662,10 +676,15 @@ void ChipWorker::init(
             );
         }
         if (init_rc != 0) {
-            throw std::runtime_error(
+            std::string error =
                 std::string(borrowed_context_generation.has_value() ? "borrowed init" : "simpler_init") +
-                " failed with code " + std::to_string(init_rc)
-            );
+                " failed with code " + std::to_string(init_rc);
+            if (const char *detail = get_init_error(device_ctx_); detail != nullptr && detail[0] != '\0') {
+                init_error_detail = detail;
+                error += ": ";
+                error += init_error_detail;
+            }
+            throw std::runtime_error(error);
         }
     } catch (...) {
         // Onboard init can leave device resources behind on failure. Only a
@@ -675,11 +694,15 @@ void ChipWorker::init(
             if (close_rc != 0 || execution_environment_releasable_fn_(device_ctx_) != 1) {
                 runtime_module_ = module;
                 device_id_ = device_id;
-                throw std::runtime_error(
+                std::string error =
                     std::string(borrowed_init_attempted ? "ChipWorker borrowed init" : "ChipWorker init") +
                     " failed with code " + std::to_string(init_rc) + "; rollback failed (" + std::to_string(close_rc) +
-                    "); cleanup is unproven; keeping the context and host runtime loaded; finalize is required"
-                );
+                    "); cleanup is unproven; keeping the context and host runtime loaded; finalize is required";
+                if (!init_error_detail.empty()) {
+                    error += "; ";
+                    error += init_error_detail;
+                }
+                throw std::runtime_error(error);
             }
         }
         // A failed sim attach must not release a sibling's virtual context.
@@ -887,6 +910,8 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     get_aicpu_dlopen_count_fn_ = nullptr;
     get_host_dlopen_count_fn_ = nullptr;
     get_run_stream_set_create_count_fn_ = nullptr;
+    get_last_scheduler_runtime_mode_fn_ = nullptr;
+    get_scheduler_mode_publish_count_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
     execution_environment_releasable_fn_ = nullptr;
     ensure_acl_ready_fn_ = nullptr;
@@ -898,12 +923,15 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_get_window_size_fn_ = nullptr;
     comm_derive_context_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
+    comm_attach_domain_host_fn_ = nullptr;
+    comm_detach_domain_host_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
     comm_global_domain_prepare_fn_ = nullptr;
     comm_global_domain_import_fn_ = nullptr;
     comm_global_domain_release_fn_ = nullptr;
     comm_global_domain_window_fn_ = nullptr;
     comm_global_domain_import_host_fn_ = nullptr;
+    comm_global_domain_detach_host_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
     set_retain_runs_fn_ = nullptr;
@@ -2073,6 +2101,20 @@ size_t ChipWorker::run_stream_set_create_count() const {
     return get_run_stream_set_create_count_fn_(device_ctx_);
 }
 
+uint32_t ChipWorker::last_scheduler_runtime_mode() const {
+    if (!initialized_ || get_last_scheduler_runtime_mode_fn_ == nullptr) {
+        return 0;
+    }
+    return get_last_scheduler_runtime_mode_fn_(device_ctx_);
+}
+
+size_t ChipWorker::scheduler_mode_publish_count() const {
+    if (!initialized_ || get_scheduler_mode_publish_count_fn_ == nullptr) {
+        return 0;
+    }
+    return get_scheduler_mode_publish_count_fn_(device_ctx_);
+}
+
 void *ChipWorker::create_comm_stream_checked(const char *op_name) {
     int rc = ensure_acl_ready_fn_(device_ctx_, device_id_);
     if (rc != 0) {
@@ -2367,6 +2409,31 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     return {device_ctx, local_window_base, actual_window_size};
 }
 
+uint64_t
+ChipWorker::comm_attach_domain_host(uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint8_t> &bytes) {
+    if (!comm_attach_domain_host_fn_ || bytes.size() != sizeof(CommGlobalDomainDescriptor))
+        throw std::invalid_argument("Host domain attachment is unsupported or has an invalid descriptor");
+    CommGlobalDomainDescriptor descriptor{};
+    std::memcpy(&descriptor, bytes.data(), sizeof(descriptor));
+    uint64_t base = 0;
+    const int rc =
+        comm_attach_domain_host_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, &descriptor, &base);
+    if (rc || !base) throw std::runtime_error("comm_attach_domain_host failed with code " + std::to_string(rc));
+    return base;
+}
+
+void ChipWorker::comm_detach_domain_host(uint64_t comm_handle, uint64_t allocation_id) {
+    require_comm_reclamation_safe();
+    if (!comm_detach_domain_host_fn_) throw std::runtime_error("Host domain detachment is unsupported");
+    const int rc = comm_detach_domain_host_fn_(reinterpret_cast<void *>(comm_handle), allocation_id);
+    if (rc) throw std::runtime_error("comm_detach_domain_host failed with code " + std::to_string(rc));
+}
+
+int ChipWorker::host_backing_process_identity() const {
+    if (!runtime_module_) throw std::runtime_error("Host identity requires an initialized runtime");
+    return simpler::host::query_host_backing_identity(*runtime_module_);
+}
+
 void ChipWorker::comm_release_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank
 ) {
@@ -2445,6 +2512,14 @@ uint64_t ChipWorker::comm_global_domain_import_host(
         throw std::runtime_error("comm_global_domain_import_host failed with code " + std::to_string(rc));
     }
     return base;
+}
+
+void ChipWorker::comm_global_domain_detach_host(uint64_t domain_id, const std::vector<uint8_t> &token) {
+    require_comm_reclamation_safe();
+    if (!comm_global_domain_detach_host_fn_) throw std::runtime_error("Host detach is unsupported by this runtime");
+    if (!global_domain_ids_.count(domain_id)) throw std::runtime_error("Host detach requires a prepared domain");
+    int rc = comm_global_domain_detach_host_fn_(domain_id, token.data(), token.size());
+    if (rc) throw std::runtime_error("comm_global_domain_detach_host failed with code " + std::to_string(rc));
 }
 
 void ChipWorker::comm_global_domain_release(uint64_t domain_id, uint32_t stage) {

@@ -6,13 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Global Host views select endpoint grants while sharing one physical attachment."""
+"""Cross-node mappings reuse restricted records and the current endpoint context."""
 
-import ctypes
+import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
-from _task_interface import read_args_from_blob
 from simpler.buffer import (
     AccessMode,
     AddressSpace,
@@ -21,107 +21,141 @@ from simpler.buffer import (
     CanonicalIdentity,
     ImportContext,
     ImportRegistry,
-    Tensor,
     mint_owner_instance_id,
 )
-from simpler.comm_domain import CommDomainRef, domain_mapping_ref, domain_mapping_target
+from simpler.comm_domain import CommDomainRef
 from simpler.comm_endpoints import DEVICE_AICORE, HOST_CPU, AdapterProfile
-from simpler.global_comm_domain import (
-    GLOBAL_DOMAIN_PROFILE_SIM,
-    GlobalDomainCommand,
-    GlobalDomainMember,
-    GlobalDomainPhase,
-)
-from simpler.task_interface import (
-    ArgDirection,
-    ChipDomainContext,
-    CommDomainHandle,
-    DataType,
-    TensorArgType,
-    _materialize_chip_task_args,
-)
-from simpler.worker import Worker, _GlobalNodeDomainState
-
-from tests.ut.py.test_worker._wire_blob import encode_blob
+from simpler.global_comm_domain import GlobalDomainPhase
+from simpler.host_domain import HostDomainView, HostMappingRecords
+from simpler.task_interface import CommDomainHandle, DataType, GlobalDomainMember
+from simpler.worker import Worker
 
 
-def source_buffer():
+def source_buffer(space=AddressSpace.HOST):
     return Buffer(
-        identity=CanonicalIdentity(mint_owner_instance_id(), 1, 1),
-        address_space=AddressSpace.HOST,
-        access=AccessMode.READWRITE,
-        backend_kind=BackendKind.REMOTE_SIDECAR,
-        nbytes=64,
+        CanonicalIdentity(mint_owner_instance_id(), 1, 1), space, AccessMode.READWRITE, BackendKind.REMOTE_SIDECAR, 64
     )
 
 
-def global_handle(buffer):
-    members = (GlobalDomainMember(0, 3, 0, 0), GlobalDomainMember(0, 7, 1, 1))
-    contexts = {worker: ChipDomainContext("test", rank, 2, 100, 200, 64, {}) for rank, worker in enumerate((3, 7))}
-    return CommDomainHandle(
-        name="test", workers=(3, 7), contexts=contexts, _release_fn=None, members=members, host_buffers={0: buffer}
-    ), members
-
-
-def test_global_view_grants_share_one_mapping_and_preserve_rw_selector():
-    buffer = source_buffer()
-    domain, _ = global_handle(buffer)
+@pytest.mark.parametrize("space", [AddressSpace.HOST, AddressSpace.DEVICE])
+def test_global_records_request_only_selected_access_and_revoke(space):
+    buffer = source_buffer(space)
+    environment = (os.getpid(), 1, 1, 0, False)
+    chip = SimpleNamespace(_validate_execution_context=lambda: None, _execution_environment=environment)
+    registry = ImportRegistry(
+        ImportContext(
+            DEVICE_AICORE,
+            platform="a2a3sim",
+            runtime="tensormap_and_ringbuffer",
+            execution_environment=environment,
+            current_environment=lambda: chip._execution_environment,
+        )
+    )
+    detached = []
+    view = HostDomainView(
+        buffer.to_descriptor(),
+        None,
+        0,
+        environment,
+        lambda: True,
+        attach=lambda: 4096,
+        detach=lambda: detached.append(1),
+        profile=AdapterProfile.HOST_SHM_MAP,
+    )
+    records = HostMappingRecords(
+        buffer,
+        (7,),
+        view_scope=lambda *_: nullcontext(),
+        view_control=lambda _resource, _worker, ref, access, unmap: view.apply(
+            chip, registry, 0, 1, ref, access, unmap=unmap, platform="a2a3sim"
+        ),
+        reference_scope=lambda _worker, count: 2 + 4 * count,
+    )
     tensor = buffer.tensor((16,), DataType.FLOAT32)
-    registry = ImportRegistry(ImportContext(DEVICE_AICORE))
-    for access in (AccessMode.READWRITE, AccessMode.READ, AccessMode.WRITE):
-        view = domain.map_view(tensor, domain_rank=1, access=access)
-        assert domain_mapping_target(view.mapping_ref) == (1, access)
-        assert view.buffer == tensor.buffer
-        registry.register_borrowed(
-            buffer.to_descriptor(), 4096, mapping=view.mapping_ref, access=access, live=lambda: True
-        )
-        assert registry.resolve_tensor(view).base == 4096
-    assert domain.map_view(tensor, domain_rank=1).mapping_ref == 2
+    mapped = records.map_view(tensor, 7, access=AccessMode.READ)
+    assert mapped.buffer == tensor.buffer and mapped.mapping_ref == 2
+    records.validate(mapped, 7)
+    registry.require_mapping_access(mapped, AccessMode.READ)
     with pytest.raises(ValueError, match="grant"):
-        registry.require_mapping_access(
-            domain.map_view(tensor, domain_rank=1, access=AccessMode.READ), AccessMode.WRITE
+        registry.require_mapping_access(mapped, AccessMode.WRITE)
+    with pytest.raises(ValueError, match="no granted attachment"):
+        registry.resolve_tensor(tensor._with_mapping_ref(6))
+    with pytest.raises(ValueError, match="target worker"):
+        records.validate(mapped, 3)
+    records.unmap_view(mapped)
+    assert detached == [1]
+    with pytest.raises(ValueError, match="not live"):
+        registry.resolve_tensor(mapped)
+    again = records.map_view(tensor, 7, access=AccessMode.WRITE)
+    assert again.mapping_ref == 6
+    with pytest.raises(ValueError, match="not live"):
+        registry.resolve_tensor(mapped)
+    chip._execution_environment = (os.getpid(), 1, 2, 0, False)
+    with pytest.raises(ValueError, match="not live"):
+        registry.resolve_tensor(again)
+
+
+def test_global_reference_namespaces_are_disjoint_and_exhaust_without_reuse():
+    buffer = source_buffer()
+    calls = []
+    records = [
+        HostMappingRecords(
+            buffer,
+            (0,),
+            view_scope=lambda *_: nullcontext(),
+            view_control=lambda *args, **kw: calls.append((args, kw)),
+            reference_scope=lambda _worker, count, rank=rank: rank + 1 + 64 * count,
         )
+        for rank in (0, 63)
+    ]
+    tensor = buffer.tensor((16,), DataType.FLOAT32)
+    refs = []
+    for item, count in zip(records, (4, 3)):
+        for _ in range(count):
+            mapped = item.map_view(tensor, 0, access=AccessMode.READ)
+            refs.append(mapped.mapping_ref)
+            item.unmap_view(mapped)
+        before = len(calls)
+        with pytest.raises(RuntimeError, match="exhausted"):
+            item.map_view(tensor, 0)
+        assert len(calls) == before
+    assert len(refs) == len(set(refs))
 
 
-def test_global_dispatch_checks_target_and_selected_grant():
+def test_global_unmap_failure_keeps_record_closed_and_retries_cleanup():
     buffer = source_buffer()
-    domain, members = global_handle(buffer)
-    registry = ImportRegistry(ImportContext(HOST_CPU))
-    registry.register_borrowed(buffer.to_descriptor(), 0, live=lambda: True)
-    worker = Worker(level=3, num_sub_workers=0)
-    worker._global_node_domains[1] = _GlobalNodeDomainState(
-        command=GlobalDomainCommand(GlobalDomainPhase.COMMIT, 1, 1, "test", GLOBAL_DOMAIN_PROFILE_SIM, 64, members, ()),
-        imports=registry,
-        node_worker_id=0,
-    )
-    source = buffer.tensor((16,), DataType.FLOAT32)
-    read = domain.map_view(source, domain_rank=1, access=AccessMode.READ)
-    worker._domain_mapping_buffer(read, 7, 1)
-    with pytest.raises(ValueError, match="grant"):
-        worker._domain_mapping_buffer(read, 7, 2)
-    with pytest.raises(ValueError, match="another node or chip"):
-        worker._domain_mapping_buffer(read, 3, 1)
-    with pytest.raises(ValueError, match="invalid domain mapping"):
-        worker._domain_mapping_buffer(source._with_mapping_ref(193), 7, 1)
+    failure = [False]
+
+    def control(*_args, unmap, **_kw):
+        if unmap and failure[0]:
+            raise RuntimeError("detach failed")
+
+    records = HostMappingRecords(buffer, (0,), view_scope=lambda *_: nullcontext(), view_control=control)
+    tensor = buffer.tensor((16,), DataType.FLOAT32)
+    mapped = records.map_view(tensor, 0)
+    failure[0] = True
+    with pytest.raises(RuntimeError, match="detach failed"):
+        records.unmap_view(mapped)
+    with pytest.raises(ValueError, match="live explicit mapping"):
+        records.validate(mapped, 0)
+    with pytest.raises(RuntimeError, match="unconfirmed"):
+        records.map_view(tensor, 0)
+    failure[0] = False
+    records.unmap_view(mapped)
+    assert records.map_view(tensor, 0).mapping_ref != mapped.mapping_ref
 
 
-def test_consumer_signature_not_transport_tag_controls_global_grant():
-    buffer = source_buffer()
-    registry = ImportRegistry(ImportContext(DEVICE_AICORE))
-    source = buffer.tensor((16,), DataType.FLOAT32)
-    target = SimpleNamespace(sig_count=1, sig=lambda _: ArgDirection.OUT)
-    for access, allowed in ((AccessMode.READ, False), (AccessMode.WRITE, True)):
-        selector = domain_mapping_ref(1, access)
-        registry.register_borrowed(buffer.to_descriptor(), 4096, mapping=selector, access=access, live=lambda: True)
-        blob = ctypes.create_string_buffer(encode_blob([source._with_mapping_ref(selector)]))
-        args = read_args_from_blob(ctypes.addressof(blob), len(blob))
-        # Transport reconstruction defaults tags to INPUT; the actual consumer writes.
-        assert args.tag(0) == TensorArgType.INPUT
-        if allowed:
-            _materialize_chip_task_args(args, registry, target)
-        else:
-            with pytest.raises(ValueError, match="grant"):
-                _materialize_chip_task_args(args, registry, target)
+@pytest.mark.parametrize("profile", [AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT, AdapterProfile.HOST_SHM_MAP])
+def test_native_device_attachment_requires_target_context(profile):
+    buffer = source_buffer(AddressSpace.DEVICE)
+    with pytest.raises(ValueError, match="device endpoint"):
+        ImportRegistry(ImportContext(HOST_CPU)).register_attachment(
+            buffer.to_descriptor(), 4096, mapping_ref=0, profile=profile, live=lambda: True
+        )
+    with pytest.raises(ValueError, match="execution environment"):
+        ImportRegistry(ImportContext(DEVICE_AICORE)).register_attachment(
+            buffer.to_descriptor(), 4096, mapping_ref=0, profile=profile, live=lambda: True
+        )
 
 
 @pytest.mark.parametrize("writing", [False, True])
@@ -161,46 +195,3 @@ def test_borrowed_copy_checks_owner_before_native_routing(monkeypatch, writing):
     assert not calls
     invoke(owner)
     assert len(calls) == 1 and calls[0][1] is writing
-
-
-def test_local_domain_slice_uses_the_canonical_device_descriptor():
-    local = Buffer(
-        identity=CanonicalIdentity(mint_owner_instance_id(), 2, 1),
-        address_space=AddressSpace.DEVICE,
-        access=AccessMode.READWRITE,
-        backend_kind=BackendKind.REMOTE_SIDECAR,
-        nbytes=64,
-        base=4096,
-        owner_worker_id=1,
-    )
-    descriptor = local.to_descriptor()
-    registry = ImportRegistry(ImportContext(DEVICE_AICORE))
-    registry.register_attachment(
-        descriptor, 4096, mapping_ref=0, profile=AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT, live=lambda: True
-    )
-    for tensor in (local.tensor((16,), DataType.FLOAT32), Tensor(local, shapes=(16,), dtype=DataType.FLOAT32)):
-        assert tensor.buffer == descriptor
-        assert tensor.mapping_ref == 0
-        assert registry.resolve_tensor(tensor).base == 4096
-    with pytest.raises(ValueError, match="device endpoint"):
-        ImportRegistry(ImportContext(HOST_CPU)).register_attachment(
-            descriptor, 4096, mapping_ref=0, profile=AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT, live=lambda: True
-        )
-    registry.unregister(descriptor.identity)
-    with pytest.raises(ValueError, match="no granted attachment"):
-        registry.resolve_tensor(local.tensor((16,), DataType.FLOAT32))
-
-    host = source_buffer()
-    members = (GlobalDomainMember(0, 1, 0, 0, {"slice": local}),)
-    context = ChipDomainContext("local", 0, 1, 100, 4096, 64, {"slice": local})
-    domain = CommDomainHandle(
-        name="local",
-        workers=(1,),
-        contexts={1: context},
-        members=members,
-        host_buffers={0: host},
-        _release_fn=lambda _: None,
-    )
-    view = domain.map_view(local.tensor((16,), DataType.FLOAT32), domain_rank=0)
-    assert view.buffer == descriptor
-    assert view.mapping_ref == domain_mapping_ref(0, AccessMode.READWRITE)

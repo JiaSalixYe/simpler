@@ -1,8 +1,12 @@
-# A3 单机多卡 Host 通信域
+# A3 单机 Host 通信域
 
-本实现把一块 Host DRAM 加入现有 L3 CommDomain：各卡显式选择自己的映射，仍用普通 Tensor 参数进入 kernel。Host 不占通信 rank。A5、多机和自动传输选路不属于本次范围。
+L2 与 L3 共用 Buffer / Tensor / TaskArgs 前端和内部 HostDomainResource；不增加 HostTable、HostTarget 或第二套地址解析模型。Host 保持 HOST 身份，不占 NPU rank。A5、多机和自动选路不属于本分支。
 
-## 使用方式
+公开签名、支持范围和兼容性见 [Python API 参考](../user/reference/python-api.md#memory)。不带 `host_window` 的 `create_buffer` 保留原有 POSIX SHM 语义。
+
+Host Fabric 用例仅验收 A3；混合 `a2a3` runner 若明确报告为 A2（`Ascend910B*`）则跳过这些用例，A3 与模拟器仍执行完整断言。查询失败、未知 SoC 和 A3 上的分配错误仍失败，不视为不支持而静默跳过。
+
+## L3 多卡使用
 
 ```python
 domain = orch.get_or_allocate_domain(
@@ -11,133 +15,107 @@ domain = orch.get_or_allocate_domain(
     host_window=HostWindowSpec(nbytes=65536, numa_id=0),
     retain_after_run=True,
 )
-orch.copy_to_host_domain(domain, data)  # 显式写入本机 Host backing；Host 不占 NPU rank
+orch.copy_to_host_domain(domain, data)
 native = domain.host().tensor((16384,), DataType.FLOAT32)
-mapped = domain.map_view(native, domain_rank=0)
+mapped = domain.map_view(native, domain_rank=0, access=AccessMode.READ)
 args = TaskArgs()
 args.add_tensor(mapped, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
-# 后续沿用 orch.submit_next_level(..., worker=0)。
-# worker 参数使用 members 中对应的实际 worker 编号；本例 rank 0 对应 worker 0。
+# 沿用 orch.submit_next_level(..., worker=0)。
 ```
 
-`copy_to_host_domain` / `copy_from_host_domain` 显式访问本机 Host backing；`copy_to_domain` / `copy_from_domain` 的 rank 仅指 NPU。两组入口复用相同的 operation lease、控制预留和编排顺序检查：回调内必须先拷贝再提交任务；回调外必须等待所有在飞 Run 完成。违反顺序时直接拒绝，不先写入数据，也不隐式等待任务。可在 Run 完成后串行更新表，再提交下一轮。
+`members` 使用实际 chip worker 编号；`domain_rank` 是该列表中的位置。`copy_to_host_domain` / `copy_from_host_domain` 访问本地 Host backing，`copy_to_domain` / `copy_from_domain` 的 rank 只指 NPU。
 
-通过 CPU 原生指针、NumPy view 或 `ctypes` 裸写不会经过上述检查。调用方必须自行保证所有读写任务已完成，且写入结束前不会并发提交新任务；Buffer 的生命周期保留不等于写入互斥。CPU 原生访问目前仅支持创建域的 endpoint，不支持把该 Host 引用发给 Python 子任务。
+## 直接 L2 使用
 
-## 公共契约与平台实现
-
-### 前后端边界（实现约束）
-
-以下是 A3/A5 共用的契约，不应因为更换传输引擎而重新实现：
-
-- **Buffer**：canonical identity、物理位置、范围、grant、owner 与跨 Run 保留。
-- **Tensor / TaskArgs**：显式消费视图、几何范围、参数方向和每参数 transfer；不携带异进程裸指针。
-- **domain / ImportRegistry**：成员与 endpoint 授权、消费端解析、旧引用失效；复用既有登记和解析路径。
-- **Run / completion 生命周期**：接受使用后保留资源，真实完成前不放行消费者、不复用输出；关闭先撤销新使用。
-
-平台后端负责内存分配约束、注册/映射、设备可用地址或通信 context、提交与完成适配，以及逆序释放。A3 使用 VMM Host physical backing，owner 保留 CPU view，每个 chip 进程经 Fabric 授权、导入并建立 NoUC view；数据搬运继续使用已有 MTE 或 PTO SDMA 路径，兼容性分别验证；A5 后续使用 URMA backend，不把通信 region 当作直接映射地址。
-
-`numa_id` 指定 Host 物理分配位置；按驱动报告的分配粒度向上对齐物理范围，公开 Buffer 范围仍为请求的逻辑大小。模拟器仅按系统页对齐。
-
-`HostDomainResource` 只保留资源身份、view 校验、使用保留和清理责任；`host_domain_backend.py` 提供 A3 与模拟 backing 的创建、进程身份、授权和释放实现，消费侧统一复用 `comm_global_domain_prepare/import/release` 建立和分阶段释放映射；本地 L3 使用单节点事务，直接 L2 使用单 endpoint，均不要求 MPI 或跨机控制通道。A5 尚未实现，不会落入 A3 默认分支；接入时不复制 domain/registry/runner。
-
-`map_view` 当前只承诺已经建立的直接地址映射。URMA 需要的注册、channel、远端信息与 completion context 不是普通映射地址，不能为了共用 API 就虚构 DIRECT_LOAD/STORE 能力。后续接入应扩展既有通信 context 和 completion 后端，继续使用同一 Buffer identity 与调用约定；本地 MTE 和远端 fetch 的能力需分别验证。
-
-公共 API 不应要求业务代码写 A3/A5 专用资源管理分支。kernel 仍决定是否读取、读取哪些行；平台能力决定可用的传输实现。当前测试显式选择 MTE/SDMA 是覆盖两条实际路径，并不表示已经实现自动选路或回退策略。
-
-```mermaid
-flowchart TD
-  B["Host Buffer：唯一 identity / 范围 / grant / owner"] --> T["Tensor：几何视图 + 显式 mapping_ref"]
-  T --> A["TaskArgs：参数方向 + transfer=NONE"]
-  A --> I["ImportRegistry：按 identity、mapping_ref 解析"]
-  I --> C["ChipTensor：当前卡有效地址，DEVICE/NONE"]
-  B --> O["Owner：Host VMM + CPU 原生 VA"]
-  O --> M["各 chip 进程：BareTgid 授权 → Fabric import → NoUC map"]
-  M --> I
-  C --> K["现有 kernel / PTO 接口"]
+```python
+buffer = worker.create_buffer(nbytes, host_window=HostWindowSpec(nbytes))
+native = buffer.tensor(shape, dtype)
+mapped = worker.map_view(native, target=worker.device_location, access=AccessMode.READ)
+# 原有 TaskArgs / kernel 提交和完成路径。
+worker.unmap_view(mapped)  # 在所有已接纳使用完成之后；保留 backing，可重新 map_view。
+worker.release_buffer(buffer)  # 在所有使用完成之后。
 ```
 
-- Buffer 始终是 HOST，同一 backing 的原生与映射 Tensor 共用 identity、范围和 grant。没有 `device_readable` 开关，也不把某个设备地址写回 Buffer。
-- 映射由 backend 成功后登记；Tensor 中的选择值不能凭空授予权限。提交校验实际目标卡、完整描述符和域存活状态，消费端再次解析。
-- 当前一域一块 Host backing，映射在域生命周期内固定。释放再创建会获得新 identity，因此旧 Tensor 不能绑定到同名新域。暂不提供独立 unmap/remap 或 context 原位重建。
-- 本地 Tensor 仍为 144 B；byte 141 保留参数 transfer，byte 142 保存 mapping_ref。零表示原生视图。所有进程必须使用同版 Python/native 构建；不支持混用旧、新 binary。跨机器 wire 明确拒绝 endpoint-local mapping_ref。
+须先初始化拥有设备 context 的 Worker 并加载支持通信的 runtime；借用 context 的 Host backing 创建会在分配前拒绝。内部复用单 rank communicator 和 64 B 逻辑 HBM 控制窗口；驱动按分配粒度对齐，它不是整表 staging。用户不创建 domain，也没有额外 Direct 公共包装。
 
-## 传输与完成
+映射 view 必须显式使用 `TensorTransfer.NONE`。直接 L2 支持同一调用中的 native/H2D 与 mapped/NONE 共存；L3 native Host 参数不能作为设备消费入口。
 
-资源准备只建立可访问性，不代表输入已经就绪。调用方选择现有 kernel；本次不新增按平台拆分的 Host 前端，也不增加自定义 SDMA engine。
+`Worker.unmap_view(mapped)` 和 `CommDomainHandle.unmap_view(mapped)` 撤销一个映射记录；重新对 native Tensor 调用 `map_view` 会签发新 ref，旧 Tensor 不会恢复有效。Tensor 的 144 B 布局及 byte 142 的 `mapping_ref` 参见 [Buffer ABI](../buffer-abi.md)。
 
-- MTE kernel 通过现有 PTO load/store 消费映射地址，沿用任务完成语义。
-- A3 异步 SDMA 沿用 `get_dma_workspace → SdmaTget → send_request_entry`，实际发起复用 PTO `TGET_ASYNC`。现有 completion manager 确认传输完成后，scheduler 才能放行依赖输出的消费者。
-- 映射选择不决定同步/异步；完成机制属于传输和运行时。测试同时覆盖 Host→HBM 与 HBM→Host，SDMA 后接真实消费者验证可见性。
+## 映射、复制与资源职责
 
-## 关闭顺序
+- Buffer 保存同一 backing 的 identity、位置、范围和权限；Tensor 选择几何与显式访问 view；TaskArgs 保留每次消费的方向和 transfer。
+- 分配只确认物理 view，不预登记设备消费 grant。`map_view` 按请求返回新 Tensor，不修改 native Tensor 或 backing identity；实际目标端的 ImportRegistry 登记受限 grant，并通过 qualified adapter、execution environment、范围和存活检查完成解析。
+- A3 backend 分配 Host VMM 物理 backing，owner 保留 CPU view；各 chip 经 Fabric PID 授权、导入和 NoUC 映射。`numa_id` 选择 Host 分配位置，Buffer 暴露逻辑范围。MTE 与 PTO SDMA 复用既有提交及完成机制，各自验收。
+- 映射没有 H2D 复制语义。CPU 原生访问仅支持创建 endpoint，不能把 Host 引用转发给 Python 子任务；不提供异进程裸地址消费。
 
-```mermaid
-flowchart LR
-  R["domain.release：撤销新使用"] --> F["已有 Run fence：等待已接受任务"]
-  F --> U["各卡撤销 attachment → unmap → release VA → free imported handle"]
-  U --> H["确认全部卡释放后，清理 Host owner"]
+## 控制协议边界
+
+单机 Host export 复用 `GlobalDomainDescriptor` 的 v2 native 布局和 profile 校验，Host 不进入 rank descriptor 表，也不单独升版该 native 布局。Python 与 native 必须来自同一构建；未来修改布局需成对迁移，此复用不代表已实现完整公共 Host attachment 协议。
+
+Host Buffer 使用现有 `REMOTE_SIDECAR` 表达地址无关描述，CPU 原生绑定及各 NPU 映射均须显式登记并检查 identity、目标、范围、权限和存活状态；不能凭这个 backend tag 自动解析或获得访问权。不新增 BackendKind。
+
+L2 CPU 读写使用创建端点的 `Buffer.base`，由调用者保证没有在途使用；L3 的 `copy_to_host_domain` 提供受控的写入入口。二者不是等价的同步保障，不为形式对称新增 API。初始化 PID 通过固定头中的显式回复字段返回，不依赖 rootinfo 路径长度或共享内存实际页大小。
+
+`map_view(access=...)` 为本次请求签发受限记录。每个 backing 的 `mapping_ref` 从 1 到 255 单调分配，不编码 rank 或 access，不复用；耗尽时显式报错，需创建新 backing。ref 是不透明的端点本地记录索引，不是可转交给陌生端点的授权凭证。实际读写按子端已注册 callable signature 检查；TaskArgs tag 用于依赖图，不作为另一套 Host 读写权限权威。
+
+mapped Tensor 不能通过 `_with_mapping_ref` 换成其他 ref；READ 记录不因此获得 WRITE 权限。native ref 0 保持原生视图，直接 L2 仍可显式使用 H2D，并与 mapped/NONE 共存。撤销后旧 ref 保持失效，重新映射取得新 ref。
+
+`DEVICE_FABRIC_V2_PEER_IMPORT` 记录后端已确认的导入来源。地址无关 Host sidecar 必须先经授权和平台导入，再由实际目标端登记受限 grant；qualified adapter 只能解析已确认且属于当前 execution environment 的记录，不能从空 body 隐式导入或扩大权限。
+
+`HOST_VMM_MAP` 仅标记 L2 创建进程内已确认的 CPU owner 绑定，不是 region planner 候选，不进入 GlobalDomainCommand，也没有新增 wire profile id。`host_domain` 模块及其映射控制是包内实现，不属于用户 API。
+
+### 实现边界与复用
+
+```text
+HostWindowSpec → HostDomainResource → A3HostBacking → A3 native owner
+                                      │ 分配 / export / PID 授权
+                                      ↓
+                 comm_attach_domain_host（A3 platform 导入 / NoUC 映射）
+                                      ↓
+               map_view → 目标 ImportRegistry 登记受限 grant
+                                      ↓
+             Buffer → Tensor 显式 view → TaskArgs → MTE / PTO SDMA
 ```
 
-复用现有 domain accepted-use 和清理 journal。任一卡释放未确认，保留 Host owner；卡端释放已经成功而 Host 清理失败时，仅重试 owner 清理，不重放 collective release。Worker.close 会继续完成 native／child teardown，并重试可确认安全的 owner 清理；若 view 释放仍未确认，则明确报错并保留 owner，不能把进程列表清空或 native 已销毁当作释放成功。
+owner 的 NUMA/P2P 分配、Fabric/PID 和逐步清理策略位于 A3 platform，只编入 A3 `host_runtime.so`，直接使用该平台已链接的 CANN ACL API；不搬迁既有 HBM helper，仅使其接受重复 ACL 初始化，以支持两种 owner 共存。Buffer/Tensor、grant、HostDomainResource 和 owner 桥接保持平台无关，供 A5 复用；`_task_interface` 不编译 A3 owner。owner 不负责全局 finalize 或 device reset。
 
-正常域释放逐步记录注销、解锁与解除映射的结果。现有 `comm_destroy` 是 communicator 的终止清理，不承诺失败后重试同一 native handle；它的失败或进程退出不能代替域的 VIEWS 成功确认，owner 仍按未确认状态保留。
+桥接复用 RuntimeModule，通过私有、同构建的 Host backing C 入口调用平台 owner；不增加独立 DSO、版本协商或公共模型。入口将异常转换为状态和错误信息；部分失败保留 opaque owner，确认释放后才销毁。owner 未释放时保留模块至进程退出，避免卸载仍被使用的实现。L3 fork 前仅保存 runtime 路径，owner 在创建进程首次使用时加载；CPU view 仍属于创建进程。A5 可在自己的 runtime 实现相同入口，当前 A5/sim 不编译或启用 A3 实现。
 
-## 验证入口
+独立清理复用同构建的可选 C 入口 `comm_detach_domain_host(handle, allocation_id)`，与现有 attach 使用同一 runtime 边界。它只清理 Host view，保留 HBM/domain 和 CPU owner；不增加 DSO 或版本框架。映射记录及准入仍位于 common 层，A3 platform 只负责物理映射与分阶段清理。
 
-- `tests/ut/py/test_host_domain.py`：双卡建域、view 目标校验、跨 Run、旧引用、配置冲突和 owner 清理失败重试。
-- `tests/ut/py/test_buffer.py`：同 identity 的原生/映射参数共存、grant 与失效校验。
-- `tests/st/worker/comm_domain/test_host_domain.py`：两卡 MTE 读写、PTO SDMA producer→consumer、BF16 设备选行，以及任务提交后的域释放；SDMA 必须在 A3 真机执行。
+现有 HBM VMM helper 使用 DEVICE/HBM 属性、不同的保留标志及导出方式，不能直接代替 Host NUMA/Fabric/PID 契约。Host 部分释放失败还必须保留原状态；不能套用失败后清空字段的 best-effort window 清理。传输、消费者完成、参数解析和使用保留则复用既有链路，不再增加一套 copy/completion 通道。
 
-Fabric/NoUC 对照提交 `ea4ae7912` 曾在 A3、CANN 9.0.0、TMR 上通过上述六项双卡测试。HostRegister 替换版本已独立通过公共 Python 回归 377 项（2 项跳过）、四项双卡模拟测试，以及 A3 双卡六项真机测试：MTE 双向、PTO SDMA 双向及其消费者可见性、BF16 设备选行、在途域释放。另有两项 HBM retained-domain 基线通过。真机使用 Linux 5.10、CANN 9.0.0、驱动 26.0.rc1 和 TMR；结论限于此环境及测试范围。
+分配、staging、映射控制、提交和释放复用 Worker operation lease、设备控制入口和端点锁。L2 `map_view` / `unmap_view` 与 release 共享端点锁，release 在锁内重查 owner，成功后才移除 ledger/journal。L3 建立 view 不等于保留一次使用，提交时仍校验记录存活并登记使用；collective 控制与 L2 单端控制保留各自编排。各 chip view 先释放、owner 后释放，失败债务遵守下节规则。
 
-本次恢复 Fabric backend，并启用 PID 白名单：初始化通信时由各 chip 返回 aclrtDeviceGetBareTgid 的实际进程身份，owner 在发布导入请求前调用 aclrtMemSetPidToShareableHandleV2 授权；不禁用 PID 校验。本次启用 PID 白名单后的 Fabric 版本已在相同 A3/CANN 9.0.0 环境完成硬件复验。模拟器仍用 SHM，不作为 Fabric 硬件支持证据。直接单 L2 可用 `create_buffer(nbytes, host_window=HostWindowSpec(nbytes))` 申请本功能资源，再用 `map_view(tensor, target=worker.device_location)` 选择当前设备映射。其复用单 rank communicator 与 64 B 逻辑 HBM 域窗口（驱动按粒度分配），不是全表 staging；须在加载支持通信的 runtime 后使用。直接 L2 入口已通过单卡真机验收：同时持有两块 backing、显式 view 读取和释放后的旧 view 拒绝。物理回收使用 `Worker.release_buffer(buffer)`；`Buffer.close()` 仅撤销后续使用，不能替代 Worker 的映射/owner 清理。
+## 顺序、释放与失败保留
 
-Fabric 初版验证：156 项相关 UT 通过；8 项 A3 真机 ST 通过，包括直接 L2、双卡 MTE 双向、BF16 选行、在途释放、PTO SDMA 双向及消费者可见性，以及持久 8 MiB Host 表的设备 ID 驱动 SDMA 取行（64 KiB 输出、首尾及重复行、四轮复用）。后者同时提交独立计算任务并检查结果，但未采集重叠 trace 或测量延迟隐藏收益。
+Host staging 复用 operation lease、控制预留及编排顺序检查：回调内先 copy、后提交任务；回调外等待所有在飞 Run 完成。违反顺序直接拒绝，不隐式等待，也不先写入数据。
 
-## 对齐 #2657 的业务场景
+CPU 指针、NumPy 或 `ctypes` 裸写绕过这些检查。调用者必须保证所有 reader / writer 已完成，写入期间不并发提交新任务。生命周期保留不等于写入互斥。
 
-[Issue #2657](https://github.com/hw-native-sys/simpler/issues/2657) 的目标是持久 Host 表上的设备发起异步稀疏 fetch。当前 A3 域实现提供资源与映射基础，尚不能以整段拷贝测试宣称完成该 issue。其当前 PR1/PR2 划分面向 A5：PR1 是同进程同步 MTE，PR2 必须包含同机跨进程/跨 rank URMA；每卡分别映射后本地 MTE 读取不能替代 PR2。
+`map_view` / `unmap_view` 拒绝在途使用，不隐式等待。L3 回调中的映射控制必须位于首次提交之前；回调外须没有在途 Run。`unmap_view` 先撤销目标记录，只有该目标最后一个 active record 退出后才调用 native detach。其他记录仍可继续使用同一物理 view；CPU owner 和 HBM/domain 均保留。
 
-```mermaid
-flowchart LR
-  B["持久 Host 表 B：初始化一次，跨 Run 注册"] --> F
-  H["设备 Hash → 行 ID"] --> F["设备发起 Fetch：只读取所选行"]
-  F --> C["后端确认数据可见"] --> D["HBM 输出 D → Dequant → WKV"]
-  F -.-> X["issue 后让出 AIV（后端支持时）"]
-  P["Backbone 输入就绪"] --> I["独立 Backbone 继续执行"]
-  D --> G["Gate"]
-  I --> G
-```
+独立 detach 失败进入 CLOSING，旧记录保持撤销，新的 attach 被拒绝；重试完成剩余清理阶段，成功后才允许以新 ref 映射。整域释放一旦开始就永久关闭该 allocation 的 attach 准入，即使后续单独清理 Host view 成功也不恢复。
 
-实线表示数据依赖；虚线表示 issue 后的资源处理。Backbone 不依赖 Hash/fetch，应在自身输入就绪后独立推进。
+L3 domain release 在已接纳使用完成后释放各 chip view，再关闭 Host owner；L2 `release_buffer` 使用相同的 views-before-owner 原则。`Buffer.close()` 撤销新使用，不能替代 Worker 的物理清理。释放与提交使用既有锁和使用保留；未知完成、未确认 view 释放及部分失败都不能当成回收成功。
 
-需要按实际数据路径补齐以下验收，不把模型算法写进公共 scheduler：
+A3 native 清理失败保留 allocation；重复清理不重播 collective barrier，barrier 超时或 VMM 结果未知保持失败。Python L3 的整域失败结果仍是保守回放，不把本地清理重试当成全域已确认释放。
 
-1. 设备生成/持有 row IDs，读取重复 ID、首尾行和越界情况；输出由调用方提供。A3 多卡读取同一 Host backing 作为当前阶段用例，不能代替 A5 跨 rank URMA 或多机验收。
-2. 表只初始化、注册一次，后续 Run 只读取所选行；设备存储不随整表大小增长。除整段 FP32 MTE/SDMA 测试外，`test_device_selected_bf16_rows` 使用设备侧 ID 选择 BF16 payload 行（逐位比较），并将非法 ID 定义为零行；两轮复用同一 backing，第二轮更新源数据以验证可见性。该用例在 Fabric 对照和 HostRegister 版本上分别通过 A3 双卡真机验证；不覆盖 MXFP8/dequant；后者随对应业务路径验证。
-3. 分开记录 issue kernel 返回和真实传输完成。延迟完成时 Dequant/WKV 不能提前运行，独立 Backbone 可继续推进；若等待占住必需 AIV，应明确限制，不能仅凭 token 宣称隐藏延迟。
-4. 两次 fetch 交错：请求/completion 槽只在后端确认不再引用后退休，输出 D 必须保留到其最后消费者结束。第二次 fetch 不能覆盖第一次仍被消费的输出。
-5. trace 观察请求发出、数据可见、独立计算与消费者开始；在途期间有用计算推进是 issue 验收要求。相同工作量串行对照、剩余等待、总耗时与 Backbone 是否变慢是本项目补充的性能验收建议，不是 issue 规定的固定加速比。
+某 rank 的 Host 清理成功仅说明其导入 view / handle 已退出，不代表创建端的物理 backing 已释放。若 barrier 或其他窗口清理结果未确认，allocation 的失败记录及父侧 owner 可继续保留，不能由一个 view 的成功推断整域回收成功。
 
-Hcomm/ElasticBuffer、PTO URMA 与 simpler completion 只复用已确认兼容的边界；不得假定 handle、CQ 布局或完成通知可以直接互换。若接外部 stream 算子，仍需分别接通输入就绪、传输完成和输出保留。
+owner 清理可在 view 释放已确认后重试；未知 view 结果保守保留到进程退出。Worker.close 继续处理子进程 teardown 并报告未清理债务。不能在无释放证明时通过 owner 析构自动释放 backing。
 
-A5 后端可参考 [#2714 的单卡 Host URMA 资格验证](https://github.com/hw-native-sys/simpler/pull/2714#issuecomment-6491020508)：同卡不同 EID、Host 控制面 UBC_TP、AIV ReadNbi/BatchCommit 与后续 Drain。该证据推翻“同进程 Host 只能同步读”的假设；尚不证明 simpler runtime 集成、计算重叠或多卡能力。Hcomm 的注册类型描述设备可见地址，源 backing 仍应保持 HOST。
+Fabric PID 白名单来源为各 chip 进程实际身份；控制面按可信进程模型运行。已验证授权调用与正常访问，未授权 PID 的真机负向验收仍待补，不能宣称已验证恶意进程隔离。
 
-## 同一 backing 的两种消费
+## 验收范围
 
-直接 L2 创建的 Host Buffer 可在一次调用中同时传入原生 Tensor（显式 `H2D`）与 `map_view` 返回的 Tensor（`NONE`）。两者保留相同 backing identity，分别解析为 owner CPU 地址和当前设备映射地址；H2D 仅为该参数创建设备副本，不改变另一参数的访问选择。两者共享在途使用保留，完成未知时不释放 backing。
+已有 A3 Fabric 真机证据包括直接 L2、双卡 MTE 双向、BF16 设备选行、在途释放、PTO SDMA 完成及消费者可见性，以及持久 8 MiB 表、64 KiB 输出的稀疏读取。首尾行、重复 ID、跨 Run 复用和 CPU 更新可见性由对应测试覆盖；历史通过结果不能替代后续重构的增量验收。
 
-此支持限于 owner 所在的直接 L2 进程；L3 子进程没有 owner CPU 地址的访问资格，仍必须选择目标卡的 mapped view。`ImportRegistry.register_attachment` 仅登记已经确认的直接地址映射；后续 A5 URMA 应接入通信 context 与完成机制，不能向这里填入 segment handle。
+HBG 与 TMR 已通过相同的 A3 真机 MTE/映射矩阵：native/mapped 同调用、独立 unmap、旧引用拒绝、重新映射数值复验、双卡双向访问、READ 拒写、已接纳任务释放，以及跨 Run BF16 稀疏取行。HBG 使用自身编译入口及实际 host orchestration，并非只复用测试标记。PTO SDMA 双向与消费者完成依赖另由 TMR 验收。
 
-消费契约修复后，158 项相关 UT 与 9 项 A3 真机 ST 通过；新增 direct L2 同调用 native/H2D + mapped/NONE 验收，原有双卡与稀疏路径全部复验。
+持续回归保留 mapping 权限/context、unmap/关闭保留、MTE 与 SDMA 消费者数值闭环，以及 native detach/release 的代表性故障注入。扩展 owner 故障矩阵、私有 mailbox 重建和专用稀疏 SDMA 组合仅作独立验收，不属于本 PR 的持续回归；未授权 PID 负向与延迟隐藏性能仍待验收。
 
-## 显式映射权限
+[#2657](https://github.com/hw-native-sys/simpler/issues/2657) 要求设备发起异步稀疏 fetch、独立计算继续推进，并在实际完成后放行消费者。当前提供 A3 资源、映射及消费基础；未采集重叠 trace 或测量延迟隐藏收益。A5 的同步 MTE 与跨 rank URMA 需要分别实施和验收。
 
-`domain.map_view(tensor, domain_rank=rank, access=AccessMode.READ)` 选择只读映射；直接 L2 的 `worker.map_view` 使用相同 `access` 参数。省略时保留 READWRITE 兼容行为。Buffer 的 HOST 身份和原生访问不变，不在 Tensor 上新增权限字段。
-
-当前 A3 profile 在建域时建立固定物理映射，并在目标 registry 登记 READ、WRITE、READWRITE 三种受限 attachment；三者复用同一地址，权限不得超过 source grant。提交端检查参数 tag，消费端按真实 callable signature 校验所选 grant；跨进程参数不携带 tag，不能以默认 INPUT 替代消费者检查。mapped view 只支持 NONE，native/H2D 继续使用原有拷贝合同。
-
-mapping reference 是同 build 内的 registry selector，不是秘密或进程内安全隔离：已经获得 RW attachment 的端点仍可选择其 RW view。选择不存在、已关闭或错误目标的记录会被拒绝。引用采用固定 64 rank、三组 grant；保持原 RW selector，所有生产者和消费者必须使用同一版本。
-
-此实现不宣称完成独立 unmap、按需物理映射或跨域共享一个 Host backing；owner 仍受既有域生命周期管理。后续扩展应复用这套 registry 和使用保留，不能另建参数解析器。
+并发预取时，请求槽退休不代表输出可复用：输出仍须保留到最后消费者完成。性能验收应记录 issue、数据可见、独立计算与消费者开始时间，并和同工作量串行执行比较。

@@ -25,7 +25,7 @@ python -m tests.st.worker.comm_domain.host_domain_matrix \
 
 ## PTO 异步稀疏读取
 
-同一命令增加 `--sparse`，复用单机的 `build_sparse_sdma` 和相同 kernel：
+同一命令增加 `--sparse`，使用 PTO SDMA 稀疏取行与消费者 kernel：
 
 - 每节点 Host 表 8 MiB，所选行只有 64 KiB；HBM payload 只分配一行。
 - 各节点的两张卡分别读取另一节点的表，行号覆盖首行、末行、重复 ID。
@@ -34,20 +34,26 @@ python -m tests.st.worker.comm_domain.host_domain_matrix \
 
 正确输出不证明延迟隐藏；需另采 device trace，并与同工作量串行方案比较，才能报告计算通信重叠及性能收益。本分支没有双机真机验收结果。
 
-## 当前验收范围
+## 验证边界
 
-- 303 项相关 UT 与 3 项生产模拟 ST 通过（单节点双卡、双节点四卡、TCP 双节点四卡）。
-- A3/CANN 9.0.0 真机的单节点双卡 GlobalDomain 对照通过：18 项访问检查、7 次交接、最终域释放。
-- direct L2 的 mapped 与 native-H2D＋mapped-NONE 两种消费通过；A3 双卡本地域 PTO SDMA 稀疏取行、完成衔接与消费者数值检查通过。
-- 本地与全局 NoUC view 使用同一有限候选地址预留函数，避免独立域的地址冲突；失败时不发布地址。
-- 真实双机 HCCS、跨机稀疏 SDMA 与性能重叠仍需在目标环境执行；单节点对照不替代这些结果。
+本轮已通过单节点双卡、双节点四卡、TCP 双节点四卡的生产模拟矩阵；分别覆盖 18/72/72 项访问检查、交接和释放。相关权限、生命周期及协议 UT 也已回归。模拟不证明物理 HCCS 可达性。
+
+历史 A3/CANN 9.0.0 单节点双卡对照曾通过 18 项访问检查和 PTO SDMA 稀疏取行；这些是旧提交证据。本轮双机 HCCS、跨机稀疏 SDMA、未授权 PID 负向及性能重叠仍需目标环境验收。
+
+## 映射与撤销
+
+单机、多机共用受限 mapping record、ImportRegistry 与 adapter 准入。IMPORT 只准备物理资源与本地原生 HBM；不会预登记 READ/WRITE/READWRITE 三档 Host 权限。L3 借用域上的 `map_view(..., access=...)` 才向目标设备登记本次请求，绑定精确 backing、端点和 execution context generation；整数引用本身不授予权限。
+
+跨节点 reference 编号按全局 target rank 分区，每次签发递增；失败、unmap 都不复用旧号。8 bit ABI 在 64 ranks 时每目标只有 3–4 次签发额度，耗尽明确拒绝；应跨 Run 复用仍有效的 Tensor view，不能反复 map 规避耗尽。编号不编码 access；访问能力只来自目标 registry 中已经确认的受限记录。
+
+`domain.unmap_view(tensor)` 先撤销新使用，再清理该 backing 的最后一个设备 view。Host 导入按 Fabric token 独立管理，detach 不释放域内 HBM 或其他 Host 窗口；失败保留 CLOSING 和清理状态。整域仍须所有节点 VIEWS 确认后才能释放 OWNERS。L4 只有描述符，设备映射在持有本地 context 的 L3 上建立。
 
 ## 公共消费接口与当前边界
 
 - 单机 L3 使用 `host_window=HostWindowSpec(...)`，L4 使用 `host_windows={node: HostWindowSpec(...)}`；两者互斥，L3 拒绝 `host_windows`。
 - `orch.copy_to_host_domain(domain, data, node=node, offset=...)` 与 `copy_from_host_domain` 支持 L4 按 owner 节点 staging，也支持 L3 借用域访问本节点 Host；单机自有域省略 `node`。复用域 copy 控制通道，每次最多 8 MiB，在任务提交前或前一 Run 完成后调用。控制面 staging 不作为 HCCS 传输性能证据。
 - L4 的 `domain.host(node)` 是资源描述，不是本地映射；设备 `map_view` 仍在持有相应 attachment 的 L3 上选择。矩阵初始化和校验均走上述公共 API。
-- 当前实现仍是每节点一个域内 Host backing，并非 Buffer 先行、多 shard/owner 或 #1836 的完整 attachment 轴。`backings` 是跨节点传递 canonical identity 的 wire 表，消费授权仍由现有 ImportRegistry 完成，不建立第二 registry。
+- 当前实现限定每节点一个域内 Host backing；Host 的 export/attachment 与 rank descriptor 分离，不提供外部分配 Buffer 接入或多 shard/owner。`backings` 是跨节点传递 canonical identity 的 wire 表，消费授权仍由现有 ImportRegistry 完成，不建立第二 registry。
 - 控制面按可信节点模型运行，PID 来源是 PREPARE 返回的各 chip 身份；这不等价于对恶意控制端的身份认证。未授权 PID 的真机负向测试尚未完成。两端要求同一构建；copy 消息显式校验自身版本。
 
 ## Host 与 rank 的协议边界
