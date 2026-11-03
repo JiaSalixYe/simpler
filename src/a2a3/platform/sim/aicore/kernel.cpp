@@ -67,6 +67,8 @@ __aicore__ uint32_t get_aicore_profiling_flag() {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_profiling_flag_key)));
 }
 
+__aicore__ uint64_t get_aicore_launch_ctrl() { return read_reg(RegId::CTRL); }
+
 __aicore__ void set_aicore_report_epoch(uint64_t epoch) {
     pthread_setspecific(g_aicore_report_epoch_key, reinterpret_cast<void *>(static_cast<uintptr_t>(epoch)));
 }

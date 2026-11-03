@@ -77,6 +77,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // report suffices. The host clears aicore_done before this kernel launches,
     // so the value the AICPU reads is this run's report, never a stale prior one.
     const uint64_t report_epoch = get_aicore_report_epoch();
+    my_hank->diag_launch_ctrl = get_aicore_launch_ctrl();
+    my_hank->diag_dispatch_ctrl = 0;
+    my_hank->diag_dispatch_token = 0;
+    my_hank->diag_coreid_raw = get_physical_core_id();
     my_hank->physical_core_id = get_physical_core_id();
     my_hank->core_type = core_type;
     if (report_epoch != 0) {
@@ -244,6 +248,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             uint64_t start_time = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
 
+            my_hank->diag_dispatch_token = 0;
+            OUT_OF_ORDER_STORE_BARRIER();
+            dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
+            my_hank->diag_dispatch_ctrl = read_reg(RegId::CTRL);
+            my_hank->diag_dispatch_token = static_cast<uint64_t>(task_id) + 1;
+            OUT_OF_ORDER_STORE_BARRIER();
+            dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
             execute_task(exec_payload);
 
             // Keep start_time -> end_time scoped to AICore execution.

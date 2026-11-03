@@ -19,6 +19,7 @@
 #include "aicpu/device_run_result_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "runtime.h"
+#include "vector_state_diagnostics.h"
 #include "spin_hint.h"
 
 // Runtime headers (full struct definition for create/destroy + SIMPLER_SCOPE)
@@ -416,6 +417,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // the run's final state can be read. Deciding the record here and
         // committing it after teardown is what keeps a teardown fault from
         // landing behind an already-published success.
+        dump_vector_state_diagnostics(runtime, "terminal");
         snapshot_run_terminal(runtime);
         aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
         // Destroy the host_build_graph runtime. sm_handle / rt are recreated

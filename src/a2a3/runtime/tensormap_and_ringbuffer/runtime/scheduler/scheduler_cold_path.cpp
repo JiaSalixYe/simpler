@@ -30,6 +30,7 @@
 #include "runtime_core.h"
 #include "shared_memory.h"
 #include "runtime.h"
+#include "vector_state_diagnostics.h"
 #include "spin_hint.h"
 
 // =============================================================================
@@ -1198,6 +1199,7 @@ void SchedulerContext::signal_emergency_shutdown(Runtime *runtime) {
     // claiming keeps whatever they already retired untouched. A core still
     // handshaking retains REQUESTED and its publisher services it after READY.
     // Cores that never publish remain the host recovery path's responsibility.
+    dump_vector_state_diagnostics(runtime, "emergency");
     LOG_WARN("Emergency shutdown: requesting retirement of all AICores");
     (void)retire_all_cores(runtime);
 }

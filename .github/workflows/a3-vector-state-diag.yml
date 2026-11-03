@@ -1,0 +1,22 @@
+name: A3 Vector State Diagnosis
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - "src/a2a3/**"
+      - "src/common/host_build_graph/runtime.h"
+      - "tools/trace_alias_vector_state.py"
+      - ".github/workflows/a3-vector-state-diag.yml"
+      - ".github/workflows/_st-framework-eager.yml"
+
+jobs:
+  diagnose:
+    uses: ./.github/workflows/_st-framework-eager.yml
+    with:
+      repository: ${{ github.event.pull_request.head.repo.full_name }}
+      ref: ${{ github.event.pull_request.head.sha }}
+      platform: a2a3
+      runs_on: '["self-hosted","Linux","ARM64","a2a3pod"]'

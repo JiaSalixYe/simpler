@@ -57,6 +57,7 @@ def test_framework_alias_inout(runtime, task_queue, framework_module, tmp_path, 
             "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
             "MAX_JOBS": "2",
             "ASCEND_PROCESS_LOG_PATH": str(logs),
+            "ASCEND_WORK_PATH": str(logs),
         },
     )
     (tmp_path / "consumer.log").write_text(result.stdout + result.stderr)

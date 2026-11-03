@@ -103,6 +103,10 @@ struct Handshake {
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
     volatile uint64_t report_epoch;      // Commit marker for a native program run's report; 0 = unstamped
+    volatile uint64_t diag_launch_ctrl;
+    volatile uint64_t diag_dispatch_ctrl;
+    volatile uint64_t diag_dispatch_token;
+    volatile uint64_t diag_coreid_raw;
 } __attribute__((aligned(64)));
 
 // The AICore owns this line's writeback: it flushes the whole line with
@@ -121,6 +125,10 @@ static_assert(offsetof(Handshake, task) == 8);
 static_assert(offsetof(Handshake, core_type) == 16);
 static_assert(offsetof(Handshake, physical_core_id) == 20);
 static_assert(offsetof(Handshake, report_epoch) == 24);
+static_assert(offsetof(Handshake, diag_launch_ctrl) == 32);
+static_assert(offsetof(Handshake, diag_dispatch_ctrl) == 40);
+static_assert(offsetof(Handshake, diag_dispatch_token) == 48);
+static_assert(offsetof(Handshake, diag_coreid_raw) == 56);
 
 /**
  * Whether `handshake` carries a report this run may act on.

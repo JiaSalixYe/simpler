@@ -93,3 +93,6 @@ __aicore__ __gm__ ChipSwimlaneActiveHead *get_chip_swimlane_aicore_head();
  */
 __aicore__ void set_aicore_report_epoch(uint64_t epoch);
 __aicore__ uint64_t get_aicore_report_epoch();
+
+// CTRL observed at the first source-level statement of the global wrapper.
+__aicore__ uint64_t get_aicore_launch_ctrl();

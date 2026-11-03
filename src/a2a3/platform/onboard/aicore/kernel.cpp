@@ -48,12 +48,14 @@
 [[block_local]] static __gm__ uint64_t *s_chip_swimlane_aicore_head_slot;
 [[block_local]] static __gm__ ChipSwimlaneActiveHead *s_chip_swimlane_aicore_head;
 [[block_local]] static uint64_t s_aicore_report_epoch;
+[[block_local]] static uint64_t s_aicore_launch_ctrl;
 
 __attribute__((weak)) __aicore__ void set_aicore_profiling_flag(uint32_t flag) { s_aicore_profiling_flag = flag; }
 __attribute__((weak)) __aicore__ uint32_t get_aicore_profiling_flag() { return s_aicore_profiling_flag; }
 
 __attribute__((weak)) __aicore__ void set_aicore_report_epoch(uint64_t epoch) { s_aicore_report_epoch = epoch; }
 __attribute__((weak)) __aicore__ uint64_t get_aicore_report_epoch() { return s_aicore_report_epoch; }
+__attribute__((weak)) __aicore__ uint64_t get_aicore_launch_ctrl() { return s_aicore_launch_ctrl; }
 
 __attribute__((weak)) __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr) {
     s_chip_swimlane_aicore_head_slot = slot_ptr;
@@ -100,6 +102,8 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(
     uint64_t runtime_args, uint32_t enable_profiling_flag, uint64_t ffts_base_addr,
     uint64_t chip_swimlane_aicore_rotation_table, uint64_t report_epoch
 ) {
+    s_aicore_launch_ctrl = get_ctrl();
+
     // Calculate block_idx for this core
 #ifdef __DAV_VEC__
     block_idx = get_block_idx() * get_subblockdim() + get_subblockid() + get_block_num();

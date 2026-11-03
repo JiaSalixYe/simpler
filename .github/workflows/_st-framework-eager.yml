@@ -29,6 +29,7 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 45
     env:
+      ASCEND_GLOBAL_LOG_LEVEL: "2"
       TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"

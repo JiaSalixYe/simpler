@@ -33,6 +33,7 @@
 #include "common/kernel_args.h"
 #include "dispatch_payload.h"
 #include "runtime.h"
+#include "vector_state_diagnostics.h"
 #include "tensormap_and_ringbuffer/kernel_launch_admission.h"
 #include "spin_hint.h"
 
@@ -1085,6 +1086,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // the run's final state can be read. Deciding the record here and
         // committing it after teardown is what keeps a teardown fault from
         // landing behind an already-published success.
+        dump_vector_state_diagnostics(runtime, "terminal");
         snapshot_run_terminal(runtime);
         aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
         // Destroy the runtime context. sm_handle / rt are recreated every run so we
