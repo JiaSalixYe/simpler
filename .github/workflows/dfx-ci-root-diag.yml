@@ -6,6 +6,9 @@ permissions:
 on:
   push:
     branches: [diag/dfx-ci-root-20261103]
+  pull_request:
+    branches: [diag/dfx-baseline-142ee15a]
+    paths: [.github/workflows/dfx-ci-root-diag.yml]
 
 jobs:
   diagnose:
