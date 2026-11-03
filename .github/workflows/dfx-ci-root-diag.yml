@@ -1,0 +1,79 @@
+name: DFX Native Crash Diagnosis
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [diag/dfx-ci-root-20261103]
+
+jobs:
+  diagnose:
+    if: github.repository == 'Leaf-Salix/simpler'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CC: gcc-15
+      CXX: g++-15
+      CMAKE_BUILD_PARALLEL_LEVEL: "4"
+      PYTHONNOUSERSITE: "1"
+      UBSAN_OPTIONS: print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: ./.github/actions/setup-gcc-15
+      - uses: ./.github/actions/apt-install
+        with:
+          required-packages: libgtest-dev gdb ccache
+      - name: Install isolated simulator build
+        run: |
+          python -m venv --system-site-packages .venv
+          source .venv/bin/activate
+          export CCACHE_DIR="$PWD/.ccache"
+          ccache -s
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install 'scikit-build-core>=0.10.0' 'nanobind>=2.0.0,<3' 'cmake>=3.20'
+          pip install -v --no-build-isolation -e '.[test]' --config-settings=build.targets=build_package_sim
+      - name: Capture native failure and alignment diagnostics
+        run: |
+          source .venv/bin/activate
+          export CCACHE_DIR="$PWD/.ccache"
+          mkdir -p outputs/dfx-native-diag
+          git rev-parse HEAD > outputs/dfx-native-diag/source.txt
+          g++-15 -v 2> outputs/dfx-native-diag/compiler.txt
+          for mode in plain alignment; do
+            flags=-g
+            if [ "$mode" = alignment ]; then
+              flags="$flags -fsanitize=alignment -fno-sanitize-recover=alignment"
+            fi
+            build="build/dfx-diag-$mode"
+            cmake -S tests/ut/cpp -B "$build" -DCMAKE_CXX_FLAGS="$flags" \
+              -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+            cmake --build "$build" --parallel 4 --target \
+              test_a5_scope_stats_collector test_a2a3_tmr_dep_gen_retained_runs
+            cp "$build/compile_commands.json" "outputs/dfx-native-diag/$mode-compile-commands.json"
+            cp "$build/CMakeCache.txt" "outputs/dfx-native-diag/$mode-CMakeCache.txt"
+            for target in test_a5_scope_stats_collector test_a2a3_tmr_dep_gen_retained_runs; do
+              log="outputs/dfx-native-diag/$mode-$target.log"
+              status=0
+              timeout 90 gdb --batch --return-child-result \
+                -ex 'set pagination off' -ex run -ex 'thread apply all bt 16' \
+                -ex 'info registers' -ex 'x/12i $pc' -ex 'disassemble /r' -ex 'info locals' \
+                --args "$build/$target" > "$log" 2>&1 || status=$?
+              cp "$build/$target" "outputs/dfx-native-diag/$mode-$target"
+              printf '%s\n' "$status" > "$log.status"
+              cat "$log"
+              printf '%s %s exit=%s\n' "$mode" "$target" "$status" >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
+      - name: Retain diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dfx-native-diag-${{ github.run_id }}-${{ github.run_attempt }}
+          path: outputs/dfx-native-diag
+          if-no-files-found: warn
