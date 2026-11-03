@@ -672,6 +672,22 @@ def test_child_journal_survivor_is_not_treated_as_view_release(monkeypatch):
     assert len(worker._cleanup_journal) == 2
 
 
+def test_a5_host_backing_selects_shared_export_and_rejects_numa():
+    backing = host_domain_backend.host_backing_type("a5")()
+    identity = CanonicalIdentity(mint_owner_instance_id(), 1, 1)
+    with pytest.raises(ValueError, match="NUMA"):
+        backing.allocate(HostWindowSpec(128, numa_id=1), identity, 0, 2)
+    assert backing.shared is None
+    try:
+        base, export = backing.allocate(HostWindowSpec(128), identity, 0, 2)
+        assert base == backing.shared.base and export.mapping_size >= 128
+        assert export.rank_count == 2
+        assert host_attachment_profile(export, "a5") is AdapterProfile.HOST_SVM_MAP
+        assert host_attachment_profile(export, "a5sim") is AdapterProfile.HOST_SHM_MAP
+    finally:
+        backing.release()
+
+
 def test_optional_host_identity_does_not_enable_unsupported_backing(monkeypatch):
     def unexpected_fabric_call():
         raise AssertionError("non-Fabric communicator requested a Fabric identity")
@@ -681,8 +697,8 @@ def test_optional_host_identity_does_not_enable_unsupported_backing(monkeypatch)
     assert host_domain_backend.host_process_identity("a2a3sim", chip) == 0
     host_domain_backend.host_backing_type("a2a3sim")().authorize([0, 0])
     assert host_domain_backend.host_process_identity("a5", chip) == 0
-    with pytest.raises(ValueError, match="not implemented"):
-        host_domain_backend.host_backing_type("a5")
+    assert host_domain_backend.host_backing_type("a5").attachment_profile is AdapterProfile.HOST_SVM_MAP
+    assert host_domain_backend.host_backing_type("a5sim") is host_domain_backend.SharedHostBacking
 
 
 def test_parent_host_bootstrap_reads_pid_replies_before_authorizing_members(monkeypatch):

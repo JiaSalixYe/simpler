@@ -122,9 +122,11 @@ Both offsets are bounded together with the length against the *registered* exten
 cannot walk a legal-looking length past the end.
 
 `HostWindowSpec`, `AccessMode` and `TensorTransfer` are available from
-`simpler.task_interface`. The Host extension currently supports local A3 L2/L3
-and the `a2a3sim` correctness backend; A5 and cross-node Host creation are not
-implemented here. `HostWindowSpec.nbytes` must be positive, below `2**63` and a
+`simpler.task_interface`. The Host extension supports local A3 and A5 L2/L3
+and their simulation backends. A5 uses shared Host backing with per-worker
+HostRegister mappings, requires `numa_id=0`, and remains under explicit manual
+hardware qualification. This local mapping does not implement URMA fetch or
+cross-node Host creation. `HostWindowSpec.nbytes` must be positive, below `2**63` and a
 multiple of 64; `numa_id` is a uint32. At L2 its size must equal `create_buffer`'s
 `nbytes`. The Worker must be initialized with a communication-capable runtime and an owned
 execution context; borrowed-context Host creation is refused before allocation.

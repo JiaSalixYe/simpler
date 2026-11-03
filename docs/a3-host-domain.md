@@ -23,7 +23,16 @@ replace `Worker.release_buffer()` for the owning allocation.
 A3 VMM/Fabric backing, CPU owner view, export and PID authorization reside in the
 A3 platform runtime DSO. The common bridge preserves module lifetime while an
 owner remains retained. The extension does not compile the A3 owner strategy.
-Simulation uses its existing shared-memory backend. A5 is unsupported here.
+Simulation uses its existing shared-memory backend. A5 single-node Workers use
+shared Host backing and per-device HostRegister mappings through the same domain
+controls. A5 Host allocation currently requires `numa_id=0`; other placement is
+rejected before allocation. Each child opens the shared backing and registers it
+in its own device context; no parent device address is forwarded.
+
+A5 mapped access is a local address-consumption path. It does not provide a URMA
+region, asynchronous fetch, or a claim of communication/computation overlap.
+The A5 cases are explicit manual qualification, not default CI coverage; actual
+multicard hardware qualification remains required.
 
 The target ImportRegistry validates the canonical descriptor, selected grant,
 execution context and liveness through existing adapter/materialization paths.
@@ -46,15 +55,17 @@ stage the Host table. Public objects remain Buffer, Tensor and TaskArgs.
 
 ## Scope
 
-This is A3 single-node resource and mapping support, qualified through direct L2
-HBG/TMR MTE tests. It does not claim A5, cross-node access, asynchronous fetch
-progress or communication/computation overlap required by the full #2657 goal.
+This is single-node resource and mapping support. A3 qualification uses direct L2
+HBG/TMR MTE tests; A5 reuses these scenarios for explicit qualification, with
+complete onboard Worker validation still pending. It does not claim cross-node
+access, asynchronous fetch progress or communication/computation overlap required
+by the full #2657 goal.
 See [Buffer ABI](buffer-abi.md) for the fixed-size Tensor mapping fields and
 same-build native boundary.
 
 The L2 acceptance suite covers TMR native/H2D plus mapped reads with unmap/remap,
 HBG native HOST/NONE plus mapped reads, HBG WRITE, and TMR READWRITE. The full
-transfer/runtime Cartesian product is intentionally absent. Per-PR scene CI
+transfer/runtime Cartesian product is intentionally absent. A3 per-PR scene CI
 keeps the TMR mixed-view/unmap path and HBG native HOST/NONE consumer path.
 WRITE/READWRITE qualification runs explicitly with `--manual only` (or with
 `--manual include` for the full acceptance suite). Runtime-independent grant,
@@ -114,7 +125,7 @@ by a consumer. This feature does not close #2460 or #2657.
 
 ## CI and qualification
 
-Per-PR L3 scenes add TMR two-worker write/reuse and HBG accepted-use release.
+A3 per-PR L3 scenes add TMR two-worker write/reuse and HBG accepted-use release.
 TMR release qualification and HBG/TMR BF16 application fetches run explicitly
 with `--manual only`. Hardware-only SDMA directions retain their isolated CI
 lane. Full qualification uses the same module with `--manual include`; this

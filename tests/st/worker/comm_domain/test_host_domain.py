@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Single-node A3 Host Fabric attachments for L2/L3, MTE and PTO SDMA."""
+"""Single-node Host attachments for L2/L3 and A3 PTO SDMA."""
 
 import ctypes
 import struct
@@ -34,6 +34,9 @@ from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
 from simpler_setup.scene_test import compile_chip_callable_spec
+
+# A5 qualification is explicitly selected while the new platform path is validated.
+pytestmark = pytest.mark.manual(platforms=["a5sim", "a5"])
 
 HOST_RUNTIMES = (
     pytest.param("tensormap_and_ringbuffer", marks=pytest.mark.runtime("tensormap_and_ringbuffer")),
@@ -113,7 +116,7 @@ def build_sdma(platform):
 @pytest.mark.parametrize(
     ("engine", "host_output"),
     [
-        pytest.param("mte", True, id="host-write-mte", marks=pytest.mark.platforms(["a2a3sim", "a2a3"])),
+        pytest.param("mte", True, id="host-write-mte", marks=pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])),
         pytest.param("sdma", False, id="host-read-sdma", marks=[pytest.mark.platforms(["a2a3"]), pytest.mark.sdma]),
         pytest.param("sdma", True, id="host-write-sdma", marks=[pytest.mark.platforms(["a2a3"]), pytest.mark.sdma]),
     ],
@@ -203,7 +206,7 @@ def test_host_domain_two_chip_transfer(st_platform, st_device_ids, engine, host_
         worker.close()
 
 
-@pytest.mark.platforms(["a2a3sim", "a2a3"])
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.parametrize(
     "runtime",
     [
@@ -254,7 +257,7 @@ def test_host_domain_release_after_accepted_tasks(st_platform, st_device_ids, ru
         worker.close()
 
 
-@pytest.mark.platforms(["a2a3sim", "a2a3"])
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.manual
 @pytest.mark.parametrize("runtime", HOST_RUNTIMES)
 @pytest.mark.device_count(2)
@@ -317,7 +320,7 @@ def test_device_selected_bf16_rows(st_platform, st_device_ids, runtime):
         worker.close()
 
 
-@pytest.mark.platforms(["a2a3sim", "a2a3"])
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.device_count(1)
 def test_direct_host_fabric_two_live_buffers(st_platform, st_device_ids):
@@ -359,7 +362,7 @@ def test_direct_host_fabric_two_live_buffers(st_platform, st_device_ids):
         worker.close()
 
 
-@pytest.mark.platforms(["a2a3sim", "a2a3"])
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.device_count(1)
 def test_direct_host_native_control_and_mapped_data(st_platform, st_device_ids):
@@ -414,7 +417,7 @@ def test_direct_host_native_control_and_mapped_data(st_platform, st_device_ids):
         worker.close()
 
 
-@pytest.mark.platforms(["a2a3sim", "a2a3"])
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.manual
 @pytest.mark.parametrize(
     ("runtime", "access"),

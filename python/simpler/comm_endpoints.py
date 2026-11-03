@@ -1093,7 +1093,13 @@ def buffer_adapter_candidates(query: BufferAccessQuery) -> tuple[_AdapterCandida
                 or (
                     profile is AdapterProfile.HOST_SHM_MAP
                     and query.consumer_deployment in (HOST_CPU, DEVICE_AICORE, DEVICE_AICPU)
-                    and query.platform == "a2a3sim"
+                    and query.platform in ("a2a3sim", "a5sim")
+                )
+                or (profile is AdapterProfile.HOST_SVM_MAP and device and query.platform == "a5")
+                or (
+                    profile is AdapterProfile.HOST_SHM_MAP
+                    and query.consumer_deployment is HOST_CPU
+                    and query.platform == "a5"
                 )
                 or (
                     profile is AdapterProfile.HOST_VMM_MAP

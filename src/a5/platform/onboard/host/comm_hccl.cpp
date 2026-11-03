@@ -47,6 +47,9 @@
 #include <utility>
 #include <vector>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "acl/acl.h"
 #include "hccl/hccl_comm.h"
@@ -86,6 +89,12 @@ static inline HcclResult hccl_comm_destroy(HcclComm c) { return HcclCommDestroy(
 // process-global and per device-pair, so releasing them per allocation would
 // tear down a route a concurrent allocation still uses.
 struct DomainAllocation {
+    void *host_cpu = nullptr;
+    void *host_device = nullptr;
+    size_t host_bytes = 0;
+    bool host_registered = false;
+    bool host_closing = false;
+    bool release_started = false;
     int rank = 0;                            // this rank's index within the subset (domain_rank)
     int nranks = 0;                          // subset size
     void *local_buf = nullptr;               // VMM-mapped device VA
@@ -1846,6 +1855,91 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 }
 
+static int release_host_mapping(DomainAllocation &allocation) {
+    allocation.host_closing = true;
+    if (allocation.host_registered) {
+        const auto rc = aclrtHostUnregister(allocation.host_cpu);
+        if (rc != ACL_SUCCESS) {
+            LOG_ERROR("[comm] HostUnregister failed: %d", static_cast<int>(rc));
+            return static_cast<int>(rc);
+        }
+        allocation.host_registered = false;
+        allocation.host_device = nullptr;
+    }
+    if (allocation.host_cpu && munmap(allocation.host_cpu, allocation.host_bytes)) {
+        LOG_ERROR("[comm] Host shared mapping munmap failed");
+        return -1;
+    }
+    allocation.host_cpu = nullptr;
+    allocation.host_bytes = 0;
+    allocation.host_closing = false;
+    return 0;
+}
+
+extern "C" int comm_attach_domain_host(
+    CommHandle h, uint64_t allocation_id, const CommGlobalDomainDescriptor *descriptor, uint64_t *base_out
+) try {
+    if (!h || !descriptor || !base_out) return -1;
+    *base_out = 0;
+    auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end()) return -1;
+    auto &allocation = *it->second;
+    if (allocation.host_cpu || allocation.host_closing || allocation.release_started ||
+        descriptor->version != COMM_GLOBAL_DOMAIN_VERSION || descriptor->reserved ||
+        descriptor->profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM || !descriptor->mapping_size ||
+        descriptor->rank_count != static_cast<uint32_t>(allocation.nranks) || descriptor->domain_rank != 0 ||
+        !descriptor->handle_size || descriptor->handle_size > COMM_GLOBAL_DOMAIN_HANDLE_BYTES) {
+        LOG_ERROR(
+            "[comm] Host attach: invalid export or closing allocation %llu",
+            static_cast<unsigned long long>(allocation_id)
+        );
+        return -1;
+    }
+    std::string name(reinterpret_cast<const char *>(descriptor->handle), descriptor->handle_size);
+    if (name.find('\0') != std::string::npos) return -1;
+    if (name.front() != '/') name.insert(name.begin(), '/');
+    const int fd = shm_open(name.c_str(), O_RDWR, 0600);
+    if (fd < 0) {
+        LOG_ERROR("[comm] Host attach: shm_open failed");
+        return -1;
+    }
+    struct stat info{};
+    if (fstat(fd, &info) || info.st_size < 0 || static_cast<uint64_t>(info.st_size) < descriptor->mapping_size) {
+        close(fd);
+        LOG_ERROR("[comm] Host attach: shared backing smaller than export");
+        return -1;
+    }
+    void *cpu = mmap(nullptr, descriptor->mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (cpu == MAP_FAILED) return -1;
+    allocation.host_cpu = cpu;
+    allocation.host_bytes = descriptor->mapping_size;
+    auto rc = aclrtHostRegisterV2(cpu, allocation.host_bytes, ACL_HOST_REG_MAPPED);
+    if (rc == ACL_SUCCESS) {
+        allocation.host_registered = true;
+        rc = aclrtHostGetDevicePointer(cpu, &allocation.host_device, 0);
+    }
+    if (rc != ACL_SUCCESS || !allocation.host_device) {
+        LOG_ERROR("[comm] Host attach: HostRegister/GetDevicePointer failed: %d", static_cast<int>(rc));
+        const int cleanup = release_host_mapping(allocation);
+        return cleanup != 0 ? cleanup : (rc != ACL_SUCCESS ? static_cast<int>(rc) : -1);
+    }
+    *base_out = reinterpret_cast<uint64_t>(allocation.host_device);
+    return 0;
+} catch (...) {
+    LOG_ERROR("[comm] Host attach: unexpected exception");
+    return -1;
+}
+
+extern "C" int comm_detach_domain_host(CommHandle h, uint64_t allocation_id) try {
+    if (!h) return -1;
+    auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end()) return -1;
+    return release_host_mapping(*it->second);
+} catch (...) {
+    return -1;
+}
+
 extern "C" int
 comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) try {
     if (!h) return -1;
@@ -1866,6 +1960,7 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
         );
         return -1;
     }
+    alloc->release_started = true;
     int rc = 0;
     // Best-effort subset barrier so peers don't free local memory under each
     // other.  If a peer crashed mid-allocation, the timeout returns false and
@@ -1878,6 +1973,11 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
         rc = -1;
     }
 
+    if (alloc->host_cpu) {
+        if (rc != 0) return rc;
+        const int host_rc = release_host_mapping(*alloc);
+        if (host_rc != 0) return host_rc;
+    }
     if (alloc->device_ctx) {
         aclError aret = aclrtFree(alloc->device_ctx);
         if (aret != ACL_SUCCESS && rc == 0) rc = -1;
@@ -1930,6 +2030,15 @@ extern "C" int comm_destroy(CommHandle h) try {
             h->rank, file_marker_handshake::stage_name(destroy_handshake.stage), destroy_handshake.rank
         );
         rc = -1;
+    }
+
+    for (auto &kv : h->domain_allocations) {
+        auto &alloc = *kv.second;
+        alloc.release_started = true;
+        if (alloc.host_cpu) {
+            const int host_rc = release_host_mapping(alloc);
+            if (host_rc != 0) return host_rc;
+        }
     }
 
     if (h->owns_device_ctx && h->device_ctx) {

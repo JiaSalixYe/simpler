@@ -65,6 +65,15 @@ class SharedHostBacking:
             self.shared.close()
 
 
+class A5HostBacking(SharedHostBacking):
+    attachment_profile = AdapterProfile.HOST_SVM_MAP
+
+    def allocate(self, spec, identity, device, rank_count):
+        if spec.numa_id:
+            raise ValueError("A5 shared Host backing does not implement NUMA placement")
+        return super().allocate(spec, identity, device, rank_count)
+
+
 class A3HostBacking:
     profile = AdapterProfile.HOST_VMM_MAP
     attachment_profile = AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT
@@ -96,7 +105,12 @@ class A3HostBacking:
         self.native.release()
 
 
-_HOST_BACKENDS = {"a2a3sim": SharedHostBacking, "a2a3": A3HostBacking}
+_HOST_BACKENDS = {
+    "a2a3sim": SharedHostBacking,
+    "a2a3": A3HostBacking,
+    "a5sim": SharedHostBacking,
+    "a5": A5HostBacking,
+}
 
 
 def host_process_identity(platform, chip_worker=None):
@@ -117,7 +131,7 @@ def host_backing_type(platform):
 
 
 def host_attachment_profile(descriptor: GlobalDomainDescriptor, platform: str) -> AdapterProfile:
-    expected = GLOBAL_DOMAIN_PROFILE_SIM if platform == "a2a3sim" else GLOBAL_DOMAIN_PROFILE_A3_FABRIC
+    expected = GLOBAL_DOMAIN_PROFILE_A3_FABRIC if platform == "a2a3" else GLOBAL_DOMAIN_PROFILE_SIM
     backend = host_backing_type(platform)
     if descriptor.profile_id != GLOBAL_DOMAIN_PROFILE_IDS[expected]:
         raise ValueError("Host attachment descriptor does not match the platform backend")
