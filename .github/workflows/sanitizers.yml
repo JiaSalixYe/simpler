@@ -22,7 +22,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dfx-native-diag:
+    if: github.ref == 'refs/heads/diag/dfx-ci-root-20261103'
+    uses: ./.github/workflows/dfx-ci-root-diag.yml
+
   sanitizer-sim:
+    if: github.ref != 'refs/heads/diag/dfx-ci-root-20261103'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     # Both ASAN and TSAN gate (no continue-on-error). They run different scopes:
