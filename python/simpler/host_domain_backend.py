@@ -15,7 +15,7 @@ changing that envelope requires a paired Python/native migration.
 
 import os
 
-from _task_interface import _HostDomainMemory
+from _task_interface import _HostDomainMemory, _require_host_mapping_support
 
 from .buffer import create_host_shared_buffer
 from .comm_endpoints import AdapterProfile
@@ -68,6 +68,12 @@ class SharedHostBacking:
 class A5HostBacking(SharedHostBacking):
     attachment_profile = AdapterProfile.HOST_SVM_MAP
 
+    def __init__(self, *, host_runtime_path=None):
+        if host_runtime_path is None:
+            raise ValueError("Host backing requires an initialized platform runtime")
+        _require_host_mapping_support(str(host_runtime_path))
+        super().__init__(host_runtime_path=host_runtime_path)
+
     def allocate(self, spec, identity, device, rank_count):
         if spec.numa_id:
             raise ValueError("A5 shared Host backing does not implement NUMA placement")
@@ -76,6 +82,10 @@ class A5HostBacking(SharedHostBacking):
 
 class A5SimHostBacking(A5HostBacking):
     attachment_profile = AdapterProfile.HOST_SHM_MAP
+
+    def __init__(self, *, host_runtime_path=None):
+        # Simulator runtime dependencies are loaded only in the chip process.
+        SharedHostBacking.__init__(self, host_runtime_path=host_runtime_path)
 
 
 class A3HostBacking:

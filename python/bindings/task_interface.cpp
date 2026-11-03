@@ -2050,6 +2050,10 @@ BufferDescriptor decode_buffer_descriptor_wire(const uint8_t *raw, size_t size) 
 #endif
 
 NB_MODULE(_task_interface, m) {
+    m.def("_require_host_mapping_support", [](const std::string &path) {
+        const RuntimeModule module(path.c_str());
+        simpler::host::require_host_mapping_support(module);
+    });
     nb::class_<HostBackingOwner>(m, "_HostDomainMemory")
         .def(nb::init<const std::string &>())
         .def(

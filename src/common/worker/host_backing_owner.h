@@ -23,6 +23,7 @@
 namespace simpler::host {
 
 int query_host_backing_identity(const RuntimeModule &module);
+void require_host_mapping_support(const RuntimeModule &module);
 
 class HostBackingOwner {
 public:

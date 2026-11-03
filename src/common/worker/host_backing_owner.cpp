@@ -35,10 +35,12 @@ HostBackingOwner::HostBackingOwner(const std::string &runtime_path) :
     (void)module_->required<decltype(&host_backing_process_identity)>("host_backing_process_identity");
 }
 
-void HostBackingOwner::require_mapping_support() const {
-    (void)module_->required<decltype(&comm_attach_domain_host)>("comm_attach_domain_host");
-    (void)module_->required<decltype(&comm_detach_domain_host)>("comm_detach_domain_host");
+void require_host_mapping_support(const RuntimeModule &module) {
+    (void)module.required<decltype(&comm_attach_domain_host)>("comm_attach_domain_host");
+    (void)module.required<decltype(&comm_detach_domain_host)>("comm_detach_domain_host");
 }
+
+void HostBackingOwner::require_mapping_support() const { require_host_mapping_support(*module_); }
 
 HostBackingOwner::~HostBackingOwner() {
     // Unknown imported-view lifetime forbids backing cleanup and code unload.

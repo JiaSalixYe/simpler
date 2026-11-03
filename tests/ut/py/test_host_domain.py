@@ -673,8 +673,14 @@ def test_child_journal_survivor_is_not_treated_as_view_release(monkeypatch):
 
 
 @pytest.mark.parametrize("platform", ["a5", "a5sim"])
-def test_a5_host_backing_selects_shared_export_and_rejects_numa(platform):
-    backing = host_domain_backend.host_backing_type(platform)()
+def test_a5_host_backing_selects_shared_export_and_rejects_numa(platform, monkeypatch):
+    support = Mock()
+    monkeypatch.setattr(host_domain_backend, "_require_host_mapping_support", support)
+    backing = host_domain_backend.host_backing_type(platform)(host_runtime_path="/test/host_runtime.so")
+    if platform == "a5":
+        support.assert_called_once_with("/test/host_runtime.so")
+    else:
+        support.assert_not_called()
     identity = CanonicalIdentity(mint_owner_instance_id(), 1, 1)
     try:
         with pytest.raises(ValueError, match="NUMA"):
@@ -747,13 +753,19 @@ def test_parent_host_bootstrap_reads_pid_replies_before_authorizing_members(monk
         worker.close()
 
 
-def test_host_mapping_runtime_support_is_checked_before_allocation(monkeypatch):
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_host_mapping_runtime_support_is_checked_before_allocation(monkeypatch, platform):
     native = MagicMock()
     native.require_mapping_support.side_effect = RuntimeError("missing Host detach entry")
     monkeypatch.setattr(host_domain_backend, "_HostDomainMemory", lambda _path: native)
+    monkeypatch.setattr(host_domain_backend, "_require_host_mapping_support", native.require_mapping_support)
+    shared_allocate = Mock(side_effect=AssertionError("allocation preceded capability check"))
+    monkeypatch.setattr(host_domain_backend, "create_host_shared_buffer", shared_allocate)
     with pytest.raises(RuntimeError, match="missing Host detach"):
-        host_domain_backend.A3HostBacking(host_runtime_path="/test/host_runtime.so")
+        host_domain_backend.host_backing_type(platform)(host_runtime_path="/test/host_runtime.so")
+    native.require_mapping_support.assert_called_once()
     native.allocate.assert_not_called()
+    shared_allocate.assert_not_called()
 
 
 _REFS = {AccessMode.READWRITE: 1, AccessMode.READ: 2, AccessMode.WRITE: 3}
