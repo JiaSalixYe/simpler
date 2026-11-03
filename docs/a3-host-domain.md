@@ -119,3 +119,4 @@ TMR release qualification and HBG/TMR BF16 application fetches run explicitly
 with `--manual only`. Hardware-only SDMA directions retain their isolated CI
 lane. Full qualification uses the same module with `--manual include`; this
 selection does not replace onboard evidence or establish latency hiding.
+
