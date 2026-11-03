@@ -279,14 +279,7 @@ from .global_comm_domain import (
     resolve_global_comm_capability,
     validate_descriptor_table,
 )
-from .host_domain import (
-    _GLOBAL_HOST_MAGIC,
-    _GLOBAL_HOST_VIEW,
-    HostDomainResource,
-    HostDomainView,
-    _apply_global_host_request,
-    _global_host_buffer,
-)
+from .host_domain import HostDomainResource, HostDomainView
 from .host_domain_backend import host_attachment_profile, host_backing_type, host_process_identity
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
 from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
@@ -913,6 +906,9 @@ _MAX_FLUSH_TIMEOUT_MS = 2**31 - 1
 # Python-only Host view control, carried by the existing generic payload mailbox.
 _CTRL_HOST_VIEW = 28
 _HOST_VIEW_REQUEST = struct.Struct("<QBBBB")
+
+_GLOBAL_HOST_VIEW = struct.Struct("<4sQQQBBBB")
+_GLOBAL_HOST_MAGIC = b"HGV2"
 _CTRL_OP_NAMES[_CTRL_HOST_VIEW] = "host_view"
 _CTRL_DELEGATED_REGION = 26
 _LOCAL_GLOBAL_CONTROL_HEADER = struct.Struct("<IIQ")
@@ -3508,6 +3504,69 @@ def _handle_ctrl_release_domain(
             import_registry.unregister(source.descriptor.identity)
     handle = _require_base_communicator(base_comm_handle)
     cw.comm_release_domain_windows(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
+
+
+def _global_host_buffer(owner_instance_id, window):
+    return Buffer(
+        identity=CanonicalIdentity(owner_instance_id, window.buffer_id, 1),
+        address_space=AddressSpace.HOST,
+        access=AccessMode.READWRITE,
+        backend_kind=BackendKind.REMOTE_SIDECAR,
+        nbytes=window.spec.nbytes,
+        base=0,
+    )
+
+
+def _apply_global_host_request(cw, registry, store, sources, payload, *, platform):  # noqa: PLR0912 -- source validation and map/unmap share one private control boundary
+    if len(payload) < _GLOBAL_HOST_VIEW.size:
+        raise ValueError("truncated global Host view request")
+    magic, domain, generation, buffer_id, reference, access, operation, reserved = _GLOBAL_HOST_VIEW.unpack_from(
+        payload
+    )
+    if magic != _GLOBAL_HOST_MAGIC or reserved or operation not in (1, 2):
+        raise ValueError("invalid global Host view request")
+    cw._validate_execution_context()
+    entry = store.domains.get(domain)
+    if entry is None or entry.generation != generation:
+        raise ValueError("global Host view requires the matching domain generation")
+    if entry.host_closing or not entry.device_ctx or not reference or not buffer_id:
+        raise ValueError("global Host mapping requires an imported live domain and reference")
+    key = (domain, buffer_id)
+    source = sources.get(key)
+    if operation == 1:
+        access = AccessMode(access)
+        tail = bytes(payload[_GLOBAL_HOST_VIEW.size :])
+        if len(tail) <= GLOBAL_DOMAIN_DESCRIPTOR_BYTES:
+            raise ValueError("invalid global Host mapping payload size")
+        exported = GlobalDomainDescriptor.decode(tail[:GLOBAL_DOMAIN_DESCRIPTOR_BYTES])
+        descriptor = _decode_buffer_descriptor_wire(tail[GLOBAL_DOMAIN_DESCRIPTOR_BYTES:])
+        if (
+            descriptor.address_space != AddressSpace.HOST
+            or descriptor.backend_kind != BackendKind.REMOTE_SIDECAR
+            or descriptor.identity.buffer_id != buffer_id
+            or descriptor.nbytes > exported.mapping_size
+        ):
+            raise ValueError("invalid global Host backing descriptor")
+        host_attachment_profile(exported, platform)
+        if source is not None:
+            if source.descriptor != descriptor or source.exported != exported:
+                raise ValueError("global Host binding conflicts with its source")
+        else:
+            source = sources[key] = HostDomainView(
+                descriptor,
+                exported,
+                0,
+                cw._execution_environment,
+                lambda: store.domains.get(domain) is entry and not entry.host_closing,
+                attach=lambda: cw.comm_global_domain_import_host(
+                    domain, exported.profile_id, exported.handle, exported.mapping_size
+                ),
+                detach=lambda: cw.comm_global_domain_detach_host(domain, exported.handle),
+            )
+    elif len(payload) != _GLOBAL_HOST_VIEW.size or access:
+        raise ValueError("invalid global Host mapping operation")
+    if source is not None:
+        source.apply(cw, registry, 0, domain, reference, access, unmap=operation == 2, platform=platform)
 
 
 def _handle_ctrl_host_view(

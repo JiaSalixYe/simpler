@@ -15,11 +15,10 @@ this module's resource and grant-registration helpers are not public APIs.
 from __future__ import annotations
 
 import ctypes
-import struct
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from _task_interface import _decode_buffer_descriptor_wire, _encode_buffer_descriptor_wire
+from _task_interface import _encode_buffer_descriptor_wire
 
 from .buffer import (
     AccessMode,
@@ -27,7 +26,6 @@ from .buffer import (
     BackendKind,
     Buffer,
     BufferDescriptor,
-    CanonicalIdentity,
     Tensor,
 )
 from .comm_domain import HostWindowSpec
@@ -236,72 +234,3 @@ class HostDomainResource:
             raise RuntimeError("Host domain owner retained: member view release is unconfirmed")
         if self.backend is not None:
             self.backend.release()
-
-
-_GLOBAL_HOST_VIEW = struct.Struct("<4sQQQBBBB")
-_GLOBAL_HOST_MAGIC = b"HGV2"
-
-
-def _global_host_buffer(owner_instance_id, window):
-    return Buffer(
-        identity=CanonicalIdentity(owner_instance_id, window.buffer_id, 1),
-        address_space=AddressSpace.HOST,
-        access=AccessMode.READWRITE,
-        backend_kind=BackendKind.REMOTE_SIDECAR,
-        nbytes=window.spec.nbytes,
-        base=0,
-    )
-
-
-def _apply_global_host_request(cw, registry, store, sources, payload, *, platform):  # noqa: PLR0912 -- source validation and map/unmap share one private control boundary
-    if len(payload) < _GLOBAL_HOST_VIEW.size:
-        raise ValueError("truncated global Host view request")
-    magic, domain, generation, buffer_id, reference, access, operation, reserved = _GLOBAL_HOST_VIEW.unpack_from(
-        payload
-    )
-    if magic != _GLOBAL_HOST_MAGIC or reserved or operation not in (1, 2):
-        raise ValueError("invalid global Host view request")
-    cw._validate_execution_context()
-    entry = store.domains.get(domain)
-    if entry is None or entry.generation != generation:
-        raise ValueError("global Host view requires the matching domain generation")
-    if entry.host_closing or not entry.device_ctx or not reference or not buffer_id:
-        raise ValueError("global Host mapping requires an imported live domain and reference")
-    key = (domain, buffer_id)
-    source = sources.get(key)
-    if operation == 1:
-        access = AccessMode(access)
-        from .global_comm_domain import GLOBAL_DOMAIN_DESCRIPTOR_BYTES  # noqa: PLC0415
-
-        tail = bytes(payload[_GLOBAL_HOST_VIEW.size :])
-        if len(tail) <= GLOBAL_DOMAIN_DESCRIPTOR_BYTES:
-            raise ValueError("invalid global Host mapping payload size")
-        exported = GlobalDomainDescriptor.decode(tail[:GLOBAL_DOMAIN_DESCRIPTOR_BYTES])
-        descriptor = _decode_buffer_descriptor_wire(tail[GLOBAL_DOMAIN_DESCRIPTOR_BYTES:])
-        if (
-            descriptor.address_space != AddressSpace.HOST
-            or descriptor.backend_kind != BackendKind.REMOTE_SIDECAR
-            or descriptor.identity.buffer_id != buffer_id
-            or descriptor.nbytes > exported.mapping_size
-        ):
-            raise ValueError("invalid global Host backing descriptor")
-        host_attachment_profile(exported, platform)
-        if source is not None:
-            if source.descriptor != descriptor or source.exported != exported:
-                raise ValueError("global Host binding conflicts with its source")
-        else:
-            source = sources[key] = HostDomainView(
-                descriptor,
-                exported,
-                0,
-                cw._execution_environment,
-                lambda: store.domains.get(domain) is entry and not entry.host_closing,
-                attach=lambda: cw.comm_global_domain_import_host(
-                    domain, exported.profile_id, exported.handle, exported.mapping_size
-                ),
-                detach=lambda: cw.comm_global_domain_detach_host(domain, exported.handle),
-            )
-    elif len(payload) != _GLOBAL_HOST_VIEW.size or access:
-        raise ValueError("invalid global Host mapping operation")
-    if source is not None:
-        source.apply(cw, registry, 0, domain, reference, access, unmap=operation == 2, platform=platform)

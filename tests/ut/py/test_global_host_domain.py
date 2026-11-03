@@ -26,7 +26,7 @@ from simpler.global_comm_domain import (
     encode_domain_command,
 )
 from simpler.task_interface import CommDomainHandle
-from simpler.worker import Worker, _GlobalNodeDomainState
+from simpler.worker import Worker, _apply_global_host_request, _global_host_buffer, _GlobalNodeDomainState
 
 from tests.ut.py.test_global_comm_domain import _host_command
 
@@ -191,7 +191,7 @@ def test_receivers_cannot_reinterpret_each_others_mapping_reference():
     from contextlib import nullcontext  # noqa: PLC0415
 
     from simpler.buffer import AccessMode, DataType  # noqa: PLC0415
-    from simpler.host_domain import HostDomainResource, _global_host_buffer  # noqa: PLC0415
+    from simpler.host_domain import HostDomainResource  # noqa: PLC0415
 
     spec = HostWindowSpec(128)
     source = _global_host_buffer(b"owner123", GlobalDomainHostWindow(0, spec, 1))
@@ -222,11 +222,7 @@ def test_first_map_binds_source_and_failed_release_revokes_it(host_authorization
     from simpler import worker as worker_module  # noqa: PLC0415
     from simpler.buffer import AccessMode  # noqa: PLC0415
     from simpler.global_comm_domain import LOCAL_DOMAIN_MAGIC, LOCAL_RELEASE_REQUEST  # noqa: PLC0415
-    from simpler.host_domain import (  # noqa: PLC0415
-        HostDomainResource,
-        _apply_global_host_request,
-        _global_host_buffer,
-    )
+    from simpler.host_domain import HostDomainResource  # noqa: PLC0415
 
     worker, state, command, resource = host_authorization
     state.phase = GlobalDomainPhase.COMMIT
