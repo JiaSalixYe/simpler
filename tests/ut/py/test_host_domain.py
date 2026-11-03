@@ -672,18 +672,19 @@ def test_child_journal_survivor_is_not_treated_as_view_release(monkeypatch):
     assert len(worker._cleanup_journal) == 2
 
 
-def test_a5_host_backing_selects_shared_export_and_rejects_numa():
-    backing = host_domain_backend.host_backing_type("a5")()
+@pytest.mark.parametrize("platform", ["a5", "a5sim"])
+def test_a5_host_backing_selects_shared_export_and_rejects_numa(platform):
+    backing = host_domain_backend.host_backing_type(platform)()
     identity = CanonicalIdentity(mint_owner_instance_id(), 1, 1)
-    with pytest.raises(ValueError, match="NUMA"):
-        backing.allocate(HostWindowSpec(128, numa_id=1), identity, 0, 2)
-    assert backing.shared is None
     try:
+        with pytest.raises(ValueError, match="NUMA"):
+            backing.allocate(HostWindowSpec(128, numa_id=1), identity, 0, 2)
+        assert backing.shared is None
         base, export = backing.allocate(HostWindowSpec(128), identity, 0, 2)
         assert base == backing.shared.base and export.mapping_size >= 128
         assert export.rank_count == 2
-        assert host_attachment_profile(export, "a5") is AdapterProfile.HOST_SVM_MAP
-        assert host_attachment_profile(export, "a5sim") is AdapterProfile.HOST_SHM_MAP
+        expected = AdapterProfile.HOST_SVM_MAP if platform == "a5" else AdapterProfile.HOST_SHM_MAP
+        assert host_attachment_profile(export, platform) is expected
     finally:
         backing.release()
 
@@ -698,7 +699,7 @@ def test_optional_host_identity_does_not_enable_unsupported_backing(monkeypatch)
     host_domain_backend.host_backing_type("a2a3sim")().authorize([0, 0])
     assert host_domain_backend.host_process_identity("a5", chip) == 0
     assert host_domain_backend.host_backing_type("a5").attachment_profile is AdapterProfile.HOST_SVM_MAP
-    assert host_domain_backend.host_backing_type("a5sim") is host_domain_backend.SharedHostBacking
+    assert host_domain_backend.host_backing_type("a5sim").attachment_profile is AdapterProfile.HOST_SHM_MAP
 
 
 def test_parent_host_bootstrap_reads_pid_replies_before_authorizing_members(monkeypatch):

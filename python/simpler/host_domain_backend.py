@@ -74,6 +74,10 @@ class A5HostBacking(SharedHostBacking):
         return super().allocate(spec, identity, device, rank_count)
 
 
+class A5SimHostBacking(A5HostBacking):
+    attachment_profile = AdapterProfile.HOST_SHM_MAP
+
+
 class A3HostBacking:
     profile = AdapterProfile.HOST_VMM_MAP
     attachment_profile = AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT
@@ -108,7 +112,7 @@ class A3HostBacking:
 _HOST_BACKENDS = {
     "a2a3sim": SharedHostBacking,
     "a2a3": A3HostBacking,
-    "a5sim": SharedHostBacking,
+    "a5sim": A5SimHostBacking,
     "a5": A5HostBacking,
 }
 

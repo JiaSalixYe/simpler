@@ -31,6 +31,11 @@ in its own device context; no parent device address is forwarded.
 
 A5 mapped access is a local address-consumption path. It does not provide a URMA
 region, asynchronous fetch, or a claim of communication/computation overlap.
+The pinned PTO manager uses a symmetric payload registration; separate Host-source
+and HBM-destination registration support is still needed for Host fetch. This
+branch keeps the existing Device URMA workspace unchanged while that interface is
+pending. A5 simulation enforces the same allocation constraints as the hardware
+backend while resolving its mapping through shared memory.
 The A5 cases are explicit manual qualification, not default CI coverage; actual
 multicard hardware qualification remains required.
 
