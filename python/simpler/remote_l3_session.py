@@ -1160,12 +1160,10 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             )
                         elif command.phase in (
                             GlobalDomainPhase.AUTHORIZE,
-                            GlobalDomainPhase.REVOKE_HOST,
                             GlobalDomainPhase.RELEASE_HOST,
                         ):
                             operation = {
                                 GlobalDomainPhase.AUTHORIZE: inner_worker._authorize_global_host_node,
-                                GlobalDomainPhase.REVOKE_HOST: inner_worker._revoke_global_host_node,
                                 GlobalDomainPhase.RELEASE_HOST: inner_worker._release_global_host_node,
                             }[command.phase]
                             operation(command)

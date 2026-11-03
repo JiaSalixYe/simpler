@@ -68,7 +68,6 @@ from simpler.global_comm_domain import (
     decode_descriptor_table,
     decode_domain_buffer_refs,
     decode_domain_command,
-    decode_host_exports,
     decode_prepare_result,
     decode_release_command,
     encode_comm_init,
@@ -77,7 +76,6 @@ from simpler.global_comm_domain import (
     encode_descriptor_table,
     encode_domain_buffer_refs,
     encode_domain_command,
-    encode_host_exports,
     encode_prepare_result,
     encode_release_command,
     resolve_global_comm_capability,
@@ -1951,7 +1949,6 @@ def _host_command(phase=GlobalDomainPhase.PREPARE_EXPORT):
     if phase in (
         GlobalDomainPhase.IMPORT,
         GlobalDomainPhase.COMMIT,
-        GlobalDomainPhase.REVOKE_HOST,
         GlobalDomainPhase.RELEASE_HOST,
     ):
         windows = tuple(
@@ -1971,7 +1968,6 @@ def _host_command(phase=GlobalDomainPhase.PREPARE_EXPORT):
         in (
             GlobalDomainPhase.IMPORT,
             GlobalDomainPhase.COMMIT,
-            GlobalDomainPhase.REVOKE_HOST,
             GlobalDomainPhase.RELEASE_HOST,
         )
         else (),
@@ -2018,7 +2014,6 @@ def test_host_prepare_reply_keeps_legacy_encoding_and_binds_actual_pids():
     assert encode_prepare_result(ranks) == encode_descriptor_table(ranks)
     assert decode_prepare_result(encode_prepare_result(ranks)) == (ranks, (), ())
     hosts = _host_command(GlobalDomainPhase.IMPORT).host_windows[:1]
-    assert decode_host_exports(encode_host_exports(hosts)) == hosts
     payload = encode_prepare_result(ranks, hosts, (101,))
     assert decode_prepare_result(payload) == (ranks, hosts, (101,))
     for bad in (payload[:3], payload[:-1], payload + b"extra", payload[:-8] + struct.pack("<I", 65)):
@@ -2040,12 +2035,11 @@ def test_host_prepare_reply_keeps_legacy_encoding_and_binds_actual_pids():
 def test_host_export_rejects_invalid_mapping_or_platform_token(export):
     host = GlobalDomainHostWindow(0, HostWindowSpec(64), 100, export)
     with pytest.raises(ValueError):
-        encode_host_exports((host,))
+        encode_prepare_result(_descriptors()[:1], (host,), (101,))
 
 
-@pytest.mark.parametrize("phase", [GlobalDomainPhase.REVOKE_HOST, GlobalDomainPhase.RELEASE_HOST])
-def test_host_cleanup_roundtrips_partial_prepare_without_full_exports(phase):
-    command = replace(_host_command(), phase=phase)
+def test_host_cleanup_roundtrips_partial_prepare_without_full_exports():
+    command = replace(_host_command(), phase=GlobalDomainPhase.RELEASE_HOST)
     assert decode_domain_command(encode_domain_command(command)) == command
     with pytest.raises(ValueError, match="cleanup requires Host"):
         encode_domain_command(replace(command, host_windows=()))

@@ -281,11 +281,11 @@ from .global_comm_domain import (
 )
 from .host_domain import (
     _GLOBAL_HOST_MAGIC,
+    _GLOBAL_HOST_VIEW,
     HostDomainResource,
     HostDomainView,
     _apply_global_host_request,
     _global_host_buffer,
-    _global_host_request,
 )
 from .host_domain_backend import host_attachment_profile, host_backing_type, host_process_identity
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
@@ -1288,8 +1288,7 @@ class _GlobalNodeDomainState:
     borrowed_handle: CommDomainHandle | None = None
     host_resources: dict = field(default_factory=dict)
     host_pids: dict[int, int] = field(default_factory=dict)
-    host_views_released: bool = False
-    hbm_released: bool = False
+    native_released: bool = False
     host_authorized: bool = False
     authorized_host_windows: tuple = ()
     authorized_host_pids: tuple[int, ...] = ()
@@ -3292,7 +3291,9 @@ def _handle_ctrl_global_domain_import(cw: _ChipWorker, buf: memoryview, store: _
         staged.close()
 
 
-def _handle_ctrl_global_domain_release(cw: _ChipWorker, buf: memoryview, store: _L2GlobalDomainStore) -> None:
+def _handle_ctrl_global_domain_release(
+    cw: _ChipWorker, buf: memoryview, store: _L2GlobalDomainStore, *, import_registry=None, host_sources=None
+) -> None:
     staged, payload, payload_size = _open_global_domain_payload(buf)
     try:
         if payload_size < LOCAL_RELEASE_REQUEST.size:
@@ -3303,6 +3304,13 @@ def _handle_ctrl_global_domain_release(cw: _ChipWorker, buf: memoryview, store: 
         if entry is not None and entry.generation != generation:
             raise RuntimeError("Global CommDomain release generation mismatch")
         if entry is not None:
+            entry.host_closing = True
+            for key, source in tuple((host_sources or {}).items()):
+                if isinstance(key, tuple) and key[0] == domain_id:
+                    assert import_registry is not None and host_sources is not None
+                    source.closing = True
+                    import_registry.unregister(source.descriptor.identity)
+                    host_sources.pop(key)
             cw.comm_global_domain_release(int(domain_id))
             store.domains.pop(int(domain_id), None)
     finally:
@@ -3891,7 +3899,9 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             elif sub_cmd == CTRL_GLOBAL_DOMAIN_IMPORT:
                 _handle_ctrl_global_domain_import(cw, buf, global_domain_store)
             elif sub_cmd == CTRL_GLOBAL_DOMAIN_RELEASE:
-                _handle_ctrl_global_domain_release(cw, buf, global_domain_store)
+                _handle_ctrl_global_domain_release(
+                    cw, buf, global_domain_store, import_registry=import_registry, host_sources=host_domain_sources
+                )
             elif sub_cmd == CTRL_GLOBAL_DOMAIN_COPY_TO:
                 _handle_ctrl_global_domain_copy(
                     cw,
@@ -4635,9 +4645,6 @@ def _run_local_global_domain_control(  # noqa: PLR0912 -- one ordered dispatcher
             )
         if command.phase is GlobalDomainPhase.AUTHORIZE:
             inner_worker._authorize_global_host_node(command)
-            return b""
-        if command.phase is GlobalDomainPhase.REVOKE_HOST:
-            inner_worker._revoke_global_host_node(command)
             return b""
         if command.phase is GlobalDomainPhase.RELEASE_HOST:
             inner_worker._release_global_host_node(command)
@@ -11438,14 +11445,11 @@ class Worker:
     def _prepare_global_host_owner(self, state, node_worker_id):
         command = state.command
         window = next(h for h in command.host_windows if h.node_worker_id == node_worker_id)
-        buffer = _global_host_buffer(command.owner_instance_id, window)
         resource = self._global_host_resource(state, window, node_worker_id)
         self._cleanup_journal.add_once("host-domain", f"global-{command.domain_id}", resource.close)
         state.host_resources[node_worker_id] = resource
         resource.allocate()
         resource.published = True
-        if resource.identity != buffer.identity:
-            raise RuntimeError("global Host allocation changed its canonical identity")
         state.node_worker_id = node_worker_id
 
     def _global_host_resource(self, state, window, receiver_node, *, buffer=None):
@@ -11521,11 +11525,8 @@ class Worker:
         ):
             raise ValueError("Global Host export table differs from authorization or is closing")
 
-    def _bind_global_host_sources(self, state):
-        assert self._worker is not None
+    def _import_global_host_sources(self, state):
         command = state.command
-        if not state.host_authorized:
-            raise RuntimeError("global Host imports require authorization before IMPORT")
         node = state.node_worker_id
         for window in command.host_windows:
             resource = state.host_resources.get(window.node_worker_id)
@@ -11543,13 +11544,6 @@ class Worker:
                 exported.mapping_size,
                 exported.handle,
             )
-            for member in self._global_local_members(command, node):
-                payload = _global_host_request(
-                    command.domain_id, command.generation, window.buffer_id, resource=resource
-                )
-                self._worker.control_payload(
-                    WorkerType.NEXT_LEVEL, member.local_worker_id, _CTRL_HOST_VIEW, payload, self._py_control_timeout_s
-                )
             self._domain_members.setdefault(self._global_domain_provenance_id(command.domain_id), set()).add(
                 resource.identity
             )
@@ -11559,50 +11553,21 @@ class Worker:
         command = state.command
         if state.phase is not GlobalDomainPhase.COMMIT:
             raise ValueError("Host mapping requires the committed global domain")
-        payload = _global_host_request(
-            command.domain_id, command.generation, resource.identity.buffer_id, reference, access, 2 if unmap else 1
+        payload = _GLOBAL_HOST_VIEW.pack(
+            _GLOBAL_HOST_MAGIC,
+            command.domain_id,
+            command.generation,
+            resource.identity.buffer_id,
+            reference,
+            int(access),
+            2 if unmap else 1,
+            0,
         )
+        if not unmap:
+            payload += resource.request()
         self._worker.control_payload(
             WorkerType.NEXT_LEVEL, worker, _CTRL_HOST_VIEW, payload, self._py_control_timeout_s
         )
-
-    def _revoke_global_host_node(self, command):
-        state = self._global_node_domains.get(command.domain_id)
-        if state is None:
-            return
-        if not command.attachments:
-            command = replace(command, attachments=state.command.attachments)
-        if self._global_domain_command_identity(state.command) != self._global_domain_command_identity(command):
-            raise ValueError("Host revoke domain identity mismatch")
-        state.phase = GlobalDomainPhase.ABORT
-        if state.view is not None:
-            state.view._committed = False
-        if state.borrowed_handle is not None:
-            state.borrowed_handle._released = True
-        for resource in state.host_resources.values():
-            resource.closed = True
-            if resource.buffer is not None:
-                resource.buffer.closed = True
-        errors = []
-        if state.prepared_domain_ranks and self._worker is None:
-            raise RuntimeError("Global Host revoke requires its live chip transport")
-        for member in state.command.members:
-            if member.domain_rank not in state.prepared_domain_ranks:
-                continue
-            try:
-                assert self._worker is not None
-                self._worker.control_payload(
-                    WorkerType.NEXT_LEVEL,
-                    member.local_worker_id,
-                    _CTRL_HOST_VIEW,
-                    _global_host_request(command.domain_id, command.generation, 0, operation=3),
-                    self._py_control_timeout_s,
-                )
-            except BaseException as error:
-                errors.append(error)
-        if errors:
-            raise RuntimeError(f"global Host view cleanup unconfirmed: {errors[0]}") from errors[0]
-        state.host_views_released = True
 
     def _release_global_host_node(self, command):
         state = self._global_node_domains.get(command.domain_id)
@@ -11612,8 +11577,7 @@ class Worker:
             command = replace(command, attachments=state.command.attachments)
         if (
             self._global_domain_command_identity(state.command) != self._global_domain_command_identity(command)
-            or not state.host_views_released
-            or not state.hbm_released
+            or not state.native_released
         ):
             raise RuntimeError("global Host owners require confirmed view and domain release")
         for resource in state.host_resources.values():
@@ -11875,7 +11839,7 @@ class Worker:
             state.command = command
             state.phase = GlobalDomainPhase.IMPORT
             if command.host_windows:
-                self._bind_global_host_sources(state)
+                self._import_global_host_sources(state)
             state.view = GlobalCommDomainView(
                 name=command.name,
                 members=command.members,
@@ -11936,24 +11900,26 @@ class Worker:
         self, command: GlobalDomainReleaseCommand, *, suppress_errors: bool = False
     ) -> None:
         state = self._global_node_domains.get(command.domain_id)
-        if state is None or state.hbm_released:
+        if state is None or state.native_released:
             return
         if state.command.generation != command.generation:
             raise RuntimeError("Global CommDomain release generation mismatch")
-        if state.host_resources and not state.host_views_released:
-            if suppress_errors:
-                return
-            raise RuntimeError("Global Host views must be confirmed revoked before domain release")
         # Invalidate the public view before the first destructive child call.
         # If fanout later fails, callers can no longer retrieve or use pointers
         # into windows that may already have been released on some local ranks.
         state.phase = GlobalDomainPhase.ABORT
+        for resource in state.host_resources.values():
+            resource.closed = True
+            if resource.buffer is not None:
+                resource.buffer.closed = True
         if state.borrowed_handle is not None:
             state.borrowed_handle._released = True
         if state.view is not None:
             state.view._committed = False  # noqa: SLF001 -- node session owns the transaction
         self._drop_domain_allocs(self._global_domain_provenance_id(command.domain_id))
         if self._worker is None:
+            if state.host_resources and state.prepared_domain_ranks:
+                raise RuntimeError("Global Host release requires its live chip transport")
             return
         errors: list[BaseException] = []
         local_members = tuple(
@@ -11982,7 +11948,7 @@ class Worker:
         if not errors:
             if state.borrowed_handle is not None:
                 state.borrowed_handle._freed = True
-            state.hbm_released = True
+            state.native_released = True
             if not state.host_resources:
                 self._global_node_domains.pop(command.domain_id, None)
         if errors and not suppress_errors:
@@ -12538,7 +12504,6 @@ class Worker:
             raise RuntimeError(f"global Host {phase.name} is unconfirmed: {errors[0]}") from errors[0]
 
     def _abort_global_host_domain(self, command, nodes):
-        self._global_host_phase(command, nodes, GlobalDomainPhase.REVOKE_HOST)
         self._global_host_phase(command, nodes, GlobalDomainPhase.ABORT)
         self._global_host_phase(command, nodes, GlobalDomainPhase.RELEASE_HOST)
 
@@ -12604,8 +12569,6 @@ class Worker:
         command = encode_release_command(GlobalDomainReleaseCommand(handle.domain_id, handle.generation))
         errors: list[BaseException] = []
         involved_nodes = tuple(dict.fromkeys(member.node_worker_id for member in handle.members))
-        if handle._host_command is not None:
-            self._global_host_phase(handle._host_command, involved_nodes, GlobalDomainPhase.REVOKE_HOST)
         mpi_group = self._mpi_group_for_involved_nodes(involved_nodes)
         if mpi_group is not None:
             try:

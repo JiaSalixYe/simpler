@@ -75,7 +75,7 @@ GLOBAL_DOMAIN_PROFILE_IDS = {
 GLOBAL_DOMAIN_MAX_STRING_BYTES = 1024
 GLOBAL_DOMAIN_MAX_COPY_BYTES = 8 * 1024 * 1024
 GLOBAL_DOMAIN_BUFFER_REF_BYTES = 104
-GLOBAL_DOMAIN_COMMAND_VERSION = 2
+GLOBAL_DOMAIN_COMMAND_VERSION = 3
 _DOMAIN_COMMAND_MAGIC = f"SDC{GLOBAL_DOMAIN_COMMAND_VERSION}".encode("ascii")
 
 CTRL_GLOBAL_DOMAIN_PREPARE = 19
@@ -100,7 +100,6 @@ class GlobalDomainPhase(enum.IntEnum):
     COMMIT = 3
     ABORT = 4
     AUTHORIZE = 5
-    REVOKE_HOST = 6
     RELEASE_HOST = 7
 
 
@@ -754,22 +753,6 @@ def _read_host_windows(reader: _Reader) -> tuple[GlobalDomainHostWindow, ...]:
     return tuple(hosts)
 
 
-def encode_host_exports(hosts: tuple[GlobalDomainHostWindow, ...]) -> bytes:
-    if not hosts or any(host.export is None for host in hosts):
-        raise ValueError("Host export reply requires prepared windows")
-    out = bytearray()
-    _put_host_windows(out, hosts)
-    return bytes(out)
-
-
-def decode_host_exports(data: bytes) -> tuple[GlobalDomainHostWindow, ...]:
-    reader = _Reader(data)
-    hosts = _read_host_windows(reader)
-    reader.done("Host exports")
-    encode_host_exports(hosts)
-    return hosts
-
-
 def _validate_target_pids(pids: tuple[int, ...]) -> None:
     if len(pids) > GLOBAL_DOMAIN_MAX_RANKS or any(type(pid) is not int or not 0 < pid < 2**31 for pid in pids):
         raise ValueError("invalid Fabric target process IDs")
@@ -786,6 +769,8 @@ def encode_prepare_result(
         if target_pids:
             raise ValueError("target process IDs require Host exports")
         return bytes(out)
+    if any(host.export is None for host in host_windows):
+        raise ValueError("Host prepare reply requires prepared windows")
     _validate_target_pids(target_pids)
     if any(
         host.export is not None and any(d.profile_id != host.export.profile_id for d in descriptors)
@@ -794,7 +779,7 @@ def encode_prepare_result(
         raise ValueError("Host prepare export profile differs from rank exports")
     if len(target_pids) != len(descriptors) or not descriptors:
         raise ValueError("Host prepare process IDs must match the exported ranks")
-    out.extend(encode_host_exports(host_windows))
+    _put_host_windows(out, host_windows)
     out.extend(struct.pack("<I", len(target_pids)))
     for pid in target_pids:
         out.extend(struct.pack("<i", pid))
@@ -845,7 +830,7 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
         _validate_target_pids(command.target_pids)
     elif command.target_pids:
         raise ValueError("target process IDs are only carried by AUTHORIZE")
-    if command.phase in (GlobalDomainPhase.REVOKE_HOST, GlobalDomainPhase.RELEASE_HOST) and not command.host_windows:
+    if command.phase is GlobalDomainPhase.RELEASE_HOST and not command.host_windows:
         raise ValueError("Host cleanup requires Host windows")
     validate_attachment_table(command.attachments, command.members)
     if command.phase is not GlobalDomainPhase.PREPARE_EXPORT and command.attachments:
@@ -869,7 +854,7 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
     if command.phase in (GlobalDomainPhase.IMPORT, GlobalDomainPhase.COMMIT):
         if len(command.descriptors) != len(command.members):
             raise ValueError("global domain IMPORT/COMMIT requires a complete descriptor table")
-    elif command.descriptors and command.phase not in (GlobalDomainPhase.REVOKE_HOST, GlobalDomainPhase.RELEASE_HOST):
+    elif command.descriptors and command.phase is not GlobalDomainPhase.RELEASE_HOST:
         raise ValueError("global domain PREPARE/ABORT/AUTHORIZE must not carry descriptors")
     if command.owner_instance_id and (len(command.owner_instance_id) != 8 or not any(command.owner_instance_id)):
         raise ValueError("global domain creator must be a nonzero 8-byte instance identity")

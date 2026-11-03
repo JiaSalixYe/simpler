@@ -239,7 +239,7 @@ class HostDomainResource:
 
 
 _GLOBAL_HOST_VIEW = struct.Struct("<4sQQQBBBB")
-_GLOBAL_HOST_MAGIC = b"HGV1"
+_GLOBAL_HOST_MAGIC = b"HGV2"
 
 
 def _global_host_buffer(owner_instance_id, window):
@@ -253,57 +253,29 @@ def _global_host_buffer(owner_instance_id, window):
     )
 
 
-def _global_host_request(domain, generation, buffer_id, reference=0, access=0, operation=0, resource=None):
-    payload = _GLOBAL_HOST_VIEW.pack(
-        _GLOBAL_HOST_MAGIC, domain, generation, buffer_id, reference, int(access), operation, 0
-    )
-    if resource is not None:
-        payload += resource.export.encode() + _encode_buffer_descriptor_wire(resource.buffer.to_descriptor())
-    return payload
-
-
-def _apply_global_host_request(cw, registry, store, sources, payload, *, platform):  # noqa: PLR0912 -- validate, bind, map and revoke share one private control boundary
+def _apply_global_host_request(cw, registry, store, sources, payload, *, platform):  # noqa: PLR0912 -- source validation and map/unmap share one private control boundary
     if len(payload) < _GLOBAL_HOST_VIEW.size:
         raise ValueError("truncated global Host view request")
     magic, domain, generation, buffer_id, reference, access, operation, reserved = _GLOBAL_HOST_VIEW.unpack_from(
         payload
     )
-    if magic != _GLOBAL_HOST_MAGIC or reserved or operation not in (0, 1, 2, 3):
+    if magic != _GLOBAL_HOST_MAGIC or reserved or operation not in (1, 2):
         raise ValueError("invalid global Host view request")
     cw._validate_execution_context()
     entry = store.domains.get(domain)
-    if (
-        entry is None
-        and operation == 3
-        and len(payload) == _GLOBAL_HOST_VIEW.size
-        and not (reference or access or buffer_id)
-    ):
-        return
     if entry is None or entry.generation != generation:
         raise ValueError("global Host view requires the matching domain generation")
-    if operation == 3:
-        if len(payload) != _GLOBAL_HOST_VIEW.size or reference or access or buffer_id:
-            raise ValueError("invalid global Host revoke request")
-        entry.host_closing = True
-        for key, source in tuple(sources.items()):
-            if not isinstance(key, tuple) or key[0] != domain:
-                continue
-            source.closing = True
-            registry.unregister(source.descriptor.identity)
-            if source.base:
-                source.detach()
-                source.base = 0
-            sources.pop(key)
-        return
-    if entry.host_closing:
-        raise ValueError("global Host imports are closing")
+    if entry.host_closing or not entry.device_ctx or not reference or not buffer_id:
+        raise ValueError("global Host mapping requires an imported live domain and reference")
     key = (domain, buffer_id)
-    if operation == 0:
+    source = sources.get(key)
+    if operation == 1:
+        access = AccessMode(access)
         from .global_comm_domain import GLOBAL_DOMAIN_DESCRIPTOR_BYTES  # noqa: PLC0415
 
         tail = bytes(payload[_GLOBAL_HOST_VIEW.size :])
-        if len(tail) <= GLOBAL_DOMAIN_DESCRIPTOR_BYTES or reference or access or not buffer_id:
-            raise ValueError("invalid global Host binding size")
+        if len(tail) <= GLOBAL_DOMAIN_DESCRIPTOR_BYTES:
+            raise ValueError("invalid global Host mapping payload size")
         exported = GlobalDomainDescriptor.decode(tail[:GLOBAL_DOMAIN_DESCRIPTOR_BYTES])
         descriptor = _decode_buffer_descriptor_wire(tail[GLOBAL_DOMAIN_DESCRIPTOR_BYTES:])
         if (
@@ -314,28 +286,22 @@ def _apply_global_host_request(cw, registry, store, sources, payload, *, platfor
         ):
             raise ValueError("invalid global Host backing descriptor")
         host_attachment_profile(exported, platform)
-        previous = sources.get(key)
-        if previous is not None:
-            if previous.descriptor != descriptor or previous.exported != exported:
+        if source is not None:
+            if source.descriptor != descriptor or source.exported != exported:
                 raise ValueError("global Host binding conflicts with its source")
-            return
-        sources[key] = HostDomainView(
-            descriptor,
-            exported,
-            0,
-            cw._execution_environment,
-            lambda: store.domains.get(domain) is entry and not entry.host_closing,
-            attach=lambda: cw.comm_global_domain_import_host(
-                domain, exported.profile_id, exported.handle, exported.mapping_size
-            ),
-            detach=lambda: cw.comm_global_domain_detach_host(domain, exported.handle),
-        )
-        return
-    if len(payload) != _GLOBAL_HOST_VIEW.size or not reference or (operation == 2 and access):
+        else:
+            source = sources[key] = HostDomainView(
+                descriptor,
+                exported,
+                0,
+                cw._execution_environment,
+                lambda: store.domains.get(domain) is entry and not entry.host_closing,
+                attach=lambda: cw.comm_global_domain_import_host(
+                    domain, exported.profile_id, exported.handle, exported.mapping_size
+                ),
+                detach=lambda: cw.comm_global_domain_detach_host(domain, exported.handle),
+            )
+    elif len(payload) != _GLOBAL_HOST_VIEW.size or access:
         raise ValueError("invalid global Host mapping operation")
-    source = sources.get(key)
-    if source is None or not entry.device_ctx:
-        raise ValueError("global Host view requires a bound imported backing")
-    if operation == 1:
-        access = AccessMode(access)
-    source.apply(cw, registry, 0, domain, reference, access, unmap=operation == 2, platform=platform)
+    if source is not None:
+        source.apply(cw, registry, 0, domain, reference, access, unmap=operation == 2, platform=platform)

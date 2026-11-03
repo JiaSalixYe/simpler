@@ -141,66 +141,43 @@ mapped = domain.map_view(source, domain_rank=0, access=AccessMode.READ)
 domain.unmap_view(mapped)
 ```
 
-`host_window` is local-L3-only; `host_windows` is L4-only and must name exactly
-the participating nodes. The two arguments are mutually exclusive. Source node
-and destination device rank are separate: the receiving L3 may map any source
-Host backing onto one of its own domain members. Mapping at the L4 controller or
-onto another L3 node's device is refused. Each consuming run must look up or
-reuse the domain in its owner L4 callback before dispatch; a child lookup alone
-does not enroll the owner's run, as with existing retained HBM domains. The native CPU pointer is usable only
-in the owning L3 process; other nodes and L4 receive the same canonical Buffer
-with `base=0`, not a remotely dereferenceable CPU pointer. Initialize or inspect
-a Host table in its owning L3 callback, with device users excluded.
+`host_window` is local-L3-only; L4 `host_windows` must name exactly its participating
+nodes. They are mutually exclusive. The source node and receiving device rank
+are separate: `map_view` must run on the L3 owning the target member. Only the
+source L3 has a usable CPU `Buffer.base`; other L3 nodes and L4 get `base=0`.
+Initialize/update tables in the owner L3 callback with device users excluded.
+Each consuming run must look up or reuse the domain in its owner L4 callback;
+a child lookup alone does not enroll that run.
 
-A3 owners use VMM Host physical memory and Fabric exports for both local and
-remote consumers. Every chip reports its actual BareTgid before authorization.
-The controller exchanges Host exports separately from the unchanged v2 rank
-descriptor table, authorizes the consuming processes, imports HBM domain state,
-and binds Host source metadata. A `map_view` request then imports the selected
-Host backing through NoUC/Fabric and installs only its requested restricted
-record in the target ImportRegistry. Payload movement uses the existing
-MTE/PTO-SDMA interfaces and completion rules; no IPC HostRegister export or
-extra copy service is involved. This route requires a supported HCCS fabric; it
-does not introduce a RoCE fallback or infer reachability from an Ethernet link.
+A3 reuses the platform DSO's VMM/Fabric owner and NoUC import. Actual chip
+BareTgids authorize the immutable Host export table before IMPORT; Host exports
+remain separate from the unchanged v2 rank descriptors. First MAP carries the
+source descriptor and establishes its restricted target record, without a
+separate metadata BIND fanout. Later MAPs must match that source. Transfers
+reuse existing MTE/PTO-SDMA and completion interfaces. A5 and RoCE fallback are
+not implemented here; this route requires a supported HCCS fabric.
 
-Each receiving L3 issues a disjoint subset of the existing 255 reference slots
-per backing, sharing its issuer across its local chips. References are routing
-indices, not authority; target records still validate access, descriptor,
-context and liveness. Exhaustion fails explicitly without reusing stale refs.
+Receiving L3s partition the existing 255 non-reusable reference slots per backing.
+References provide no authority; target records still validate descriptor,
+grant, context and liveness. Exhaustion fails explicitly.
 
-Release confirms Host revocation/detach on **all** nodes before releasing any
-owner. HBM domain release follows those acknowledgements; only after every node
-confirms that stage are Host owners released. Partial prepare/import failures
-use the same staged rollback. An unconfirmed stage retains owner cleanup debt;
-a local success or child process exit is not a remote release acknowledgement.
+Existing domain release revokes target records and retires native Host imports
+before HBM. Only after every node acknowledges that release are Host owners
+closed. Partial creation uses the same rollback. Unconfirmed results
+retain cleanup debt; local child exit cannot substitute for remote confirmation.
+This does not establish asynchronous latency hiding or complete #2657.
 
-The manual global Host acceptance case exercises peer reads, peer writes,
-owner CPU readback and map/unmap restrictions using the existing vector-add
-callable. Local simulation validates control and permission behavior, not
-physical inter-server Fabric visibility or PID isolation. Run it explicitly
-with `--manual only`; it adds no default scene-CI matrix. Dual-host A3 hardware
-qualification, including unauthorized-PID rejection, remains required.
+### Dual-host qualification
 
-## Multi-node Host qualification
-
-The manual global Host test reuses the existing vector-add kernel. Its local and
-TCP variants cover two L3 nodes, peer Host reads and writes, CPU readback,
-receiver selection, unmap/stale references and retained-domain cleanup. Both
-simulator variants pass; this is not evidence of hardware HCCS reachability or
-communication/computation overlap.
-
-For a two-machine A3 run, install the same branch commit and PTO pin on the
-controller and both nodes, with compatible CANN/driver versions. Reserve the
-selected physical devices on both nodes through their normal device queues and
-keep the reservations for the complete test. On each node, start the existing
-worker daemon in that checkout's environment:
+Install the same commit and PTO pin on controller and both A3 nodes, with
+compatible CANN/drivers. Keep physical-device queue reservations on both nodes
+for the complete test. Start the existing daemon in each checkout's environment:
 
 ```bash
 python -m simpler.remote_l3_worker --host 0.0.0.0 --port <port>
 ```
 
-With two reachable endpoints and the two reserved physical device IDs in node
-order, run from the controller:
+From the controller, name endpoints and reserved physical device IDs in node order:
 
 ```bash
 SIMPLER_HOST_ENDPOINTS='<node0>:<port0>,<node1>:<port1>' \
@@ -209,8 +186,9 @@ SIMPLER_HOST_ENDPOINTS='<node0>:<port0>,<node1>:<port1>' \
   --platform a2a3 --device <device0>,<device1> --manual only -v --forked
 ```
 
-The endpoints carry control messages; data access uses the A3 Fabric backend and
-requires a real shared HCCS topology. The test does not substitute TCP payload
-copies for device access. Without `SIMPLER_HOST_ENDPOINTS`, the TCP simulator
-variant starts two loopback daemons and preserves their logs under its pytest
-temporary directory. This test remains manual and adds no per-PR scene selection.
+TCP carries control; peer data uses Fabric/HCCS. Without external endpoints, the
+`a2a3sim` case starts two loopback daemons and saves logs in pytest's temporary
+directory. The manual local/TCP cases reuse vector-add for peer reads/writes,
+CPU readback, receiver selection, unmap/stale references and retained cleanup;
+they add no default scene-CI matrix. Simulation cannot qualify real inter-server
+visibility or unauthorized-PID rejection; those require dual-host hardware.
