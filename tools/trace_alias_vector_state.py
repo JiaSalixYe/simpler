@@ -17,9 +17,9 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
 _EXAMPLE = _ROOT / "examples/workers/l2/framework_eager"
-_WORDS = 32
+_WORDS = 64
 _UNPROVEN = []
-_FIELDS = (
+_FIELDS: tuple[str, ...] = (
     "entry_ctrl",
     "pre_add_ctrl",
     "post_add_issue_ctrl",
@@ -41,6 +41,35 @@ _FIELDS = (
     "result_ub",
     "post_vector_sync_ctrl",
     "post_all_sync_ctrl",
+    "source_tensor_addr",
+    "target_tensor_addr",
+    "source_stride1",
+    "target_stride1",
+    "source_offset",
+    "target_offset",
+    "source_buffer",
+    "target_buffer",
+    "source_ndims",
+    "target_ndims",
+    "trace_device_addr",
+    "producer_source_buffer",
+    "producer_target_buffer",
+    "producer_source_offset",
+    "producer_target_offset",
+    "producer_src_rows",
+    "producer_src_cols",
+    "producer_dst_rows",
+    "producer_dst_cols",
+    "producer_src_stride0",
+    "producer_src_stride1",
+    "producer_dst_stride0",
+    "producer_dst_stride1",
+    "producer_source_ndims",
+    "producer_target_ndims",
+    "producer_tensor_count",
+    "producer_scalar_count",
+    "producer_trace_device",
+    "producer_marker",
 )
 _PUBLISH = (
     " ".join(
@@ -70,7 +99,7 @@ def generate_sources(output):
     source = _replace_once(
         source,
         'extern "C" __aicore__',
-        """struct AliasVectorRecord { volatile uint64_t values[32]; };
+        """struct AliasVectorRecord { volatile uint64_t values[64]; };
 
 template <typename TileData>
 __tf__ PTO_INTERNAL void record_tile_address(
@@ -88,6 +117,17 @@ extern "C" __aicore__""",
     trace[7] = reinterpret_cast<uint64_t>(source); trace[8] = reinterpret_cast<uint64_t>(target);
     trace[10] = source_tensor->strides[0]; trace[11] = target_tensor->strides[0];
     trace[12] = get_coreid();
+    trace[21] = args[0]; trace[22] = args[1];
+    trace[23] = source_tensor->strides[1]; trace[24] = target_tensor->strides[1];
+    trace[25] = source_tensor->start_offset; trace[26] = target_tensor->start_offset;
+    trace[27] = source_tensor->buffer.addr; trace[28] = target_tensor->buffer.addr;
+    trace[29] = source_tensor->ndims; trace[30] = target_tensor->ndims; trace[31] = args[2];
+    trace[32] = args[3]; trace[33] = args[4]; trace[34] = args[5]; trace[35] = args[6];
+    for (int i = 0; i < 6; ++i) {
+        trace[36 + i * 2] = static_cast<uint32_t>(args[7 + i]);
+        trace[37 + i * 2] = static_cast<uint64_t>(args[7 + i]) >> 32;
+    }
+    trace[48] = args[13]; trace[49] = args[14];
 """
     source = _replace_once(source, "    using ShapeType", entry + "    " + _publish(1) + "\n    using ShapeType")
     add = "    pto::TADD(result, source_tile, target_tile);"
@@ -117,10 +157,22 @@ extern "C" __aicore__""",
     kernel.write_text(source)
     orchestration = (_EXAMPLE / "kernels/alias_inout_orchestration.cpp").read_text()
     orchestration = _replace_once(orchestration, "expected_arg_count = 2", "expected_arg_count = 3")
+    producer = """    const auto &source = args.tensor(0).ref();
+    const auto &target = args.tensor(1).ref();
+    const auto pack = [](uint32_t low, uint32_t high) {
+        return static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32);
+    };
+    const uint64_t counts = pack(task.tensor_count(), task.scalar_count() + 12);
+    task.add_scalar(
+        source.buffer.addr, target.buffer.addr, source.start_offset, target.start_offset,
+        pack(source.shapes[0], source.shapes[1]), pack(target.shapes[0], target.shapes[1]),
+        pack(source.strides[0], source.strides[1]), pack(target.strides[0], target.strides[1]),
+        pack(source.ndims, target.ndims), counts, args.scalar<uint64_t>(0), uint64_t(0xa3a3f83d));
+"""
     orchestration = _replace_once(
         orchestration,
         "    rt_submit_aiv_task(0, task);",
-        "    task.add_scalar(args.scalar<uint64_t>(0));\n    rt_submit_aiv_task(0, task);",
+        "    task.add_scalar(args.scalar<uint64_t>(0));\n" + producer + "    rt_submit_aiv_task(0, task);",
     )
     orch = output / "alias_vector_state_orchestration.cpp"
     orch.write_text(orchestration)
@@ -173,7 +225,14 @@ def run(options):
                     "function_name": "framework_alias_inout",
                     "signature": signature,
                 },
-                "incores": [{"func_id": 0, "source": str(kernel), "core_type": "aiv", "signature": signature}],
+                "incores": [
+                    {
+                        "func_id": 0,
+                        "source": str(kernel),
+                        "core_type": "aiv",
+                        "signature": signature + [ArgDirection.SCALAR] * 12,
+                    },
+                ],
             },
             platform,
             runtime,
@@ -240,6 +299,26 @@ def run(options):
         assert [row[key] for key in ("tile_rows", "tile_cols", "expected_repeats")] == [64] * 3, row
         assert [row[key] for key in ("src_ub", "target_ub", "result_ub")] == [0, 0x4000, 0x8000], row
         assert row["dst_gm"] - row["src_gm"] == (0 if index < options.calls else 32), row
+        assert row["producer_marker"] == 0xA3A3F83D, row
+        assert [row[key] for key in ("producer_tensor_count", "producer_scalar_count")] == [2, 13], row
+        for name in (
+            "source_buffer",
+            "target_buffer",
+            "source_offset",
+            "target_offset",
+            "src_rows",
+            "src_cols",
+            "dst_rows",
+            "dst_cols",
+            "src_stride0",
+            "dst_stride0",
+            "source_ndims",
+            "target_ndims",
+        ):
+            assert row["producer_" + name] == row[name], (name, row)
+        assert row["producer_src_stride1"] == row["source_stride1"] == 1, row
+        assert row["producer_dst_stride1"] == row["target_stride1"] == 1, row
+        assert row["producer_trace_device"] == row["trace_device_addr"] == device + index * _WORDS * 8, row
 
 
 def main():

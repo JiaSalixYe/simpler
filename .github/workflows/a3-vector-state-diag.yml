@@ -9,6 +9,7 @@ on:
       - "src/a2a3/**"
       - "src/common/host_build_graph/runtime.h"
       - "tools/trace_alias_vector_state.py"
+      - "tests/st/worker/framework_eager/test_alias_vector_state.py"
       - ".github/workflows/a3-vector-state-diag.yml"
       - ".github/workflows/_st-framework-eager.yml"
 
