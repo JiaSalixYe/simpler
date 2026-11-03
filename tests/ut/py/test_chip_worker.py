@@ -35,6 +35,23 @@ from simpler.task_interface import (
 )
 from simpler.worker import Worker, _Lifecycle
 
+
+@pytest.fixture(autouse=True)
+def isolate_fake_runtime_history(request, monkeypatch):
+    # The generated C-ABI fixture and path-marshalling fake never initialize CANN.
+    if "kernel_symbol_runtime" not in request.fixturenames and request.node.originalname != (
+        "test_shared_initializer_maps_binary_paths_and_runtime_options"
+    ):
+        return
+    from simpler import task_interface as task_module  # noqa: PLC0415
+    from simpler import worker as worker_module  # noqa: PLC0415
+    from simpler._onboard_fork import _ProcessDeviceState  # noqa: PLC0415
+
+    state = _ProcessDeviceState()
+    monkeypatch.setattr(task_module, "process_device_state", state)
+    monkeypatch.setattr(worker_module, "process_device_state", state)
+
+
 # ============================================================================
 # CallConfig tests
 # ============================================================================

@@ -50,7 +50,15 @@ def main():
 
     for index in range(options.prefix):
         cycle(f"L2_{index + 1}", level=2, device_id=devices[0])
-    cycle("L3", level=3, device_ids=devices, num_sub_workers=0, startup_timeout_s=120, heap_ring_size=0)
+    try:
+        cycle("L3", level=3, device_ids=devices, num_sub_workers=0, startup_timeout_s=120, heap_ring_size=0)
+    except RuntimeError as error:
+        if not options.prefix or "even after close()" not in str(error):
+            raise
+        print("MIXED_REFUSED_BEFORE_FORK", str(error), flush=True)
+    else:
+        if options.prefix:
+            raise AssertionError("onboard initialization history must refuse hierarchy startup")
     print("PROBE_PASS", flush=True)
 
 

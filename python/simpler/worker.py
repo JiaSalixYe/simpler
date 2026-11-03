@@ -115,6 +115,7 @@ from _task_interface import (
 )
 
 from . import _log as _simpler_log
+from ._onboard_fork import process_device_state
 from .buffer import (
     OWNER_INSTANCE_ID_BYTES,
     AccessMode,
@@ -9116,8 +9117,9 @@ class Worker:
             if self.level == 2:
                 self._init_level2(**init_options)
             elif self.level >= 3:
-                self._init_hierarchical()
-                self._start_hierarchical()
+                with process_device_state.hierarchy(timeout=max(0.0, self._startup_deadline - _monotonic())):
+                    self._init_hierarchical()
+                    self._start_hierarchical()
             else:
                 raise ValueError(f"Worker: level {self.level} not supported")
             # Atomic READY commit inside the exception boundary: publish the

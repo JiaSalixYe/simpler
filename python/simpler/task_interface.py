@@ -126,6 +126,7 @@ from _task_interface import (
     scalar_to_uint64 as _native_scalar_to_uint64,
 )
 
+from ._onboard_fork import process_device_state
 from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
 from .comm_domain import CommDomainRef
 from .comm_endpoints import DEVICE_AICPU
@@ -1514,6 +1515,7 @@ def _initialize_chip_runtime(  # noqa: PLR0913 -- explicit binary, workspace and
     _initialize_host_log(log_level)
     dispatcher_path = getattr(bins, "dispatcher_path", None)
     sim_context_path = getattr(bins, "sim_context_path", None)
+    sim_context = "" if sim_context_path is None else str(sim_context_path)
     sdma_warmup_path = getattr(bins, "sdma_warmup_path", None)
     init_options = {}
     if borrowed_context_generation is not None:
@@ -1522,22 +1524,23 @@ def _initialize_chip_runtime(  # noqa: PLR0913 -- explicit binary, workspace and
         sdma_warmup_path = None
     # C++ retains libcpu_sim_context.so in the sim process registry. Sim has
     # no dispatcher; onboard bootstrap consumes its actual binary path.
-    impl.init(
-        str(bins.host_path),
-        str(bins.aicpu_path),
-        str(bins.aicore_path),
-        "" if dispatcher_path is None else str(dispatcher_path),
-        int(device_id),
-        prewarm_config,
-        bool(enable_sdma),
-        "" if sim_context_path is None else str(sim_context_path),
-        "" if sdma_warmup_path is None else str(sdma_warmup_path),
-        bool(collect_across_runs),
-        int(workspace_budget_bytes),
-        bool(manage_workspace),
-        int(requested_pipeline_depth),
-        **init_options,
-    )
+    with process_device_state.device_init(not sim_context):
+        impl.init(
+            str(bins.host_path),
+            str(bins.aicpu_path),
+            str(bins.aicore_path),
+            "" if dispatcher_path is None else str(dispatcher_path),
+            int(device_id),
+            prewarm_config,
+            bool(enable_sdma),
+            sim_context,
+            "" if sdma_warmup_path is None else str(sdma_warmup_path),
+            bool(collect_across_runs),
+            int(workspace_budget_bytes),
+            bool(manage_workspace),
+            int(requested_pipeline_depth),
+            **init_options,
+        )
 
 
 class ChipWorker:

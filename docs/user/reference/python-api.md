@@ -57,6 +57,16 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | `init(prewarm_config=None, *, borrowed_context_generation=None)` | Resolves binaries; owns or borrows the direct L2 device context, or starts children |
 | `close()` | Retires runtime resources and children; resets only an owned device. Put it in a `finally` |
 
+A process that has attempted onboard initialization through `Worker` or public
+`ChipWorker` cannot subsequently start a forked Worker hierarchy, even after
+`close()` or a failed initialization. Startup raises before preparing or forking
+children. Start that hierarchy in a fresh Python process. Repeated direct L2
+initialization in the original process remains supported. This process history
+is independent of device allocation lifetime; closing a context does not reset
+CANN's process-global state. Simulator-only startup does not record onboard
+history. External device-library initialization and private native entry points
+are outside this Python admission check.
+
 ### Borrowed device context and caller ordering
 
 For direct onboard L2, `worker.init(borrowed_context_generation=token)` borrows

@@ -913,7 +913,9 @@ class TestLevel2Lifecycle:
                 pass
 
             def get_binaries(self, *_a, **_k):
-                return SimpleNamespace(host_path="unused", aicpu_path="unused", aicore_path="unused")
+                return SimpleNamespace(
+                    host_path="unused", aicpu_path="unused", aicore_path="unused", sim_context_path="unused"
+                )
 
         # Mock the device/runtime layer so this stays device-free (no sim
         # binaries required) — the regression is purely the lifecycle state.
@@ -1650,7 +1652,9 @@ class TestLevel2Lifecycle:
                 pass
 
             def get_binaries(self, *_a, **_k):
-                return SimpleNamespace(host_path="unused", aicpu_path="unused", aicore_path="unused")
+                return SimpleNamespace(
+                    host_path="unused", aicpu_path="unused", aicore_path="unused", sim_context_path="unused"
+                )
 
         monkeypatch.setattr(worker_mod, "_ChipWorker", chip_cls)
         monkeypatch.setattr(
