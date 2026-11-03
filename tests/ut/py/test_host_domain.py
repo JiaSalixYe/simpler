@@ -1026,7 +1026,7 @@ def test_host_attachment_cleanup_faults(tmp_path):
             "DomainAllocation::~DomainAllocation()",
             "// ============================================================================",
         ),
-        section('extern "C" int comm_attach_domain_host(', 'extern "C" int\ncomm_release_domain_windows'),
+        section("static int import_domain_host(", 'extern "C" int\ncomm_release_domain_windows'),
         section('extern "C" int\ncomm_release_domain_windows', 'extern "C" int comm_global_domain_prepare'),
     ]
     # Only SDK/runtime boundaries are stubbed; the selected production bodies are compiled verbatim.

@@ -23,6 +23,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _encode_buffer_descriptor_wire,
 )
 
+from .comm_domain import HostWindowSpec
 from .comm_endpoints import (
     _ADAPTER_KIND_IDS,  # noqa: F401 — re-export of the comm_endpoints numeric table
     _ADAPTER_PROFILE_IDS,  # noqa: F401 — re-export of the comm_endpoints numeric table
@@ -74,7 +75,8 @@ GLOBAL_DOMAIN_PROFILE_IDS = {
 GLOBAL_DOMAIN_MAX_STRING_BYTES = 1024
 GLOBAL_DOMAIN_MAX_COPY_BYTES = 8 * 1024 * 1024
 GLOBAL_DOMAIN_BUFFER_REF_BYTES = 104
-_DOMAIN_COMMAND_MAGIC = b"SDC1"
+GLOBAL_DOMAIN_COMMAND_VERSION = 2
+_DOMAIN_COMMAND_MAGIC = f"SDC{GLOBAL_DOMAIN_COMMAND_VERSION}".encode("ascii")
 
 CTRL_GLOBAL_DOMAIN_PREPARE = 19
 CTRL_GLOBAL_DOMAIN_IMPORT = 20
@@ -83,8 +85,8 @@ CTRL_GLOBAL_DOMAIN_COPY_TO = 22
 CTRL_GLOBAL_DOMAIN_COPY_FROM = 23
 
 LOCAL_DOMAIN_MAGIC = b"SGD1"
-LOCAL_PREPARE_REQUEST = struct.Struct("<4sIQQIIIQ")
-LOCAL_PREPARE_REPLY = struct.Struct("<4sIQQQQ")
+LOCAL_PREPARE_REQUEST = struct.Struct("<4sIQQIIIQ?")
+LOCAL_PREPARE_REPLY = struct.Struct("<4sIQQQQi")
 LOCAL_IMPORT_REQUEST = struct.Struct("<4sIQQI")
 LOCAL_IMPORT_REPLY = struct.Struct("<4sIQQQQQ")
 LOCAL_RELEASE_REQUEST = struct.Struct("<4sIQQ")
@@ -97,6 +99,9 @@ class GlobalDomainPhase(enum.IntEnum):
     IMPORT = 2
     COMMIT = 3
     ABORT = 4
+    AUTHORIZE = 5
+    REVOKE_HOST = 6
+    RELEASE_HOST = 7
 
 
 @dataclass(frozen=True)
@@ -219,6 +224,23 @@ def resolve_global_comm_capability(*, platform: str, profile: str, local_device_
 
 
 @dataclass(frozen=True)
+class HostExportDescriptor:
+    """Opaque platform export; backing identity belongs to its Host window."""
+
+    profile_id: int
+    mapping_size: int
+    handle: bytes
+
+
+@dataclass(frozen=True)
+class GlobalDomainHostWindow:
+    node_worker_id: int
+    spec: HostWindowSpec
+    buffer_id: int
+    export: HostExportDescriptor | None = None
+
+
+@dataclass(frozen=True)
 class GlobalDomainCommand:
     phase: GlobalDomainPhase
     domain_id: int
@@ -232,6 +254,8 @@ class GlobalDomainCommand:
     attachments: tuple[GlobalDomainAttachment, ...] = ()
     owner_instance_id: bytes = b""
     retain_after_run: bool = False
+    host_windows: tuple[GlobalDomainHostWindow, ...] = ()
+    target_pids: tuple[int, ...] = ()
 
     def attachments_for_node(self, node_worker_id: int) -> tuple[GlobalDomainAttachment, ...]:
         """Return the row addressed to one receiving L3 node.
@@ -661,8 +685,168 @@ def decode_comm_init_result(data: bytes) -> GlobalCommInitResult:
     return result
 
 
+def _validate_host_window(host: GlobalDomainHostWindow) -> None:
+    if (
+        type(host.node_worker_id) is not int
+        or not 0 <= host.node_worker_id < 2**31
+        or not isinstance(host.spec, HostWindowSpec)
+        or type(host.buffer_id) is not int
+        or not 0 < host.buffer_id < 2**64
+    ):
+        raise ValueError("invalid Host window node, specification or Buffer identity")
+    exported = host.export
+    if exported is None:
+        return
+    if (
+        not isinstance(exported, HostExportDescriptor)
+        or exported.profile_id not in GLOBAL_DOMAIN_PROFILE_IDS.values()
+        or not host.spec.nbytes <= exported.mapping_size < 2**64
+        or not isinstance(exported.handle, bytes)
+        or not 0 < len(exported.handle) <= GLOBAL_DOMAIN_HANDLE_BYTES
+    ):
+        raise ValueError("invalid Host export profile, mapping size or token")
+    if (
+        exported.profile_id == GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_A3_FABRIC]
+        and len(exported.handle) != 128
+    ):
+        raise ValueError("Host Fabric token must contain 128 bytes")
+
+
+def _put_host_windows(out: bytearray, hosts: tuple[GlobalDomainHostWindow, ...]) -> None:
+    if len(hosts) > GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("Host window count exceeds maximum")
+    if len({h.node_worker_id for h in hosts}) != len(hosts) or len({h.buffer_id for h in hosts}) != len(hosts):
+        raise ValueError("Host windows repeat a node or Buffer identity")
+    out.extend(struct.pack("<I", len(hosts)))
+    for host in hosts:
+        _validate_host_window(host)
+        out.extend(
+            struct.pack(
+                "<iIQQ?",
+                host.node_worker_id,
+                host.spec.numa_id,
+                host.spec.nbytes,
+                host.buffer_id,
+                host.export is not None,
+            )
+        )
+        if host.export is not None:
+            out.extend(struct.pack("<IQ", host.export.profile_id, host.export.mapping_size))
+            _put_blob(out, host.export.handle, GLOBAL_DOMAIN_HANDLE_BYTES, "Host token")
+
+
+def _read_host_windows(reader: _Reader) -> tuple[GlobalDomainHostWindow, ...]:
+    count = reader.u32()
+    if count > GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("Host window count exceeds maximum")
+    hosts = []
+    for _ in range(count):
+        node, numa, nbytes, buffer_id = struct.unpack("<iIQQ", reader.fixed(24, "Host window"))
+        present = reader.fixed(1, "Host export presence")
+        if present not in (b"\x00", b"\x01"):
+            raise ValueError("invalid Host export presence")
+        exported = None
+        if present == b"\x01":
+            exported = HostExportDescriptor(
+                reader.u32(), reader.u64(), reader.blob(GLOBAL_DOMAIN_HANDLE_BYTES, "Host token")
+            )
+        hosts.append(GlobalDomainHostWindow(node, HostWindowSpec(nbytes, numa), buffer_id, exported))
+    return tuple(hosts)
+
+
+def encode_host_exports(hosts: tuple[GlobalDomainHostWindow, ...]) -> bytes:
+    if not hosts or any(host.export is None for host in hosts):
+        raise ValueError("Host export reply requires prepared windows")
+    out = bytearray()
+    _put_host_windows(out, hosts)
+    return bytes(out)
+
+
+def decode_host_exports(data: bytes) -> tuple[GlobalDomainHostWindow, ...]:
+    reader = _Reader(data)
+    hosts = _read_host_windows(reader)
+    reader.done("Host exports")
+    encode_host_exports(hosts)
+    return hosts
+
+
+def _validate_target_pids(pids: tuple[int, ...]) -> None:
+    if len(pids) > GLOBAL_DOMAIN_MAX_RANKS or any(type(pid) is not int or not 0 < pid < 2**31 for pid in pids):
+        raise ValueError("invalid Fabric target process IDs")
+
+
+def encode_prepare_result(
+    descriptors: tuple[GlobalDomainDescriptor, ...],
+    host_windows: tuple[GlobalDomainHostWindow, ...] = (),
+    target_pids: tuple[int, ...] = (),
+) -> bytes:
+    """Rank exports followed by optional Host tokens and endpoint process IDs."""
+    out = bytearray(encode_descriptor_table(descriptors))
+    if not host_windows:
+        if target_pids:
+            raise ValueError("target process IDs require Host exports")
+        return bytes(out)
+    _validate_target_pids(target_pids)
+    if any(
+        host.export is not None and any(d.profile_id != host.export.profile_id for d in descriptors)
+        for host in host_windows
+    ):
+        raise ValueError("Host prepare export profile differs from rank exports")
+    if len(target_pids) != len(descriptors) or not descriptors:
+        raise ValueError("Host prepare process IDs must match the exported ranks")
+    out.extend(encode_host_exports(host_windows))
+    out.extend(struct.pack("<I", len(target_pids)))
+    for pid in target_pids:
+        out.extend(struct.pack("<i", pid))
+    return bytes(out)
+
+
+def decode_prepare_result(
+    data: bytes,
+) -> tuple[tuple[GlobalDomainDescriptor, ...], tuple[GlobalDomainHostWindow, ...], tuple[int, ...]]:
+    reader = _Reader(data)
+    count = reader.u32()
+    if count > GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("global domain descriptor table exceeds maximum")
+    descriptors = tuple(
+        GlobalDomainDescriptor.decode(reader.fixed(GLOBAL_DOMAIN_DESCRIPTOR_BYTES, "descriptor")) for _ in range(count)
+    )
+    if len(data) == 4 + count * GLOBAL_DOMAIN_DESCRIPTOR_BYTES:
+        return descriptors, (), ()
+    hosts = _read_host_windows(reader)
+    count = reader.u32()
+    if count > GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("Host prepare process ID count exceeds maximum")
+    pids = tuple(reader.i32() for _ in range(count))
+    reader.done("Host prepare result")
+    encode_prepare_result(descriptors, hosts, pids)
+    if not hosts:
+        raise ValueError("unexpected empty Host prepare suffix")
+    return descriptors, hosts, pids
+
+
 def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR0912 -- wire validation keeps phase rules adjacent to encoding
     validate_member_table(command.members)
+    if command.host_windows:
+        nodes = sorted({member.node_worker_id for member in command.members})
+        if [host.node_worker_id for host in command.host_windows] != nodes or not command.owner_instance_id:
+            raise ValueError("Host windows must cover participating nodes and require a creator")
+        for host in command.host_windows:
+            _validate_host_window(host)
+            if host.export is not None and host.export.profile_id != GLOBAL_DOMAIN_PROFILE_IDS.get(command.profile):
+                raise ValueError("Host export profile differs from its domain")
+        if command.phase in (GlobalDomainPhase.IMPORT, GlobalDomainPhase.COMMIT) and any(
+            h.export is None for h in command.host_windows
+        ):
+            raise ValueError("Host IMPORT/COMMIT requires every prepared export")
+    if command.phase is GlobalDomainPhase.AUTHORIZE:
+        if not command.host_windows or not 0 < len(command.target_pids) <= len(command.members):
+            raise ValueError("Host AUTHORIZE requires windows and bounded member process IDs")
+        _validate_target_pids(command.target_pids)
+    elif command.target_pids:
+        raise ValueError("target process IDs are only carried by AUTHORIZE")
+    if command.phase in (GlobalDomainPhase.REVOKE_HOST, GlobalDomainPhase.RELEASE_HOST) and not command.host_windows:
+        raise ValueError("Host cleanup requires Host windows")
     validate_attachment_table(command.attachments, command.members)
     if command.phase is not GlobalDomainPhase.PREPARE_EXPORT and command.attachments:
         raise ValueError("global domain attachments are only carried by PREPARE_EXPORT")
@@ -685,8 +869,8 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
     if command.phase in (GlobalDomainPhase.IMPORT, GlobalDomainPhase.COMMIT):
         if len(command.descriptors) != len(command.members):
             raise ValueError("global domain IMPORT/COMMIT requires a complete descriptor table")
-    elif command.descriptors:
-        raise ValueError("global domain PREPARE/ABORT must not carry descriptors")
+    elif command.descriptors and command.phase not in (GlobalDomainPhase.REVOKE_HOST, GlobalDomainPhase.RELEASE_HOST):
+        raise ValueError("global domain PREPARE/ABORT/AUTHORIZE must not carry descriptors")
     if command.owner_instance_id and (len(command.owner_instance_id) != 8 or not any(command.owner_instance_id)):
         raise ValueError("global domain creator must be a nonzero 8-byte instance identity")
     if not command.owner_instance_id and (
@@ -725,6 +909,10 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
     out.extend(struct.pack("<I", len(command.descriptors)))
     for descriptor in command.descriptors:
         out.extend(descriptor.encode())
+    _put_host_windows(out, command.host_windows)
+    out.extend(struct.pack("<I", len(command.target_pids)))
+    for pid in command.target_pids:
+        out.extend(struct.pack("<i", pid))
     return bytes(out)
 
 
@@ -774,6 +962,11 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         GlobalDomainDescriptor.decode(reader.fixed(GLOBAL_DOMAIN_DESCRIPTOR_BYTES, "descriptor"))
         for _ in range(descriptor_count)
     )
+    host_windows = _read_host_windows(reader)
+    pid_count = reader.u32()
+    if pid_count > GLOBAL_DOMAIN_MAX_RANKS:
+        raise ValueError("Host target process ID count exceeds maximum")
+    target_pids = tuple(reader.i32() for _ in range(pid_count))
     reader.done("ALLOC_DOMAIN")
     command = GlobalDomainCommand(
         phase=phase,
@@ -788,6 +981,8 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         attachments=attachments,
         owner_instance_id=owner_instance_id,
         retain_after_run=retention == b"\x01",
+        host_windows=host_windows,
+        target_pids=target_pids,
     )
     encode_domain_command(command)
     return command

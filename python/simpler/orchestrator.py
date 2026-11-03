@@ -543,6 +543,7 @@ class Orchestrator:
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
         host_window: HostWindowSpec | None = None,
+        host_windows: dict[int, HostWindowSpec] | None = None,
         workers: Sequence[int] | None = None,
         workspace_engines: Sequence[str] = (),
     ) -> CommDomainHandle:
@@ -571,6 +572,7 @@ class Orchestrator:
             retain_after_run,
             workspace_engines=workspace_engines,
             host_window=host_window,
+            host_windows=host_windows,
             reuse=False,
         )
 
@@ -584,6 +586,7 @@ class Orchestrator:
         retain_after_run: bool = False,
         workspace_engines: Sequence[str] = (),
         host_window: HostWindowSpec | None = None,
+        host_windows: dict[int, HostWindowSpec] | None = None,
     ) -> CommDomainHandle:
         """Return the same live handle on an exact configuration match, otherwise create it.
 
@@ -598,11 +601,22 @@ class Orchestrator:
             retain_after_run,
             workspace_engines=workspace_engines,
             host_window=host_window,
+            host_windows=host_windows,
             reuse=True,
         )
 
     def _domain(
-        self, name, members, window_size, buffers, retain_after_run, *, workspace_engines=(), host_window=None, reuse
+        self,
+        name,
+        members,
+        window_size,
+        buffers,
+        retain_after_run,
+        *,
+        workspace_engines=(),
+        host_window=None,
+        host_windows=None,
+        reuse,
     ):
         if self._worker is None:
             raise RuntimeError("domain allocation requires an Orchestrator bound to a Worker")
@@ -615,6 +629,7 @@ class Orchestrator:
             reuse=reuse,
             workspace_engines=workspace_engines,
             host_window=host_window,
+            host_windows=host_windows,
         )
 
     def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:

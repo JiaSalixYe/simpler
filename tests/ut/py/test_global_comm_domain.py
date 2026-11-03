@@ -24,6 +24,7 @@ from typing import cast
 
 import pytest
 from simpler.buffer import AddressSpace, buffer_reference, wrap_vmm_window
+from simpler.comm_domain import HostWindowSpec
 from simpler.comm_endpoints import (
     _ADAPTER_KIND_IDS,
     _ADAPTER_PROFILE_IDS,
@@ -57,14 +58,18 @@ from simpler.global_comm_domain import (
     GlobalDomainCommand,
     GlobalDomainCopyCommand,
     GlobalDomainDescriptor,
+    GlobalDomainHostWindow,
     GlobalDomainMember,
     GlobalDomainPhase,
     GlobalDomainReleaseCommand,
+    HostExportDescriptor,
     decode_comm_init,
     decode_copy_command,
     decode_descriptor_table,
     decode_domain_buffer_refs,
     decode_domain_command,
+    decode_host_exports,
+    decode_prepare_result,
     decode_release_command,
     encode_comm_init,
     encode_comm_init_result,
@@ -72,6 +77,8 @@ from simpler.global_comm_domain import (
     encode_descriptor_table,
     encode_domain_buffer_refs,
     encode_domain_command,
+    encode_host_exports,
+    encode_prepare_result,
     encode_release_command,
     resolve_global_comm_capability,
     validate_descriptor_table,
@@ -904,6 +911,7 @@ def test_mixed_local_remote_import_failure_rolls_back_local_node(monkeypatch):
                     rank_count,
                     profile_id,
                     window_size,
+                    _host_enabled,
                 ) = LOCAL_PREPARE_REQUEST.unpack_from(payload, 0)
                 descriptor = GlobalDomainDescriptor(
                     version=GLOBAL_DOMAIN_VERSION,
@@ -921,6 +929,7 @@ def test_mixed_local_remote_import_failure_rolls_back_local_node(monkeypatch):
                         generation,
                         0x1000,
                         window_size,
+                        0,
                     )
                     + descriptor.encode()
                 )
@@ -1935,3 +1944,108 @@ def test_mpirun_group_cleanup_continues_after_one_process_wait_fails():
     finally:
         worker._mpi_l3_groups.clear()
         _close_failure_injection_worker(worker, resources)
+
+
+def _host_command(phase=GlobalDomainPhase.PREPARE_EXPORT):
+    windows = tuple(GlobalDomainHostWindow(node, HostWindowSpec(64), 100 + node) for node in range(2))
+    if phase in (
+        GlobalDomainPhase.IMPORT,
+        GlobalDomainPhase.COMMIT,
+        GlobalDomainPhase.REVOKE_HOST,
+        GlobalDomainPhase.RELEASE_HOST,
+    ):
+        windows = tuple(
+            replace(h, export=HostExportDescriptor(1, 4096, f"/host-{h.node_worker_id}".encode())) for h in windows
+        )
+    return GlobalDomainCommand(
+        phase,
+        11,
+        1,
+        "host-table",
+        "sim",
+        4096,
+        _members(),
+        (),
+        descriptors=_descriptors()
+        if phase
+        in (
+            GlobalDomainPhase.IMPORT,
+            GlobalDomainPhase.COMMIT,
+            GlobalDomainPhase.REVOKE_HOST,
+            GlobalDomainPhase.RELEASE_HOST,
+        )
+        else (),
+        owner_instance_id=b"creator1",
+        host_windows=windows,
+        target_pids=(101, 202) if phase is GlobalDomainPhase.AUTHORIZE else (),
+    )
+
+
+@pytest.mark.parametrize("phase", list(GlobalDomainPhase))
+def test_host_command_preserves_rank_descriptor_axis(phase):
+    command = _host_command(phase)
+    assert decode_domain_command(encode_domain_command(command)) == command
+    assert GLOBAL_DOMAIN_VERSION == 2
+    assert len(command.descriptors) in (0, len(command.members))
+
+
+@pytest.mark.parametrize("corruption", ["duplicate", "missing-node", "owner", "export", "profile", "pid", "pid-phase"])
+def test_host_command_rejects_inconsistent_identity_and_authority(corruption):
+    command = _host_command(GlobalDomainPhase.IMPORT)
+    windows = command.host_windows
+    if corruption == "duplicate":
+        command = replace(command, host_windows=(windows[0], replace(windows[1], buffer_id=windows[0].buffer_id)))
+    elif corruption == "missing-node":
+        command = replace(command, host_windows=windows[:1])
+    elif corruption == "owner":
+        command = replace(command, owner_instance_id=b"")
+    elif corruption == "export":
+        command = replace(command, host_windows=(replace(windows[0], export=None), windows[1]))
+    elif corruption == "profile":
+        command = replace(
+            command, host_windows=(replace(windows[0], export=HostExportDescriptor(2, 4096, b"x" * 128)), windows[1])
+        )
+    elif corruption == "pid":
+        command = replace(_host_command(GlobalDomainPhase.AUTHORIZE), target_pids=(0,))
+    else:
+        command = replace(command, target_pids=(101,))
+    with pytest.raises(ValueError):
+        encode_domain_command(command)
+
+
+def test_host_prepare_reply_keeps_legacy_encoding_and_binds_actual_pids():
+    ranks = _descriptors()[:1]
+    assert encode_prepare_result(ranks) == encode_descriptor_table(ranks)
+    assert decode_prepare_result(encode_prepare_result(ranks)) == (ranks, (), ())
+    hosts = _host_command(GlobalDomainPhase.IMPORT).host_windows[:1]
+    assert decode_host_exports(encode_host_exports(hosts)) == hosts
+    payload = encode_prepare_result(ranks, hosts, (101,))
+    assert decode_prepare_result(payload) == (ranks, hosts, (101,))
+    for bad in (payload[:3], payload[:-1], payload + b"extra", payload[:-8] + struct.pack("<I", 65)):
+        with pytest.raises(ValueError):
+            decode_prepare_result(bad)
+    for bad in ((), (0,), (True,), (2**31,), (101, 202)):
+        with pytest.raises(ValueError):
+            encode_prepare_result(ranks, hosts, bad)
+
+
+@pytest.mark.parametrize(
+    "export",
+    [
+        HostExportDescriptor(1, 1, b"/short"),
+        HostExportDescriptor(2, 4096, b"x"),
+        HostExportDescriptor(9, 4096, b"unknown"),
+    ],
+)
+def test_host_export_rejects_invalid_mapping_or_platform_token(export):
+    host = GlobalDomainHostWindow(0, HostWindowSpec(64), 100, export)
+    with pytest.raises(ValueError):
+        encode_host_exports((host,))
+
+
+@pytest.mark.parametrize("phase", [GlobalDomainPhase.REVOKE_HOST, GlobalDomainPhase.RELEASE_HOST])
+def test_host_cleanup_roundtrips_partial_prepare_without_full_exports(phase):
+    command = replace(_host_command(), phase=phase)
+    assert decode_domain_command(encode_domain_command(command)) == command
+    with pytest.raises(ValueError, match="cleanup requires Host"):
+        encode_domain_command(replace(command, host_windows=()))

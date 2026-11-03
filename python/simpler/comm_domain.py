@@ -58,6 +58,7 @@ class DomainConfig:
     topology: tuple
     workspace_engines: tuple[str, ...] = ()
     host_window: HostWindowSpec | None = None
+    host_windows: tuple = ()
 
     @classmethod
     def capture(cls, members, window_size, buffers, retain_after_run, topology, workspace_engines=()):

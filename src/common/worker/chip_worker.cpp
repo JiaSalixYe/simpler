@@ -459,6 +459,10 @@ void ChipWorker::init(
         comm_release_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_release_domain_windows");
         comm_global_domain_prepare_fn_ = module->required<CommGlobalDomainPrepareFn>("comm_global_domain_prepare");
         comm_global_domain_import_fn_ = module->required<CommGlobalDomainImportFn>("comm_global_domain_import");
+        comm_global_domain_import_host_fn_ =
+            module->optional<CommGlobalDomainImportHostFn>("comm_global_domain_import_host");
+        comm_global_domain_detach_host_fn_ =
+            module->optional<CommGlobalDomainDetachHostFn>("comm_global_domain_detach_host");
         comm_global_domain_release_fn_ = module->required<CommGlobalDomainReleaseFn>("comm_global_domain_release");
         comm_barrier_fn_ = module->required<CommBarrierFn>("comm_barrier");
         comm_destroy_fn_ = module->required<CommDestroyFn>("comm_destroy");
@@ -918,6 +922,8 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_release_domain_windows_fn_ = nullptr;
     comm_global_domain_prepare_fn_ = nullptr;
     comm_global_domain_import_fn_ = nullptr;
+    comm_global_domain_import_host_fn_ = nullptr;
+    comm_global_domain_detach_host_fn_ = nullptr;
     comm_global_domain_release_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
@@ -2483,6 +2489,30 @@ uint64_t ChipWorker::comm_global_domain_import(uint64_t domain_id, const std::ve
         throw std::runtime_error("comm_global_domain_import returned a null device context");
     }
     return device_ctx;
+}
+
+uint64_t ChipWorker::comm_global_domain_import_host(
+    uint64_t domain_id, uint32_t profile, const std::vector<uint8_t> &token, uint64_t mapping_size
+) {
+    if (!comm_global_domain_import_host_fn_)
+        throw std::runtime_error("Global Host import is unsupported by this runtime");
+    if (token.empty() || token.size() > COMM_GLOBAL_DOMAIN_HANDLE_BYTES || !mapping_size)
+        throw std::invalid_argument("Global Host import has an invalid export");
+    uint64_t base = 0;
+    const int rc =
+        comm_global_domain_import_host_fn_(domain_id, profile, token.data(), token.size(), mapping_size, &base);
+    if (rc || !base) throw std::runtime_error("comm_global_domain_import_host failed with code " + std::to_string(rc));
+    return base;
+}
+
+void ChipWorker::comm_global_domain_detach_host(uint64_t domain_id, const std::vector<uint8_t> &token) {
+    require_comm_reclamation_safe();
+    if (!comm_global_domain_detach_host_fn_)
+        throw std::runtime_error("Global Host detach is unsupported by this runtime");
+    if (token.empty() || token.size() > COMM_GLOBAL_DOMAIN_HANDLE_BYTES)
+        throw std::invalid_argument("Global Host detach has an invalid export");
+    const int rc = comm_global_domain_detach_host_fn_(domain_id, token.data(), token.size());
+    if (rc) throw std::runtime_error("comm_global_domain_detach_host failed with code " + std::to_string(rc));
 }
 
 void ChipWorker::comm_global_domain_release(uint64_t domain_id) {

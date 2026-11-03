@@ -15,10 +15,11 @@ this module's resource and grant-registration helpers are not public APIs.
 from __future__ import annotations
 
 import ctypes
+import struct
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from _task_interface import _encode_buffer_descriptor_wire
+from _task_interface import _decode_buffer_descriptor_wire, _encode_buffer_descriptor_wire
 
 from .buffer import (
     AccessMode,
@@ -26,6 +27,7 @@ from .buffer import (
     BackendKind,
     Buffer,
     BufferDescriptor,
+    CanonicalIdentity,
     Tensor,
 )
 from .comm_domain import HostWindowSpec
@@ -43,6 +45,8 @@ class HostDomainView:
     execution_environment: tuple
     owner_live: Callable[[], bool]
     closing: bool = False
+    attach: Callable | None = None
+    detach: Callable | None = None
 
     def apply(self, cw, registry, comm, allocation, reference, access, *, unmap, platform):
         cw._validate_execution_context()
@@ -54,14 +58,21 @@ class HostDomainView:
             if registry.has_active_attachments(self.descriptor.identity):
                 return
             self.closing = True
-            cw.comm_detach_domain_host(comm, allocation)
+            if self.detach is None:
+                cw.comm_detach_domain_host(comm, allocation)
+            else:
+                self.detach()
             self.base = 0
             self.closing = False
             return
         if self.closing:
             raise RuntimeError("Host mapping cleanup is unconfirmed")
         if not self.base:
-            self.base = cw.comm_attach_domain_host(comm, allocation, self.exported.encode())
+            self.base = (
+                cw.comm_attach_domain_host(comm, allocation, self.exported.encode())
+                if self.attach is None
+                else self.attach()
+            )
         try:
             registry.register_attachment(
                 self.descriptor,
@@ -95,14 +106,16 @@ class HostDomainResource:
         view_scope,
         view_control,
         host_runtime_path=None,
+        buffer=None,
+        reference_namespace=(1, 1),
     ):
         self.spec = spec
         self.identity = identity
         self.workers = tuple(workers)
         self.device = device
-        self.backend = host_backing_type(platform)(host_runtime_path=host_runtime_path)
-        self.buffer = None
-        self._descriptor = None
+        self.backend = host_backing_type(platform)(host_runtime_path=host_runtime_path) if buffer is None else None
+        self.buffer = buffer
+        self._descriptor = None if buffer is None else buffer.to_descriptor()
         self.export = None
         self.published = False
         self.views_released = False
@@ -110,11 +123,17 @@ class HostDomainResource:
         self._view_scope = view_scope
         self._view_control = view_control
         self._direct_view = None
-        self._next_reference = 1
+        reference_start, reference_step = reference_namespace
+        if not 1 <= reference_start <= 255 or not 1 <= reference_step <= 64:
+            raise ValueError("invalid Host mapping issuer namespace")
+        self._next_reference = reference_start
+        self._reference_step = reference_step
         self._mapping_targets = {}
         self._revoked_refs = set()
 
     def allocate(self):
+        if self.backend is None:
+            raise ValueError("a borrowed Host source cannot allocate its owner")
         base, self.export = self.backend.allocate(self.spec, self.identity, self.device, len(self.workers))
         self.buffer = Buffer(
             identity=self.identity,
@@ -156,7 +175,7 @@ class HostDomainResource:
             if self._next_reference > 255:
                 raise RuntimeError("Host mapping references exhausted; allocate a new backing")
             reference = self._next_reference
-            self._next_reference += 1
+            self._next_reference += self._reference_step
             mapped = tensor._with_mapping_ref(reference)
             self._mapping_targets[reference] = (worker, False)
             self._revoked_refs.add(reference)
@@ -202,6 +221,8 @@ class HostDomainResource:
         if self.closed or self.buffer is None or self.buffer.closed:
             raise ValueError("Host domain backing is not live")
         base = self.buffer.base
+        if not base:
+            raise ValueError("Host copy requires the owning process's native view")
         if writing:
             ctypes.memmove(base + offset, value, size)
             return None
@@ -213,4 +234,108 @@ class HostDomainResource:
             self.buffer.closed = True
         if self.published and not self.views_released:
             raise RuntimeError("Host domain owner retained: member view release is unconfirmed")
-        self.backend.release()
+        if self.backend is not None:
+            self.backend.release()
+
+
+_GLOBAL_HOST_VIEW = struct.Struct("<4sQQQBBBB")
+_GLOBAL_HOST_MAGIC = b"HGV1"
+
+
+def _global_host_buffer(owner_instance_id, window):
+    return Buffer(
+        identity=CanonicalIdentity(owner_instance_id, window.buffer_id, 1),
+        address_space=AddressSpace.HOST,
+        access=AccessMode.READWRITE,
+        backend_kind=BackendKind.REMOTE_SIDECAR,
+        nbytes=window.spec.nbytes,
+        base=0,
+    )
+
+
+def _global_host_request(domain, generation, buffer_id, reference=0, access=0, operation=0, resource=None):
+    payload = _GLOBAL_HOST_VIEW.pack(
+        _GLOBAL_HOST_MAGIC, domain, generation, buffer_id, reference, int(access), operation, 0
+    )
+    if resource is not None:
+        payload += resource.export.encode() + _encode_buffer_descriptor_wire(resource.buffer.to_descriptor())
+    return payload
+
+
+def _apply_global_host_request(cw, registry, store, sources, payload, *, platform):  # noqa: PLR0912 -- validate, bind, map and revoke share one private control boundary
+    if len(payload) < _GLOBAL_HOST_VIEW.size:
+        raise ValueError("truncated global Host view request")
+    magic, domain, generation, buffer_id, reference, access, operation, reserved = _GLOBAL_HOST_VIEW.unpack_from(
+        payload
+    )
+    if magic != _GLOBAL_HOST_MAGIC or reserved or operation not in (0, 1, 2, 3):
+        raise ValueError("invalid global Host view request")
+    cw._validate_execution_context()
+    entry = store.domains.get(domain)
+    if (
+        entry is None
+        and operation == 3
+        and len(payload) == _GLOBAL_HOST_VIEW.size
+        and not (reference or access or buffer_id)
+    ):
+        return
+    if entry is None or entry.generation != generation:
+        raise ValueError("global Host view requires the matching domain generation")
+    if operation == 3:
+        if len(payload) != _GLOBAL_HOST_VIEW.size or reference or access or buffer_id:
+            raise ValueError("invalid global Host revoke request")
+        entry.host_closing = True
+        for key, source in tuple(sources.items()):
+            if not isinstance(key, tuple) or key[0] != domain:
+                continue
+            source.closing = True
+            registry.unregister(source.descriptor.identity)
+            if source.base:
+                source.detach()
+                source.base = 0
+            sources.pop(key)
+        return
+    if entry.host_closing:
+        raise ValueError("global Host imports are closing")
+    key = (domain, buffer_id)
+    if operation == 0:
+        from .global_comm_domain import GLOBAL_DOMAIN_DESCRIPTOR_BYTES  # noqa: PLC0415
+
+        tail = bytes(payload[_GLOBAL_HOST_VIEW.size :])
+        if len(tail) <= GLOBAL_DOMAIN_DESCRIPTOR_BYTES or reference or access or not buffer_id:
+            raise ValueError("invalid global Host binding size")
+        exported = GlobalDomainDescriptor.decode(tail[:GLOBAL_DOMAIN_DESCRIPTOR_BYTES])
+        descriptor = _decode_buffer_descriptor_wire(tail[GLOBAL_DOMAIN_DESCRIPTOR_BYTES:])
+        if (
+            descriptor.address_space != AddressSpace.HOST
+            or descriptor.backend_kind != BackendKind.REMOTE_SIDECAR
+            or descriptor.identity.buffer_id != buffer_id
+            or descriptor.nbytes > exported.mapping_size
+        ):
+            raise ValueError("invalid global Host backing descriptor")
+        host_attachment_profile(exported, platform)
+        previous = sources.get(key)
+        if previous is not None:
+            if previous.descriptor != descriptor or previous.exported != exported:
+                raise ValueError("global Host binding conflicts with its source")
+            return
+        sources[key] = HostDomainView(
+            descriptor,
+            exported,
+            0,
+            cw._execution_environment,
+            lambda: store.domains.get(domain) is entry and not entry.host_closing,
+            attach=lambda: cw.comm_global_domain_import_host(
+                domain, exported.profile_id, exported.handle, exported.mapping_size
+            ),
+            detach=lambda: cw.comm_global_domain_detach_host(domain, exported.handle),
+        )
+        return
+    if len(payload) != _GLOBAL_HOST_VIEW.size or not reference or (operation == 2 and access):
+        raise ValueError("invalid global Host mapping operation")
+    source = sources.get(key)
+    if source is None or not entry.device_ctx:
+        raise ValueError("global Host view requires a bound imported backing")
+    if operation == 1:
+        access = AccessMode(access)
+    source.apply(cw, registry, 0, domain, reference, access, unmap=operation == 2, platform=platform)

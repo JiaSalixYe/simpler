@@ -4213,6 +4213,24 @@ NB_MODULE(_task_interface, m) {
             "Import a rank-ordered Global CommDomain descriptor table and return the device context."
         )
         .def(
+            "comm_global_domain_import_host",
+            [](ChipWorker &self, uint64_t domain_id, uint32_t profile, nb::bytes token, uint64_t mapping_size) {
+                const auto *data = reinterpret_cast<const uint8_t *>(token.c_str());
+                return self.comm_global_domain_import_host(
+                    domain_id, profile, std::vector<uint8_t>(data, data + token.size()), mapping_size
+                );
+            },
+            nb::arg("domain_id"), nb::arg("profile"), nb::arg("token"), nb::arg("mapping_size")
+        )
+        .def(
+            "comm_global_domain_detach_host",
+            [](ChipWorker &self, uint64_t domain_id, nb::bytes token) {
+                const auto *data = reinterpret_cast<const uint8_t *>(token.c_str());
+                self.comm_global_domain_detach_host(domain_id, std::vector<uint8_t>(data, data + token.size()));
+            },
+            nb::arg("domain_id"), nb::arg("token")
+        )
+        .def(
             "comm_global_domain_release", &ChipWorker::comm_global_domain_release, nb::arg("domain_id"),
             "Release a prepared or imported Global CommDomain."
         )

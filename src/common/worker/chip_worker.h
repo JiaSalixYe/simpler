@@ -421,6 +421,10 @@ public:
         uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile
     );
     uint64_t comm_global_domain_import(uint64_t domain_id, const std::vector<uint8_t> &descriptors);
+    uint64_t comm_global_domain_import_host(
+        uint64_t domain_id, uint32_t profile, const std::vector<uint8_t> &token, uint64_t mapping_size
+    );
+    void comm_global_domain_detach_host(uint64_t domain_id, const std::vector<uint8_t> &token);
     void comm_global_domain_release(uint64_t domain_id);
     void comm_barrier(uint64_t comm_handle);
     void comm_destroy(uint64_t comm_handle);
@@ -609,6 +613,8 @@ private:
     using CommGlobalDomainPrepareFn =
         int (*)(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *);
     using CommGlobalDomainImportFn = int (*)(uint64_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *);
+    using CommGlobalDomainImportHostFn = int (*)(uint64_t, uint32_t, const uint8_t *, size_t, uint64_t, uint64_t *);
+    using CommGlobalDomainDetachHostFn = int (*)(uint64_t, const uint8_t *, size_t);
     using CommGlobalDomainReleaseFn = int (*)(uint64_t);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
@@ -745,6 +751,8 @@ private:
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommGlobalDomainPrepareFn comm_global_domain_prepare_fn_ = nullptr;
     CommGlobalDomainImportFn comm_global_domain_import_fn_ = nullptr;
+    CommGlobalDomainImportHostFn comm_global_domain_import_host_fn_ = nullptr;
+    CommGlobalDomainDetachHostFn comm_global_domain_detach_host_fn_ = nullptr;
     CommGlobalDomainReleaseFn comm_global_domain_release_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;

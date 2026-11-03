@@ -1,4 +1,4 @@
-# A3 single-node Host buffers
+# A3 Host communication buffers
 
 A direct L2 Worker can allocate a Host backing and explicitly select a device
 mapping. Buffer remains HOST with the same canonical identity; mapping returns a
@@ -46,8 +46,9 @@ stage the Host table. Public objects remain Buffer, Tensor and TaskArgs.
 
 ## Scope
 
-This is A3 single-node resource and mapping support, qualified through direct L2
-HBG/TMR MTE tests. It does not claim A5, cross-node access, asynchronous fetch
+Local A3 resource and mapping support is qualified through direct L2 HBG/TMR
+MTE tests. The cross-node extension below uses the same contract and requires
+separate hardware qualification. Neither path claims A5, asynchronous fetch
 progress or communication/computation overlap required by the full #2657 goal.
 See [Buffer ABI](buffer-abi.md) for the fixed-size Tensor mapping fields and
 same-build native boundary.
@@ -119,3 +120,97 @@ TMR release qualification and HBG/TMR BF16 application fetches run explicitly
 with `--manual only`. Hardware-only SDMA directions retain their isolated CI
 lane. Full qualification uses the same module with `--manual include`; this
 selection does not replace onboard evidence or establish latency hiding.
+
+## Cross-node HCCS Host backing
+
+An L4 domain can request one Host backing on each participating L3 node:
+
+```python
+domain = orch.get_or_allocate_domain(
+    name="shared-tables", members=[(0, 0), (1, 0)], window_size=65536,
+    buffers=[CommBufferSpec("output", "float32", 16384, 65536)],
+    host_windows={0: HostWindowSpec(65536), 1: HostWindowSpec(65536)},
+    retain_after_run=True,
+)
+# Pass domain.ref through the existing L3 callable route. In the receiving L3:
+domain = orch.get_domain(domain_ref)
+source = domain.host(1).tensor((16384,), DataType.FLOAT32)
+mapped = domain.map_view(source, domain_rank=0, access=AccessMode.READ)
+# Submit mapped with transfer NONE to that member, then retire its accepted use.
+# In a later callback or after the run drains:
+domain.unmap_view(mapped)
+```
+
+`host_window` is local-L3-only; `host_windows` is L4-only and must name exactly
+the participating nodes. The two arguments are mutually exclusive. Source node
+and destination device rank are separate: the receiving L3 may map any source
+Host backing onto one of its own domain members. Mapping at the L4 controller or
+onto another L3 node's device is refused. Each consuming run must look up or
+reuse the domain in its owner L4 callback before dispatch; a child lookup alone
+does not enroll the owner's run, as with existing retained HBM domains. The native CPU pointer is usable only
+in the owning L3 process; other nodes and L4 receive the same canonical Buffer
+with `base=0`, not a remotely dereferenceable CPU pointer. Initialize or inspect
+a Host table in its owning L3 callback, with device users excluded.
+
+A3 owners use VMM Host physical memory and Fabric exports for both local and
+remote consumers. Every chip reports its actual BareTgid before authorization.
+The controller exchanges Host exports separately from the unchanged v2 rank
+descriptor table, authorizes the consuming processes, imports HBM domain state,
+and binds Host source metadata. A `map_view` request then imports the selected
+Host backing through NoUC/Fabric and installs only its requested restricted
+record in the target ImportRegistry. Payload movement uses the existing
+MTE/PTO-SDMA interfaces and completion rules; no IPC HostRegister export or
+extra copy service is involved. This route requires a supported HCCS fabric; it
+does not introduce a RoCE fallback or infer reachability from an Ethernet link.
+
+Each receiving L3 issues a disjoint subset of the existing 255 reference slots
+per backing, sharing its issuer across its local chips. References are routing
+indices, not authority; target records still validate access, descriptor,
+context and liveness. Exhaustion fails explicitly without reusing stale refs.
+
+Release confirms Host revocation/detach on **all** nodes before releasing any
+owner. HBM domain release follows those acknowledgements; only after every node
+confirms that stage are Host owners released. Partial prepare/import failures
+use the same staged rollback. An unconfirmed stage retains owner cleanup debt;
+a local success or child process exit is not a remote release acknowledgement.
+
+The manual global Host acceptance case exercises peer reads, peer writes,
+owner CPU readback and map/unmap restrictions using the existing vector-add
+callable. Local simulation validates control and permission behavior, not
+physical inter-server Fabric visibility or PID isolation. Run it explicitly
+with `--manual only`; it adds no default scene-CI matrix. Dual-host A3 hardware
+qualification, including unauthorized-PID rejection, remains required.
+
+## Multi-node Host qualification
+
+The manual global Host test reuses the existing vector-add kernel. Its local and
+TCP variants cover two L3 nodes, peer Host reads and writes, CPU readback,
+receiver selection, unmap/stale references and retained-domain cleanup. Both
+simulator variants pass; this is not evidence of hardware HCCS reachability or
+communication/computation overlap.
+
+For a two-machine A3 run, install the same branch commit and PTO pin on the
+controller and both nodes, with compatible CANN/driver versions. Reserve the
+selected physical devices on both nodes through their normal device queues and
+keep the reservations for the complete test. On each node, start the existing
+worker daemon in that checkout's environment:
+
+```bash
+python -m simpler.remote_l3_worker --host 0.0.0.0 --port <port>
+```
+
+With two reachable endpoints and the two reserved physical device IDs in node
+order, run from the controller:
+
+```bash
+SIMPLER_HOST_ENDPOINTS='<node0>:<port0>,<node1>:<port1>' \
+  python -m pytest \
+  'tests/st/worker/comm_domain/test_global_host_domain.py::test_global_host_peer_read_write_and_revoke[tcp]' \
+  --platform a2a3 --device <device0>,<device1> --manual only -v --forked
+```
+
+The endpoints carry control messages; data access uses the A3 Fabric backend and
+requires a real shared HCCS topology. The test does not substitute TCP payload
+copies for device access. Without `SIMPLER_HOST_ENDPOINTS`, the TCP simulator
+variant starts two loopback daemons and preserves their logs under its pytest
+temporary directory. This test remains manual and adds no per-PR scene selection.

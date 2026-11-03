@@ -123,8 +123,8 @@ cannot walk a legal-looking length past the end.
 
 `HostWindowSpec`, `AccessMode` and `TensorTransfer` are available from
 `simpler.task_interface`. The Host extension currently supports local A3 L2/L3
-and the `a2a3sim` correctness backend; A5 and cross-node Host creation are not
-implemented here. `HostWindowSpec.nbytes` must be positive, below `2**63` and a
+and the `a2a3sim` correctness backend. L4 `host_windows` adds A3 cross-node
+HCCS/Fabric attachments; A5 is not implemented here. `HostWindowSpec.nbytes` must be positive, below `2**63` and a
 multiple of 64; `numa_id` is a uint32. At L2 its size must equal `create_buffer`'s
 `nbytes`. The Worker must be initialized with a communication-capable runtime and an owned
 execution context; borrowed-context Host creation is refused before allocation.
@@ -137,8 +137,9 @@ ImportRegistry and qualified adapter check the execution environment, extent,
 access and liveness; the registered callable signature determines required
 execution access. TaskArgs tags describe dependencies.
 
-Mapping references are opaque, increase from 1 through 255 per backing, encode
-neither rank nor access, and are never reused. Exhaustion raises an explicit
+Mapping references are opaque indices from 1 through 255 per backing; they do
+not grant authority and are never reused. Cross-node receivers partition that
+bounded namespace, so each receiver has fewer slots. Exhaustion raises an explicit
 error. A mapped Tensor cannot switch refs through `_with_mapping_ref`; native
 ref 0 still supports explicit H2D. `unmap_view` rejects in-flight use, revokes the
 record and detaches the physical Host view only after its target's last active
@@ -215,10 +216,10 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `submit_next_level(callable_handle, args, config=None, *, worker: int) -> TaskHandle` | Hands a callable to one exact NEXT_LEVEL child and returns an opaque handle for explicit task dependencies |
 | `submit_next_level_group(callable_handle, args_list, config=None, *, workers: list[int]) -> TaskHandle` | Submits one group DAG node and returns its opaque handle |
 | `submit_sub(callable_handle, args=None)` | Schedules a registered host-side Python callable |
-| `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, host_window=None)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported. The optional `HostWindowSpec` adds one local Host backing at L3 only |
-| `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, host_window=None)` | Reuse the same live handle after full configuration validation, including the Host spec, or create it |
+| `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, host_window=None, host_windows=None)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported. `host_window=HostWindowSpec(...)` adds local L3 Host backing; L4 `host_windows={node: spec}` must cover the participating nodes. These options are mutually exclusive |
+| `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, host_window=None, host_windows=None)` | Reuse the same live handle after full configuration validation, including the Host spec, or create it |
 | `get_domain(name_or_ref)` / `release_domain(handle)` | Creator-local name lookup or borrowing by `CommDomainRef`; only the creator owns release |
-| `CommDomainHandle.host() -> Buffer` | Returns the creator's native Host backing; requires a live local Host window. Host does not become a rank |
+| `CommDomainHandle.host(node_worker_id=None) -> Buffer` | Local L3 uses `host()`. A global domain selects its source with `host(node)`; only the owning L3 gets a CPU pointer, other receivers get `base=0`. Host is not a rank |
 | `CommDomainHandle.map_view(tensor, *, domain_rank, access=AccessMode.READWRITE) -> Tensor` | Issues a restricted mapping record for the member's Host attachment; `domain_rank` is the position in `members`, not a Host rank or physical device id. Same view, identity and access rules as L2 `Worker.map_view` |
 | `CommDomainHandle.unmap_view(tensor) -> None` | Revokes one issued mapping under the same rules as L2 `Worker.unmap_view`; retains the domain and CPU owner |
 | `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded NPU-rank staging before task submission; L3 requires declared slices |

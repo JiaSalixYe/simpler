@@ -1187,6 +1187,9 @@ class CommDomainHandle:
         "_ref",
         "requested_window_size",
         "_host_resource",
+        "_host_resources",
+        "_host_buffers",
+        "_host_command",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1229,6 +1232,9 @@ class CommDomainHandle:
         self.attachments = tuple(attachments)
         self._config = None
         self._host_resource = None
+        self._host_resources = {}
+        self._host_buffers = {}
+        self._host_command = None
         self._released = False
         self._freed = False
         self._ref = ref
@@ -1242,27 +1248,42 @@ class CommDomainHandle:
         if self._released:
             raise RuntimeError(f"CommDomainHandle({self.name!r}) is already released")
 
-    def host(self) -> Buffer:
+    def host(self, node_worker_id: int | None = None) -> Buffer:
         """Return the creator's native Host backing. Host is not a communication rank."""
         self._require_live()
+        if node_worker_id is not None:
+            resource = self._host_resources.get(int(node_worker_id))
+            if resource is not None:
+                return resource.buffer
+            try:
+                return self._host_buffers[int(node_worker_id)]
+            except KeyError:
+                raise ValueError("domain has no Host window on that node") from None
         if self._host_resource is None:
-            raise ValueError("domain has no local Host window")
+            raise ValueError("select the Host source node with host(node_worker_id)")
         return self._host_resource.buffer
 
     def map_view(self, tensor: Tensor, *, domain_rank: int, access=AccessMode.READWRITE) -> Tensor:
         """Establish a restricted NPU mapping over the same source backing."""
         self._require_live()
         member = self.member(domain_rank)
-        if self._host_resource is None:
-            raise ValueError("domain has no local Host window")
-        return self._host_resource.map_view(tensor, member.local_worker_id, access=access)
+        resource = self._host_resource or next(
+            (r for r in self._host_resources.values() if r.identity == tensor.buffer.identity), None
+        )
+        context = self.contexts.get(member.local_worker_id)
+        if resource is None or context is None or context.domain_rank != member.domain_rank:
+            raise ValueError("Host map_view requires a member on the receiving L3 node")
+        return resource.map_view(tensor, member.local_worker_id, access=access)
 
     def unmap_view(self, tensor: Tensor) -> None:
         """Revoke one issued mapping after all accepted readers have retired."""
         self._require_live()
-        if self._host_resource is None:
-            raise ValueError("domain has no local Host window")
-        self._host_resource.unmap_view(tensor)
+        resource = self._host_resource or next(
+            (r for r in self._host_resources.values() if r.identity == tensor.buffer.identity), None
+        )
+        if resource is None:
+            raise ValueError("Host unmap_view requires the receiving L3 node")
+        resource.unmap_view(tensor)
 
     def member(self, domain_rank: int) -> GlobalDomainMember:
         """Return rank-ordered topology and ordinary Buffer slices."""

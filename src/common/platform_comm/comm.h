@@ -342,6 +342,18 @@ int comm_global_domain_import(
 );
 
 /**
+ * Optional same-build Host attachment APIs. Opaque exports identify Host backing
+ * independently of the rank descriptor table. The caller confirms all users
+ * retired before detach and all Host views retired before owner release.
+ * Failed imports/detaches retain cleanup ownership and cannot be used as views.
+ */
+int comm_global_domain_import_host(
+    uint64_t domain_id, uint32_t profile, const uint8_t *token, size_t token_size, uint64_t mapping_size,
+    uint64_t *base_out
+);
+int comm_global_domain_detach_host(uint64_t domain_id, const uint8_t *token, size_t token_size);
+
+/**
  * Release a prepared or imported Global CommDomain. This is local teardown.
  * The L4 owner is responsible for
  * draining all rank tasks before fanout.

@@ -287,6 +287,9 @@ struct DomainAllocation {
     uint64_t host_reservation = 0;
     bool host_mapped = false;
     bool host_closing = false;
+    uint64_t host_mapping_size = 0;
+    bool global_host_closing = false;
+    std::unordered_map<std::string, std::unique_ptr<DomainAllocation>> host_imports;
     std::vector<VmmWindow> peer_windows;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
 };
@@ -1714,8 +1717,9 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 }
 
-extern "C" int comm_attach_domain_host(
-    CommHandle h, uint64_t allocation_id, const CommGlobalDomainDescriptor *descriptor, uint64_t *base_out
+static int import_domain_host(
+    DomainAllocation &allocation, uint64_t allocation_id, const CommGlobalDomainDescriptor *descriptor,
+    uint64_t *base_out, std::vector<std::pair<uint64_t, uint64_t>> occupied
 ) {
     const char *stage = "validate arguments";
     auto fail = [&](int status) {
@@ -1734,13 +1738,9 @@ extern "C" int comm_attach_domain_host(
         return status;
     };
     try {
-        if (!h || !descriptor || !base_out) return fail(-1);
+        if (!descriptor || !base_out) return fail(-1);
         *base_out = 0;
-        stage = "find allocation";
-        auto it = h->domain_allocations.find(allocation_id);
-        if (it == h->domain_allocations.end()) return fail(-1);
         stage = "validate descriptor";
-        auto &allocation = *it->second;
         if (allocation.host_closing || allocation.release_barrier_attempted || allocation.release_windows_attempted)
             return fail(-1);
         if (allocation.host_base || allocation.host_handle) {
@@ -1758,13 +1758,6 @@ extern "C" int comm_attach_domain_host(
         stage = "validate NoUC extent";
         if (descriptor->mapping_size > end - begin - unit) return fail(-1);
         const uint64_t bytes = (descriptor->mapping_size + unit - 1) / unit * unit;
-        std::vector<std::pair<uint64_t, uint64_t>> occupied;
-        for (const auto &entry : h->domain_allocations) {
-            if (entry.second->host_base)
-                occupied.emplace_back(
-                    reinterpret_cast<uint64_t>(entry.second->host_base), entry.second->host_reservation
-                );
-        }
         std::sort(occupied.begin(), occupied.end());
         uint64_t address = begin;
         for (const auto &[base, length] : occupied) {
@@ -1824,6 +1817,7 @@ extern "C" int comm_attach_domain_host(
         stage = "map imported Host memory";
         status = aclrtMapMem(allocation.host_base, descriptor->mapping_size, 0, allocation.host_handle, 0);
         if (status != ACL_SUCCESS) return fail(static_cast<int>(status));
+        allocation.host_mapping_size = descriptor->mapping_size;
         allocation.host_mapped = true;
         *base_out = reinterpret_cast<uint64_t>(allocation.host_base);
         return 0;
@@ -1836,6 +1830,34 @@ extern "C" int comm_attach_domain_host(
     } catch (...) {
         return fail(-1);
     }
+}
+
+extern "C" int comm_attach_domain_host(
+    CommHandle h, uint64_t allocation_id, const CommGlobalDomainDescriptor *descriptor, uint64_t *base_out
+) try {
+    if (!h) {
+        LOG_ERROR(
+            "[comm] attach_domain_host: allocation_id=%llu invalid communicator",
+            static_cast<unsigned long long>(allocation_id)
+        );
+        return -1;
+    }
+    auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end()) {
+        LOG_ERROR(
+            "[comm] attach_domain_host: allocation_id=%llu allocation not found",
+            static_cast<unsigned long long>(allocation_id)
+        );
+        return -1;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> occupied;
+    for (const auto &entry : h->domain_allocations) {
+        if (entry.second->host_base)
+            occupied.emplace_back(reinterpret_cast<uint64_t>(entry.second->host_base), entry.second->host_reservation);
+    }
+    return import_domain_host(*it->second, allocation_id, descriptor, base_out, std::move(occupied));
+} catch (...) {
+    return -1;
 }
 
 extern "C" int comm_detach_domain_host(CommHandle h, uint64_t allocation_id) try {
@@ -2061,6 +2083,78 @@ extern "C" int comm_global_domain_import(
     return -1;
 }
 
+extern "C" int comm_global_domain_import_host(
+    uint64_t domain_id, uint32_t profile, const uint8_t *token, size_t token_size, uint64_t mapping_size,
+    uint64_t *base_out
+) try {
+    auto fail = [&](const char *reason) {
+        LOG_ERROR(
+            "[global domain] Host import: domain_id=%llu profile=%u token_bytes=%zu mapping_size=%llu: %s",
+            static_cast<unsigned long long>(domain_id), profile, token_size,
+            static_cast<unsigned long long>(mapping_size), reason
+        );
+        return -1;
+    };
+    if (!base_out) return fail("null output");
+    *base_out = 0;
+    if (!token || token_size != sizeof(aclrtMemFabricHandle) || !mapping_size ||
+        profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC)
+        return fail("invalid export");
+    std::scoped_lock lock(global_domain_allocations_mutex);
+    auto it = global_domain_allocations.find(domain_id);
+    if (it == global_domain_allocations.end() || !it->second->device_ctx || it->second->global_host_closing ||
+        it->second->release_failed)
+        return fail("domain is absent, unimported or closing");
+    auto &imports = it->second->host_imports;
+    const std::string key(reinterpret_cast<const char *>(token), token_size);
+    auto previous = imports.find(key);
+    if (previous != imports.end()) {
+        const auto &host = *previous->second;
+        if (host.host_closing || !host.host_mapped || host.host_mapping_size != mapping_size)
+            return fail("export conflicts with a retained import");
+        *base_out = reinterpret_cast<uint64_t>(host.host_base);
+        return 0;
+    }
+    CommGlobalDomainDescriptor descriptor{};
+    descriptor.version = COMM_GLOBAL_DOMAIN_VERSION;
+    descriptor.profile = profile;
+    descriptor.mapping_size = mapping_size;
+    descriptor.handle_size = static_cast<uint32_t>(token_size);
+    std::memcpy(descriptor.handle, token, token_size);
+    std::vector<std::pair<uint64_t, uint64_t>> occupied;
+    for (const auto &entry : global_domain_allocations) {
+        for (const auto &item : entry.second->host_imports) {
+            if (item.second->host_base)
+                occupied.emplace_back(
+                    reinterpret_cast<uint64_t>(item.second->host_base), item.second->host_reservation
+                );
+        }
+    }
+    auto host = std::make_unique<DomainAllocation>();
+    auto *allocation = host.get();
+    imports.emplace(key, std::move(host));
+    const int rc = import_domain_host(*allocation, domain_id, &descriptor, base_out, std::move(occupied));
+    if (rc) allocation->host_closing = true;
+    return rc;
+} catch (...) {
+    return -1;
+}
+
+extern "C" int comm_global_domain_detach_host(uint64_t domain_id, const uint8_t *token, size_t token_size) try {
+    if (!token || token_size != sizeof(aclrtMemFabricHandle)) return -1;
+    std::scoped_lock lock(global_domain_allocations_mutex);
+    auto it = global_domain_allocations.find(domain_id);
+    if (it == global_domain_allocations.end()) return -1;
+    auto &imports = it->second->host_imports;
+    auto host = imports.find(std::string(reinterpret_cast<const char *>(token), token_size));
+    if (host == imports.end()) return 0;
+    const auto status = release_domain_host(host->second.get());
+    if (status == ACL_SUCCESS) imports.erase(host);
+    return static_cast<int>(status);
+} catch (...) {
+    return -1;
+}
+
 extern "C" int comm_global_domain_release(uint64_t domain_id) try {
     std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(domain_id);
@@ -2075,6 +2169,12 @@ extern "C" int comm_global_domain_release(uint64_t domain_id) try {
         );
         return -1;
     }
+    allocation->global_host_closing = true;
+    aclError host_status = ACL_SUCCESS;
+    for (auto &entry : allocation->host_imports)
+        record_first_error(release_domain_host(entry.second.get()), &host_status);
+    if (host_status != ACL_SUCCESS) return static_cast<int>(host_status);
+    allocation->host_imports.clear();
     int rc = 0;
     if (allocation->device_ctx != nullptr) {
         if (aclrtFree(allocation->device_ctx) != ACL_SUCCESS) {

@@ -220,6 +220,8 @@ struct GlobalDomainAllocation {
     std::string shm_name;
     void *local_base = nullptr;
     size_t mapping_size = 0;
+    bool host_closing = false;
+    std::unordered_map<std::string, std::unique_ptr<DomainAllocation>> host_imports;
     std::vector<GlobalPeerMapping> peer_mappings;
     std::unique_ptr<CommContext> host_ctx;
 };
@@ -714,13 +716,12 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 }
 
-extern "C" int comm_attach_domain_host(
-    CommHandle h, uint64_t allocation_id, const CommGlobalDomainDescriptor *descriptor, uint64_t *base_out
-) try {
-    if (!h || !descriptor || !base_out) return -1;
-    auto it = h->domain_allocations.find(allocation_id);
-    if (it == h->domain_allocations.end() || it->second->host_base || it->second->host_closing ||
-        it->second->release_started || descriptor->version != COMM_GLOBAL_DOMAIN_VERSION || descriptor->reserved ||
+static int
+import_domain_host(DomainAllocation &allocation, const CommGlobalDomainDescriptor *descriptor, uint64_t *base_out) try {
+    if (!descriptor || !base_out) return -1;
+    *base_out = 0;
+    if (allocation.host_base || allocation.host_closing || allocation.release_started ||
+        descriptor->version != COMM_GLOBAL_DOMAIN_VERSION || descriptor->reserved ||
         descriptor->profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM || !descriptor->mapping_size ||
         !descriptor->handle_size || descriptor->handle_size > COMM_GLOBAL_DOMAIN_HANDLE_BYTES)
         return -1;
@@ -738,10 +739,30 @@ extern "C" int comm_attach_domain_host(
     void *base = mmap(nullptr, descriptor->mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (base == MAP_FAILED) return -1;
-    it->second->host_base = base;
-    it->second->host_bytes = descriptor->mapping_size;
+    allocation.host_base = base;
+    allocation.host_bytes = descriptor->mapping_size;
     *base_out = reinterpret_cast<uint64_t>(base);
     return 0;
+} catch (...) {
+    return -1;
+}
+
+static int release_domain_host(DomainAllocation &allocation) {
+    allocation.host_closing = true;
+    if (allocation.host_base && munmap(allocation.host_base, allocation.host_bytes)) return -1;
+    allocation.host_base = nullptr;
+    allocation.host_bytes = 0;
+    allocation.host_closing = false;
+    return 0;
+}
+
+extern "C" int comm_attach_domain_host(
+    CommHandle h, uint64_t allocation_id, const CommGlobalDomainDescriptor *descriptor, uint64_t *base_out
+) try {
+    if (!h) return -1;
+    auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end()) return -1;
+    return import_domain_host(*it->second, descriptor, base_out);
 } catch (...) {
     return -1;
 }
@@ -749,14 +770,7 @@ extern "C" int comm_attach_domain_host(
 extern "C" int comm_detach_domain_host(CommHandle h, uint64_t allocation_id) try {
     if (!h) return -1;
     auto it = h->domain_allocations.find(allocation_id);
-    if (it == h->domain_allocations.end()) return -1;
-    auto &allocation = *it->second;
-    allocation.host_closing = true;
-    if (allocation.host_base && munmap(allocation.host_base, allocation.host_bytes)) return -1;
-    allocation.host_base = nullptr;
-    allocation.host_bytes = 0;
-    allocation.host_closing = false;
-    return 0;
+    return it == h->domain_allocations.end() ? -1 : release_domain_host(*it->second);
 } catch (...) {
     return -1;
 }
@@ -834,7 +848,7 @@ extern "C" int comm_global_domain_prepare(
         local_window_base_out == nullptr) {
         return -1;
     }
-    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
+    std::scoped_lock lock(global_domain_allocations_mutex);
     if (global_domain_allocations.count(domain_id) != 0) {
         return -1;
     }
@@ -894,7 +908,7 @@ extern "C" int comm_global_domain_prepare(
 extern "C" int comm_global_domain_import(
     uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
 ) try {
-    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
+    std::scoped_lock lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(domain_id);
     if (it == global_domain_allocations.end() || descriptors == nullptr || device_ctx_out == nullptr) {
         return -1;
@@ -960,12 +974,72 @@ extern "C" int comm_global_domain_import(
     return -1;
 }
 
+extern "C" int comm_global_domain_import_host(
+    uint64_t domain_id, uint32_t profile, const uint8_t *token, size_t token_size, uint64_t mapping_size,
+    uint64_t *base_out
+) try {
+    if (!base_out) return -1;
+    *base_out = 0;
+    if (!token || !token_size || token_size > COMM_GLOBAL_DOMAIN_HANDLE_BYTES || !mapping_size ||
+        profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM)
+        return -1;
+    std::scoped_lock lock(global_domain_allocations_mutex);
+    auto it = global_domain_allocations.find(domain_id);
+    if (it == global_domain_allocations.end() || !it->second->host_ctx || it->second->host_closing) return -1;
+    auto &imports = it->second->host_imports;
+    const std::string key(reinterpret_cast<const char *>(token), token_size);
+    auto previous = imports.find(key);
+    if (previous != imports.end()) {
+        const auto &host = *previous->second;
+        if (host.host_closing || !host.host_base || host.host_bytes != mapping_size) return -1;
+        *base_out = reinterpret_cast<uint64_t>(host.host_base);
+        return 0;
+    }
+    CommGlobalDomainDescriptor descriptor{};
+    descriptor.version = COMM_GLOBAL_DOMAIN_VERSION;
+    descriptor.profile = profile;
+    descriptor.mapping_size = mapping_size;
+    descriptor.handle_size = static_cast<uint32_t>(token_size);
+    std::memcpy(descriptor.handle, token, token_size);
+    auto host = std::make_unique<DomainAllocation>();
+    auto *allocation = host.get();
+    imports.emplace(key, std::move(host));
+    const int rc = import_domain_host(*allocation, &descriptor, base_out);
+    if (rc) allocation->host_closing = true;
+    return rc;
+} catch (...) {
+    return -1;
+}
+
+extern "C" int comm_global_domain_detach_host(uint64_t domain_id, const uint8_t *token, size_t token_size) try {
+    if (!token || !token_size || token_size > COMM_GLOBAL_DOMAIN_HANDLE_BYTES) return -1;
+    std::scoped_lock lock(global_domain_allocations_mutex);
+    auto it = global_domain_allocations.find(domain_id);
+    if (it == global_domain_allocations.end()) return -1;
+    auto &imports = it->second->host_imports;
+    auto host = imports.find(std::string(reinterpret_cast<const char *>(token), token_size));
+    if (host == imports.end()) return 0;
+    const int rc = release_domain_host(*host->second);
+    if (!rc) imports.erase(host);
+    return rc;
+} catch (...) {
+    return -1;
+}
+
 extern "C" int comm_global_domain_release(uint64_t domain_id) try {
-    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
+    std::scoped_lock lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(domain_id);
     if (it == global_domain_allocations.end()) {
         return 0;
     }
+    it->second->host_closing = true;
+    int rc = 0;
+    for (auto &host : it->second->host_imports) {
+        const int status = release_domain_host(*host.second);
+        if (!rc) rc = status;
+    }
+    if (rc) return rc;
+    it->second->host_imports.clear();
     global_domain_allocations.erase(it);
     return 0;
 } catch (const std::exception &e) {

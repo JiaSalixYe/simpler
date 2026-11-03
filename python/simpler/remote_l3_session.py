@@ -64,7 +64,6 @@ from .global_comm_domain import (
     decode_release_command,
     encode_comm_init_result,
     encode_copy_result,
-    encode_descriptor_table,
     encode_domain_buffer_refs,
     resolve_global_comm_capability,
 )
@@ -1150,7 +1149,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             )
                             if result is None:
                                 descriptors = inner_worker._prepare_global_domain_node(command, worker_id)  # noqa: SLF001
-                                result = encode_descriptor_table(descriptors)
+                                result = inner_worker._global_prepare_result(command, worker_id, descriptors)  # noqa: SLF001
                             _control_result_reply(
                                 conn,
                                 manifest,
@@ -1158,6 +1157,20 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                                 control.control_name,
                                 control.control_version,
                                 result,
+                            )
+                        elif command.phase in (
+                            GlobalDomainPhase.AUTHORIZE,
+                            GlobalDomainPhase.REVOKE_HOST,
+                            GlobalDomainPhase.RELEASE_HOST,
+                        ):
+                            operation = {
+                                GlobalDomainPhase.AUTHORIZE: inner_worker._authorize_global_host_node,
+                                GlobalDomainPhase.REVOKE_HOST: inner_worker._revoke_global_host_node,
+                                GlobalDomainPhase.RELEASE_HOST: inner_worker._release_global_host_node,
+                            }[command.phase]
+                            operation(command)
+                            _control_reply(
+                                conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
                             )
                         elif command.phase is GlobalDomainPhase.IMPORT:
                             inner_worker._import_global_domain_node(command, worker_id)  # noqa: SLF001
