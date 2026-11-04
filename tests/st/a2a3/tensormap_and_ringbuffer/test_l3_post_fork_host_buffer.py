@@ -15,7 +15,7 @@ the parent and carries a raw parent VA that is unmapped (or stale) in the child.
 ``Worker.create_buffer`` allocates a POSIX-shm backing and hands back a
 ``Buffer``; naming it in a task arg with ``handle.tensor(...)`` carries a
 self-describing descriptor that the forked chip child materializes lazily on
-first receipt (map-once), so a tensor built over ``handle.shm.buf`` round-trips
+first receipt (map-once), so a tensor built over ``handle.buffer`` round-trips
 with **no per-run copy** — the child reads and writes the same physical pages the
 parent sees.
 
@@ -116,9 +116,9 @@ class TestPostForkHostBufferZeroCopy(SceneTestCase):
         a = b = out = None
         result = False
         try:
-            a = torch.frombuffer(ba.shm.buf, dtype=DTYPE, count=SIZE)
-            b = torch.frombuffer(bb.shm.buf, dtype=DTYPE, count=SIZE)
-            out = torch.frombuffer(bout.shm.buf, dtype=DTYPE, count=SIZE)
+            a = torch.frombuffer(ba.buffer, dtype=DTYPE, count=SIZE)
+            b = torch.frombuffer(bb.buffer, dtype=DTYPE, count=SIZE)
+            out = torch.frombuffer(bout.buffer, dtype=DTYPE, count=SIZE)
             a.fill_(5.0)  # in place → lands directly in the child-visible shm
             b.fill_(7.0)
             out.zero_()

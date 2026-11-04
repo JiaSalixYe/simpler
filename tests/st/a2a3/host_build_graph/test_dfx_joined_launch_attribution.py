@@ -617,7 +617,7 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
             for index, value in enumerate(_PAIR_INPUT_VALUES):
                 nbytes = SIZE * DTYPE.itemsize
                 buffers = [worker.create_buffer(nbytes) for _ in range(3)]
-                tensors = [torch.frombuffer(buffer.shm.buf, dtype=DTYPE, count=SIZE) for buffer in buffers]
+                tensors = [torch.frombuffer(buffer.buffer, dtype=DTYPE, count=SIZE) for buffer in buffers]
                 tensors[0].fill_(value)
                 tensors[1].fill_(value + 1.0)
                 tensors[2].zero_()
@@ -667,7 +667,7 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
             # execution-credit reuse and the next submit. Each run keeps its own buffers alive.
             for index, value in enumerate(_REFILL_INPUT_VALUES):
                 buffers = [worker.create_buffer(SIZE * DTYPE.itemsize) for _ in range(3)]
-                tensors = [torch.frombuffer(buffer.shm.buf, dtype=DTYPE, count=SIZE) for buffer in buffers]
+                tensors = [torch.frombuffer(buffer.buffer, dtype=DTYPE, count=SIZE) for buffer in buffers]
                 tensors[0].fill_(value)
                 tensors[1].fill_(value + 1.0)
                 tensors[2].zero_()
@@ -1093,7 +1093,7 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
         root.mkdir(parents=True, exist_ok=True)
         nbytes = SIZE * DTYPE.itemsize
         buffers = [worker.create_buffer(nbytes) for _ in range(3)]
-        tensors = [torch.frombuffer(buffer.shm.buf, dtype=DTYPE, count=SIZE) for buffer in buffers]
+        tensors = [torch.frombuffer(buffer.buffer, dtype=DTYPE, count=SIZE) for buffer in buffers]
         tensors[0].fill_(3.0)
         tensors[1].fill_(4.0)
         tensors[2].zero_()

@@ -11,7 +11,7 @@
 /**
  * HCCL backend for the comm_* distributed communication API.
  *
- * Implements the five functions declared in host/comm.h using Ascend
+ * Implements the comm_* and private Host backing APIs using Ascend
  * HCCL (bundled with CANN) for the bootstrap / barrier / teardown plane
  * and ACL VMM for the per-rank symmetric window pool. A3 uses Fabric V2
  * handles; platforms without Fabric support
@@ -27,7 +27,11 @@
 #include "common/acl_hal_device.h"
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
+#include "host/host_backing.h"
 
+#include <algorithm>
+#include <array>
+#include <dlfcn.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -57,6 +62,293 @@ static inline HcclResult hccl_comm_init_root_info(uint32_t n, const HcclRootInfo
 }
 static inline HcclResult hccl_barrier(HcclComm c, aclrtStream s) { return HcclBarrier(c, s); }
 static inline HcclResult hccl_comm_destroy(HcclComm c) { return HcclCommDestroy(c); }
+
+// ============================================================================
+// Host backing ownership
+// ============================================================================
+
+namespace simpler::a3 {
+
+// Explicitly released after every imported view is acknowledged gone.
+// Destruction cannot prove that acknowledgement and does not free the backing.
+class HostDomainMemory {
+public:
+    std::pair<uint64_t, std::array<uint8_t, 128>> allocate(int device, uint32_t numa, uint64_t logical_bytes);
+    void authorize(const std::vector<int32_t> &pids);
+    void import_shared(int device, const uint8_t *token, uint64_t size, bool device_view);
+    uint64_t base() const;
+    void release();
+    static int process_identity(int device = -1);
+
+private:
+    int device_ = -1;
+    void *base_ = nullptr;
+    aclrtDrvMemHandle handle_ = nullptr;
+    bool mapped_ = false;
+    bool closing_ = false;
+    uint64_t size_ = 0;
+    std::array<uint8_t, 128> token_{};
+};
+
+namespace {
+void check(int rc, const char *op) {
+    if (rc) throw std::runtime_error(std::string(op) + " failed with code " + std::to_string(rc));
+}
+
+void ensure_acl() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const aclError rc = aclInit(nullptr);
+        if (rc != ACL_ERROR_REPEAT_INITIALIZE) check(rc, "aclInit");
+    });
+}
+
+class HostDeviceScope {
+public:
+    explicit HostDeviceScope(int device) {
+        if (device < 0) return;
+        if (aclrtGetCurrentContext(&previous_) != ACL_SUCCESS) previous_ = nullptr;
+        int32_t selected = -1;
+        changed_ = aclrtGetDevice(&selected) != ACL_SUCCESS || selected != device;
+        if (changed_) check(aclrtSetDevice(device), "aclrtSetDevice");
+    }
+    ~HostDeviceScope() {
+        if (changed_ && previous_ && aclrtSetCurrentContext(previous_) != ACL_SUCCESS)
+            LOG_ERROR("Host backing operation failed to restore the previous ACL context");
+    }
+    void restore() {
+        if (changed_ && previous_) check(aclrtSetCurrentContext(previous_), "restore Host backing ACL context");
+        changed_ = false;
+    }
+
+private:
+    aclrtContext previous_ = nullptr;
+    bool changed_ = false;
+};
+
+void *required_symbol(const char *name) {
+    void *symbol = dlsym(RTLD_DEFAULT, name);
+    if (!symbol) throw std::runtime_error(std::string("CANN ACL symbol not found: ") + name);
+    return symbol;
+}
+
+void require_host_fabric() {
+    const char *soc = aclrtGetSocName();
+    if (!soc || std::strncmp(soc, "Ascend910_93", 12) != 0)
+        throw std::runtime_error("Host Fabric backing requires an A3 device");
+    (void)required_symbol("aclrtReserveMemAddressNoUCMemory");
+}
+
+void authorize_fabric(void *token, std::vector<int32_t> pids) {
+    if (pids.empty() || std::any_of(pids.begin(), pids.end(), [](int32_t pid) {
+            return pid <= 0;
+        }))
+        throw std::invalid_argument("Fabric authorization requires positive process identities");
+    auto authorize = reinterpret_cast<decltype(&aclrtMemSetPidToShareableHandleV2)>(
+        required_symbol("aclrtMemSetPidToShareableHandleV2")
+    );
+    check(authorize(token, ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, pids.data(), pids.size()), "Fabric process authorization");
+}
+}  // namespace
+
+std::pair<uint64_t, std::array<uint8_t, 128>>
+HostDomainMemory::allocate(int device, uint32_t numa, uint64_t logical_bytes) {
+    if (closing_ || handle_ || base_ || !logical_bytes) throw std::invalid_argument("Host allocation is not empty");
+    ensure_acl();
+    HostDeviceScope scope(device);
+    require_host_fabric();
+    device_ = device;
+    aclrtPhysicalMemProp prop{};
+    prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
+    prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
+    prop.memAttr = ACL_MEM_P2P_HUGE;
+    prop.location = {numa, ACL_MEM_LOCATION_TYPE_HOST_NUMA};
+    size_t granularity = 0;
+    check(
+        aclrtMemGetAllocationGranularity(&prop, ACL_RT_MEM_ALLOC_GRANULARITY_MINIMUM, &granularity), "Host granularity"
+    );
+    if (!granularity || logical_bytes > SIZE_MAX - (granularity - 1))
+        throw std::invalid_argument("Host allocation extent overflow");
+    size_ = (logical_bytes + granularity - 1) / granularity * granularity;
+    check(aclrtMallocPhysical(&handle_, size_, &prop, 0), "Host physical allocation");
+    check(aclrtReserveMemAddress(&base_, size_, 0, nullptr, 1), "Host VA reservation");
+    check(aclrtMapMem(base_, size_, 0, handle_, 0), "Host owner mapping");
+    mapped_ = true;
+    std::memset(base_, 0, logical_bytes);
+    check(
+        aclrtMemExportToShareableHandleV2(
+            handle_, ACL_RT_IPC_MEM_EXPORT_FLAG_DEFAULT, ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, token_.data()
+        ),
+        "Fabric export"
+    );
+    scope.restore();
+    return {size_, token_};
+}
+
+void HostDomainMemory::import_shared(int device, const uint8_t *token, uint64_t size, bool device_view) {
+    if (closing_ || handle_ || base_ || !token || !size)
+        throw std::invalid_argument("Host import requires an empty owner and valid export");
+    ensure_acl();
+    HostDeviceScope scope(device);
+    device_ = device;
+    size_ = size;
+    if (device_view) {
+        require_host_fabric();
+        constexpr uint64_t unit = 1ULL << 30, begin = 40ULL << 40, end = 224ULL << 40;
+        if (size > end - begin - unit) throw std::invalid_argument("Host device mapping exceeds NoUC range");
+        const uint64_t bytes = (size + unit - 1) / unit * unit;
+        auto reserve = reinterpret_cast<decltype(&aclrtReserveMemAddressNoUCMemory)>(
+            required_symbol("aclrtReserveMemAddressNoUCMemory")
+        );
+        std::memcpy(token_.data(), token, token_.size());
+        check(
+            aclrtMemImportFromShareableHandleV2(
+                token_.data(), ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, ACL_RT_IPC_MEM_EXPORT_FLAG_DEFAULT, &handle_
+            ),
+            "Host device Fabric import"
+        );
+        // The driver arbitrates NoUC reservations across all endpoint imports.
+        aclError status = ACL_SUCCESS;
+        uint64_t address = begin;
+        constexpr unsigned max_candidates = 64;
+        for (unsigned attempt = 0; attempt < max_candidates && address <= end - bytes; ++attempt, address += bytes) {
+            void *candidate = nullptr;
+            status = reserve(&candidate, bytes, 0, reinterpret_cast<void *>(address), 0);
+            if (status == ACL_SUCCESS) {
+                base_ = candidate;
+                break;
+            }
+        }
+        check(status, "Host device NoUC reservation");
+        check(aclrtMapMem(base_, size_, 0, handle_, 0), "Host device mapping");
+        mapped_ = true;
+        scope.restore();
+        return;
+    }
+    // Driver FABRIC is 1; ACL's separately defined FABRIC value is 2.
+    using GetHostId = int (*)(uint32_t *);
+    using Import = int (*)(int, void *, uint32_t, void **);
+    // Keep the loaded driver available for imported handles until process exit.
+    static void *driver = dlopen("libascend_hal.so", RTLD_NOW | RTLD_LOCAL);
+    if (!driver) throw std::runtime_error("Host import requires libascend_hal.so");
+    auto get_host = reinterpret_cast<GetHostId>(dlsym(driver, "halGetHostID"));
+    auto import = reinterpret_cast<Import>(dlsym(driver, "halMemImportFromShareableHandleV2"));
+    if (!get_host || !import) throw std::runtime_error("Host-target Fabric import is unsupported by this driver");
+    uint32_t host = 0;
+    check(get_host(&host), "halGetHostID");
+    std::memcpy(token_.data(), token, token_.size());
+    check(import(1, token_.data(), host, reinterpret_cast<void **>(&handle_)), "Host-target Fabric import");
+    check(aclrtReserveMemAddress(&base_, size_, 0, nullptr, 1), "Host import VA reservation");
+    check(aclrtMapMem(base_, size_, 0, handle_, 0), "Host import mapping");
+    mapped_ = true;
+    scope.restore();
+}
+
+void HostDomainMemory::authorize(const std::vector<int32_t> &pids) {
+    if (closing_ || !mapped_ || !handle_) throw std::invalid_argument("Host owner has no live allocation");
+    HostDeviceScope scope(device_);
+    authorize_fabric(token_.data(), pids);
+    scope.restore();
+}
+
+uint64_t HostDomainMemory::base() const {
+    if (closing_ || !mapped_ || !base_) throw std::invalid_argument("Host owner has no live mapping");
+    return reinterpret_cast<uint64_t>(base_);
+}
+
+void HostDomainMemory::release() {
+    if (!base_ && !handle_) return;
+    closing_ = true;
+    HostDeviceScope scope(device_);
+    if (mapped_) {
+        check(aclrtUnmapMem(base_), "Host unmap");
+        mapped_ = false;
+    }
+    if (base_) {
+        check(aclrtReleaseMemAddress(base_), "Host VA release");
+        base_ = nullptr;
+    }
+    if (handle_) {
+        check(aclrtFreePhysical(handle_), "Host physical free");
+        handle_ = nullptr;
+    }
+    scope.restore();
+}
+
+int HostDomainMemory::process_identity(int device) {
+    ensure_acl();
+    HostDeviceScope scope(device);
+    int32_t pid = 0;
+    auto get_pid = reinterpret_cast<decltype(&aclrtDeviceGetBareTgid)>(required_symbol("aclrtDeviceGetBareTgid"));
+    check(get_pid(&pid), "Fabric process identity");
+    if (pid <= 0) throw std::runtime_error("Invalid Fabric process identity");
+    scope.restore();
+    return pid;
+}
+
+}  // namespace simpler::a3
+
+extern "C" int host_backing_allocate(
+    void **owner, int device, uint32_t numa, uint64_t bytes, uint64_t *mapping_size, uint8_t *export_data,
+    size_t export_capacity, size_t *export_size, char *error, size_t error_capacity
+) {
+    return simpler::host::call_host_backing(error, error_capacity, [&] {
+        if (!owner || !mapping_size || !export_data || export_capacity < 128 || !export_size)
+            throw std::invalid_argument("Invalid Host backing allocation output");
+        if (!*owner) *owner = new simpler::a3::HostDomainMemory();
+        const auto [size, token] = static_cast<simpler::a3::HostDomainMemory *>(*owner)->allocate(device, numa, bytes);
+        std::memcpy(export_data, token.data(), token.size());
+        *export_size = token.size();
+        *mapping_size = size;
+    });
+}
+
+extern "C" int host_backing_import(
+    void **owner, int device, const uint8_t *token, size_t token_size, uint64_t mapping_size, bool device_view,
+    char *error, size_t error_capacity
+) {
+    return simpler::host::call_host_backing(error, error_capacity, [&] {
+        if (!owner || !token || token_size != 128 || !mapping_size)
+            throw std::invalid_argument("Invalid Host backing import");
+        if (!*owner) *owner = new simpler::a3::HostDomainMemory();
+        static_cast<simpler::a3::HostDomainMemory *>(*owner)->import_shared(device, token, mapping_size, device_view);
+    });
+}
+
+extern "C" int
+host_backing_authorize(void *owner, const int32_t *identities, size_t count, char *error, size_t error_capacity) {
+    return simpler::host::call_host_backing(error, error_capacity, [&] {
+        if (!owner) throw std::invalid_argument("Host owner has no live allocation");
+        if (!identities || !count)
+            throw std::invalid_argument("Fabric authorization requires positive process identities");
+        static_cast<simpler::a3::HostDomainMemory *>(owner)->authorize({identities, identities + count});
+    });
+}
+
+extern "C" int host_backing_get_base(void *owner, uint64_t *base, char *error, size_t error_capacity) {
+    return simpler::host::call_host_backing(error, error_capacity, [&] {
+        if (!owner || !base) throw std::invalid_argument("Host owner has no live mapping");
+        *base = static_cast<simpler::a3::HostDomainMemory *>(owner)->base();
+    });
+}
+
+extern "C" int host_backing_release(void **owner, char *error, size_t error_capacity) {
+    return simpler::host::call_host_backing(error, error_capacity, [&] {
+        if (!owner) throw std::invalid_argument("Invalid Host backing owner");
+        if (!*owner) return;
+        auto *memory = static_cast<simpler::a3::HostDomainMemory *>(*owner);
+        memory->release();
+        delete memory;
+        *owner = nullptr;
+    });
+}
+
+extern "C" int host_backing_process_identity(int device, int32_t *identity, char *error, size_t error_capacity) {
+    return simpler::host::call_host_backing(error, error_capacity, [&] {
+        if (!identity) throw std::invalid_argument("Invalid Host process identity output");
+        *identity = simpler::a3::HostDomainMemory::process_identity(device);
+    });
+}
 
 // ============================================================================
 // Internal state
@@ -83,6 +375,10 @@ struct DomainAllocation {
     int rank = 0;
     int nranks = 0;
     bool release_failed = false;
+    bool release_barrier_attempted = false;
+    bool release_barrier_succeeded = false;
+    bool release_windows_attempted = false;
+    aclError release_windows_status = ACL_SUCCESS;
     VmmWindow local_window;
     std::vector<VmmWindow> peer_windows;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
@@ -1484,31 +1780,41 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
         );
         return -1;
     }
-    int rc = 0;
-    // Best-effort subset barrier so peers don't free local memory under each
-    // other.  If a peer crashed mid-allocation, the timeout returns false and
-    // we proceed with local teardown anyway — same shape as comm_destroy.
-    if (!file_barrier(
+    // The barrier result is terminal; cleanup retries are local.
+    if (!alloc->release_barrier_attempted) {
+        alloc->release_barrier_attempted = true;
+        alloc->release_barrier_succeeded = file_barrier(
             h->rootinfo_path, static_cast<int>(domain_rank), static_cast<int>(rank_count),
             domain_barrier_tag(allocation_id, "release"), h->run_token
-        )) {
-        LOG_WARN("[comm rank %d] release_domain: barrier timed out; releasing local state anyway", h->rank);
-        rc = -1;
+        );
+        if (!alloc->release_barrier_succeeded) {
+            LOG_WARN("[comm rank %d] release_domain: barrier failed; retaining local state", h->rank);
+        }
     }
+    if (!alloc->release_barrier_succeeded) return -1;
 
+    int rc = 0;
     if (alloc->device_ctx) {
         aclError aret = aclrtFree(alloc->device_ctx);
-        if (aret != ACL_SUCCESS && rc == 0) rc = -1;
-        alloc->device_ctx = nullptr;
+        if (aret != ACL_SUCCESS && rc == 0) rc = static_cast<int>(aret);
+        if (aret == ACL_SUCCESS) alloc->device_ctx = nullptr;
     }
-    aclError release_status = release_domain_windows(alloc.get());
-    if (release_status != ACL_SUCCESS) {
+    // VMM helpers clear fields even on failure, so their result remains sticky.
+    if (!alloc->release_windows_attempted) {
+        alloc->release_windows_status = static_cast<aclError>(-1);
+        alloc->release_windows_attempted = true;
+        aclError release_status = release_vmm_windows(&alloc->peer_windows);
+        record_first_error(release_vmm_window(&alloc->local_window), &release_status);
+        alloc->release_windows_status = release_status;
+    }
+    if (alloc->release_windows_status != ACL_SUCCESS) {
         LOG_ERROR(
-            "[comm rank %d] release_domain: release VMM windows -> %d", h->rank, static_cast<int>(release_status)
+            "[comm rank %d] release_domain: release VMM windows -> %d", h->rank,
+            static_cast<int>(alloc->release_windows_status)
         );
-        if (rc == 0) rc = -1;
+        if (rc == 0) rc = static_cast<int>(alloc->release_windows_status);
     }
-    h->domain_allocations.erase(it);
+    if (rc == 0) h->domain_allocations.erase(it);
     return rc;
 } catch (const std::exception &e) {
     LOG_ERROR("[comm] release_domain: exception: %s", e.what());

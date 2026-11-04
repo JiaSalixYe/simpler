@@ -74,7 +74,7 @@ class TestL3CreateBuffer(SceneTestCase):
 
         # The backing is usable in place (born-shared shm).
         assert h0.shm is not None
-        buf = h0.shm.buf
+        buf = h0.buffer
         assert buf is not None
         buf[:4] = b"\xde\xad\xbe\xef"
         assert bytes(buf[:4]) == b"\xde\xad\xbe\xef"

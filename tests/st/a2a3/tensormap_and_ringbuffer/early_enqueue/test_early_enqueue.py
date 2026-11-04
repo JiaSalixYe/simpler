@@ -956,7 +956,7 @@ class _A2a3TmrEarlyEnqueueBase(SceneTestCase):
     @staticmethod
     def _tensor_from_host_buffer(worker, value):
         buffer = worker.create_buffer(_SIZE * torch.float32.itemsize)
-        tensor = torch.frombuffer(buffer.shm.buf, dtype=torch.float32, count=_SIZE)
+        tensor = torch.frombuffer(buffer.buffer, dtype=torch.float32, count=_SIZE)
         tensor.fill_(value)
         return buffer, tensor
 

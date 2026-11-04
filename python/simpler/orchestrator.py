@@ -122,7 +122,7 @@ def _reject_remote_sidecar_args(args: object, *, kind: str) -> None:
         raise TypeError(f"RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits, not {kind}")
 
 
-def _reject_device_args(args: object, *, kind: str) -> None:
+def _reject_device_args(args: object, *, kind: str, worker=None) -> None:
     """Refuse a DEVICE-space tensor bound for a host endpoint.
 
     A Python sub-worker maps its args into its own process and hands them to torch, so a device
@@ -131,15 +131,20 @@ def _reject_device_args(args: object, *, kind: str) -> None:
     """
     if not isinstance(args, TaskArgs):
         return
-    from .buffer import AddressSpace  # noqa: PLC0415
+    from .buffer import AddressSpace, BackendKind  # noqa: PLC0415
 
     for i in range(args.tensor_count()):
         desc = args.tensor(i).buffer
-        if desc.address_space == AddressSpace.DEVICE:
+        if desc.address_space == AddressSpace.DEVICE or args.tensor(i).mapping_ref:
             raise ValueError(
                 f"{kind}: argument {i} is a DEVICE-space tensor ({desc.backend_kind.name}); a Python "
                 f"sub-worker runs on the host and can only take HOST-space tensors"
             )
+        if worker is not None and desc.backend_kind == BackendKind.REMOTE_SIDECAR:
+            resource = worker._mapping_resource(args.tensor(i))
+            if resource is None:
+                raise ValueError("Host CPU argument requires a live owned backing")
+            resource._check_source(args.tensor(i))
 
 
 def _remote_data_eligible_worker_ids(
@@ -354,7 +359,9 @@ class Orchestrator:
             prov_guard = worker._child_prov_lock
         with prov_guard:
             if needs_prov:
-                worker._child_prov_check_dispatch_locked(c_args, cpp_worker_id, api="submit_next_level")
+                worker._child_prov_check_dispatch_locked(
+                    c_args, cpp_worker_id, api="submit_next_level", sidecar=remote_sidecar
+                )
                 remote_sidecar = worker._prepare_buffer_references(c_args, remote_sidecar, cpp_worker_id)
             final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
             if worker is not None:
@@ -464,7 +471,12 @@ class Orchestrator:
         with prov_guard:
             for index, c_args in member_checks:
                 assert worker is not None
-                worker._child_prov_check_dispatch_locked(c_args, worker_ids[index], api="submit_next_level_group")
+                worker._child_prov_check_dispatch_locked(
+                    c_args,
+                    worker_ids[index],
+                    api="submit_next_level_group",
+                    sidecar=remote_sidecars[index] if remote_sidecars is not None else None,
+                )
                 prepared = worker._prepare_buffer_references(
                     c_args, remote_sidecars[index] if remote_sidecars is not None else None, worker_ids[index]
                 )
@@ -495,7 +507,7 @@ class Orchestrator:
             expected_namespace="LOCAL_PYTHON",
         )
         _reject_remote_sidecar_args(args, kind="orch.submit_sub")
-        _reject_device_args(args, kind="orch.submit_sub")
+        _reject_device_args(args, kind="orch.submit_sub", worker=self._worker)
         if self._worker is not None:
             self._worker._record_touched_identities(args)
         _admit_task_submission(self._worker)
@@ -511,7 +523,7 @@ class Orchestrator:
         )
         for args in args_list:
             _reject_remote_sidecar_args(args, kind="orch.submit_sub_group")
-            _reject_device_args(args, kind="orch.submit_sub_group")
+            _reject_device_args(args, kind="orch.submit_sub_group", worker=self._worker)
         # Second pass, as in submit_next_level_group: a member rejected above means no member is
         # dispatched, and identities recorded for a group that never went out would refuse a
         # release of buffers no task ever received.
@@ -580,7 +592,13 @@ class Orchestrator:
         A hit neither allocates nor initializes the existing window.
         """
         return self._domain(
-            name, members, window_size, buffers, retain_after_run, workspace_engines=workspace_engines, reuse=True
+            name,
+            members,
+            window_size,
+            buffers,
+            retain_after_run,
+            workspace_engines=workspace_engines,
+            reuse=True,
         )
 
     def _domain(self, name, members, window_size, buffers, retain_after_run, *, workspace_engines=(), reuse):
@@ -660,12 +678,12 @@ class Orchestrator:
         buffer: str | None = None,
         offset: int = 0,
     ) -> None:
-        """Synchronously stage bytes; does not wait for queued tasks.
+        """Synchronously stage bytes to an NPU rank; does not wait for queued tasks.
 
         L3 staging precedes task submission and stays within declared buffer slices.
         L4 keeps its existing window copy path.
         """
-        self._copy_domain(handle, domain_rank, bytes(data), buffer, offset, writing=True)
+        self._copy_domain(handle, operator.index(domain_rank), bytes(data), buffer, offset, writing=True)
 
     def copy_from_domain(
         self,
@@ -677,7 +695,9 @@ class Orchestrator:
         offset: int = 0,
     ) -> bytes:
         """Synchronously read bytes with the same range and ordering rules as copy_to_domain."""
-        return cast(bytes, self._copy_domain(handle, domain_rank, int(nbytes), buffer, offset, writing=False))
+        return cast(
+            bytes, self._copy_domain(handle, operator.index(domain_rank), int(nbytes), buffer, offset, writing=False)
+        )
 
     copy_to_global_domain = copy_to_domain
     copy_from_global_domain = copy_from_domain
@@ -693,7 +713,7 @@ class Orchestrator:
         ):
             return self._copy_domain_locked(handle, rank, data, buffer, offset, writing=writing)
 
-    def _copy_domain_locked(self, handle, rank, data, buffer, offset, *, writing):
+    def _copy_domain_locked(self, handle, rank, data, buffer, offset, *, writing):  # noqa: PLR0912 -- keep staging and its ordered cleanup in one transaction
         assert self._worker is not None
         if not handle.borrowed:
             if handle._ref is None or handle._ref.owner_instance_id != self._worker._owner_instance_id:
@@ -724,19 +744,22 @@ class Orchestrator:
             host = self._worker.create_buffer(size)
             try:
                 if writing:
-                    host.shm.buf[:size] = data
+                    host.buffer[:size] = data
                 for device, device_offset, host_offset, count in ranges:
                     if writing:
                         self.copy_to(device, host, dst_offset=device_offset, src_offset=host_offset, nbytes=count)
                     else:
                         self.copy_from(host, device, dst_offset=host_offset, src_offset=device_offset, nbytes=count)
-                return None if writing else bytes(host.shm.buf[:size])
+                return None if writing else bytes(host.buffer[:size])
             finally:
                 # Control copies have finished and this private staging buffer was never submitted.
-                host.close()
-                self._worker._release_import_recursive(host.identity)
-                with self._worker._registry_lock:
-                    self._worker._buffers.pop(int(host.identity.buffer_id), None)
+                if host.identity in self._worker._host_buffers:
+                    self._worker._release_host_buffer(host.identity)
+                else:
+                    host.close()
+                    self._worker._release_import_recursive(host.identity)
+                    with self._worker._registry_lock:
+                        self._worker._buffers.pop(int(host.identity.buffer_id), None)
 
     def create_worker_chip_region(self, *, worker_id: int, payload_bytes: int, counter_bytes: int):
         """Create an L3-L2 communication region on one NEXT_LEVEL chip worker."""
