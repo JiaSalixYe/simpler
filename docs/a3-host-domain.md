@@ -7,11 +7,9 @@ supported; extending device communication domains to Host storage is separate wo
 
 ## Allocation and mapping
 
-A3 `Worker.create_buffer(nbytes)` defaults to Host NUMA VMM/Fabric backing without
-a Host-specific allocation keyword. Simulation and A5 ordinary allocation retain
-POSIX shared memory. Physical alignment is internal; logical sizes need only be
-positive. A3 L4 retains its existing POSIX allocator. Small L2/L3 buffers also
-use VMM; allocator thresholds and performance tuning are deferred.
+`Worker.create_buffer(nbytes)` retains ordinary POSIX shared memory allocation.
+No device registration occurs until an explicit map request. CPU-only buffers,
+small controls and existing staging retain their usual allocation behavior.
 
 ```python
 buffer = worker.create_buffer(4096)
@@ -44,10 +42,12 @@ lookup keys, never permissions: they are backing-scoped, never reused, encode
 neither rank nor access, and fail on exhaustion. Mapped parameters require explicit
 `TensorTransfer.NONE`; native and mapped arguments can coexist in one invocation.
 
-A3 allocation, PID authorization and imports reside in the platform runtime DSO.
-CPU processes use HAL Host-target imports; NPU endpoints use Fabric/NoUC imports.
-The existing private owner bridge retains imported resources and the loaded module.
-Neither CPU-only allocation nor L2 device mapping creates a synthetic domain.
+The A3 platform registers each target process's local shared-memory address with
+HostRegister. No Fabric export/import, PID whitelist or Host-target HAL mapping
+is required. POSIX shared memory supplies CPU process sharing. The target registry
+retains the shared-memory import and device registration until unmap succeeds.
+The platform runtime owns device context selection and HostUnregister; the common
+bridge retains the runtime module while native cleanup remains owed.
 
 ## L3 local endpoints
 
@@ -81,10 +81,10 @@ with conflicting accepted uses drained. `unmap_view` refuses in-flight use befor
 revocation; domain lifetime has no effect on a Host mapping.
 
 After accepted uses end, unmap first revokes the selected grant. The
-last active record releases the endpoint's physical import. Failure remains
+last active record releases the endpoint's device registration. Failure remains
 CLOSING, rejects new use, and retains cleanup ownership for retry. Old references
 never revive. `release_buffer` refuses remaining mappings and releases
-the owner only after child CPU imports are confirmed gone. Worker close reaps
+the original backing after mappings and accepted uses retire. Worker close reaps
 consumers and reports unconfirmed cleanup rather than freeing unsafe storage.
 
 ## Qualification
@@ -96,7 +96,6 @@ application cases retain their manual selection. Do not multiply these into a
 runtime/engine/size CI matrix.
 
 Qualification evidence must match this ownership refactor; historical tests at
-`ef701aaa2941` cover the earlier domain-coupled implementation. Unauthorized-PID
-hardware rejection, A5, cross-node access,
+`ef701aaa2941` cover the earlier domain-coupled implementation. A5 and cross-node access,
 Engram table layout and communication/computation overlap remain unqualified.
 This work does not close issues #2460 or #2657.

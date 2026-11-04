@@ -106,8 +106,6 @@ NativeRunProvenance make_run_provenance(
     return provenance;
 }
 
-using simpler::host::HostBackingOwner;
-
 struct LocalAclMemLocation {
     uint32_t id{0};
     int type{0};
@@ -2051,50 +2049,11 @@ BufferDescriptor decode_buffer_descriptor_wire(const uint8_t *raw, size_t size) 
 #endif
 
 NB_MODULE(_task_interface, m) {
-    nb::class_<HostBackingOwner>(m, "_HostDomainMemory")
+    nb::class_<simpler::host::HostRegistration>(m, "_HostRegistration")
         .def(nb::init<const std::string &>())
-        .def(
-            "allocate",
-            [](HostBackingOwner &owner, int device, uint32_t numa, uint64_t nbytes) {
-                const auto [size, token] = owner.allocate(device, numa, nbytes);
-                return nb::make_tuple(size, nb::bytes(reinterpret_cast<const char *>(token.data()), token.size()));
-            }
-        )
-        .def(
-            "import_shared",
-            [](HostBackingOwner &owner, int device, nb::bytes token, uint64_t size, bool device_view) {
-                const auto *data = reinterpret_cast<const uint8_t *>(token.c_str());
-                owner.import_shared(device, {data, data + token.size()}, size, device_view);
-            },
-            nb::arg("device"), nb::arg("token"), nb::arg("mapping_size"), nb::arg("device_view") = false
-        )
-        .def(
-            "buffer",
-            [](HostBackingOwner &owner, uint64_t size) {
-                struct Export {
-                    nb::object keeper;
-                    HostBackingOwner *backing = nullptr;
-                    ~Export() {
-                        if (backing) backing->release_export();
-                    }
-                };
-                auto lease = std::make_unique<Export>();
-                lease->keeper = nb::cast(&owner, nb::rv_policy::reference);
-                const auto address = owner.acquire_export(size);
-                lease->backing = &owner;
-                nb::capsule capsule(lease.get(), [](void *ptr) noexcept {
-                    delete static_cast<Export *>(ptr);
-                });
-                lease.release();
-                nb::ndarray<nb::memview, uint8_t> array(reinterpret_cast<void *>(address), {size}, capsule);
-                return array.cast();
-            }
-        )
-        .def("require_mapping_support", &HostBackingOwner::require_mapping_support)
-        .def("authorize", &HostBackingOwner::authorize)
-        .def_prop_ro("base", &HostBackingOwner::base)
-        .def("release", &HostBackingOwner::release)
-        .def("process_identity", &HostBackingOwner::process_identity, nb::arg("device") = -1);
+        .def("register", &simpler::host::HostRegistration::register_memory)
+        .def_prop_ro("base", &simpler::host::HostRegistration::base)
+        .def("release", &simpler::host::HostRegistration::release);
     m.doc() = "Nanobind bindings for task_interface (DataType, Buffer/Tensor wire ABI, ChipTensor, TaskArgs variants)";
 
     // Source commit this extension was compiled from; "" when git was

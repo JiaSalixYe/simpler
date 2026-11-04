@@ -12,91 +12,30 @@
 #include "host_backing_owner.h"
 
 #include <array>
-#include <stdexcept>
-
-#include "../platform_comm/comm.h"
 
 namespace simpler::host {
-
-int query_host_backing_identity(const RuntimeModule &module, int device) {
-    auto query = module.required<decltype(&host_backing_process_identity)>("host_backing_process_identity");
-    std::array<char, 1024> error{};
-    int32_t identity = 0;
-    check_host_backing_result(query(device, &identity, error.data(), error.size()), error.data());
-    return identity;
-}
-
-HostBackingOwner::HostBackingOwner(const std::string &runtime_path) :
+HostRegistration::HostRegistration(const std::string &runtime_path) :
     module_(std::make_shared<RuntimeModule>(runtime_path.c_str())),
-    allocate_(module_->required<decltype(allocate_)>("host_backing_allocate")),
-    authorize_(module_->required<decltype(authorize_)>("host_backing_authorize")),
-    base_(module_->required<decltype(base_)>("host_backing_get_base")),
-    release_(module_->required<decltype(release_)>("host_backing_release")) {
-    (void)module_->required<decltype(&host_backing_process_identity)>("host_backing_process_identity");
-}
+    register_(module_->required<decltype(register_)>("host_register_memory")),
+    base_(module_->required<decltype(base_)>("host_registration_base")),
+    release_(module_->required<decltype(release_)>("host_registration_release")) {}
 
-void HostBackingOwner::require_mapping_support() const {
-    (void)module_->required<decltype(&host_backing_import)>("host_backing_import");
-}
-
-HostBackingOwner::~HostBackingOwner() {
-    // Unknown imported-view lifetime forbids backing cleanup and code unload.
+HostRegistration::~HostRegistration() {
+    // Only explicit release proves that device users have stopped.
     if (owner_) module_->retain_until_process_exit();
 }
-
-std::pair<uint64_t, std::vector<uint8_t>> HostBackingOwner::allocate(int device, uint32_t numa, uint64_t bytes) {
+void HostRegistration::register_memory(int device, uint64_t host_base, uint64_t bytes) {
     std::array<char, 1024> error{};
-    std::vector<uint8_t> token(COMM_GLOBAL_DOMAIN_HANDLE_BYTES);
-    uint64_t size = 0;
-    size_t count = 0;
-    check_host_backing_result(
-        allocate_(&owner_, device, numa, bytes, &size, token.data(), token.size(), &count, error.data(), error.size()),
-        error.data()
-    );
-    if (count > token.size() || !count || size < bytes) throw std::runtime_error("Invalid Host backing export");
-    size_ = size;
-    token.resize(count);
-    return {size, std::move(token)};
+    check_host_backing_result(register_(&owner_, device, host_base, bytes, error.data(), error.size()), error.data());
 }
-
-void HostBackingOwner::import_shared(int device, const std::vector<uint8_t> &token, uint64_t size, bool device_view) {
-    auto import = module_->required<decltype(&host_backing_import)>("host_backing_import");
-    std::array<char, 1024> error{};
-    check_host_backing_result(
-        import(&owner_, device, token.data(), token.size(), size, device_view, error.data(), error.size()), error.data()
-    );
-    size_ = size;
-    device_view_ = device_view;
-}
-
-uint64_t HostBackingOwner::acquire_export(uint64_t bytes) {
-    if (device_view_) throw std::invalid_argument("Device mappings cannot be exported as CPU buffers");
-    if (!bytes || bytes > size_) throw std::invalid_argument("Host buffer export exceeds allocation");
-    const auto address = base();
-    ++exports_;
-    return address;
-}
-
-void HostBackingOwner::authorize(const std::vector<int32_t> &identities) {
-    std::array<char, 1024> error{};
-    check_host_backing_result(
-        authorize_(owner_, identities.data(), identities.size(), error.data(), error.size()), error.data()
-    );
-}
-
-uint64_t HostBackingOwner::base() const {
+uint64_t HostRegistration::base() const {
     std::array<char, 1024> error{};
     uint64_t address = 0;
     check_host_backing_result(base_(owner_, &address, error.data(), error.size()), error.data());
     return address;
 }
-
-void HostBackingOwner::release() {
-    if (exports_) throw std::runtime_error("Host buffer has outstanding exported views");
+void HostRegistration::release() {
     std::array<char, 1024> error{};
     check_host_backing_result(release_(&owner_, error.data(), error.size()), error.data());
 }
-
-int HostBackingOwner::process_identity(int device) const { return query_host_backing_identity(*module_, device); }
-
 }  // namespace simpler::host

@@ -82,7 +82,7 @@ def test_retained_domain_reaches_chip_in_second_run(st_platform, st_device_ids, 
             assert domain.released and not domain.freed
         run.wait()
         assert domain.freed
-        assert struct.unpack_from(f"<{_NUMEL}f", output.buffer) == (70.0,) * _NUMEL
+        assert struct.unpack_from(f"<{_NUMEL}f", output.shm.buf) == (70.0,) * _NUMEL
     finally:
         worker.close()
 
@@ -147,6 +147,6 @@ def test_l4_reuse_keeps_domain_until_child_kernel_completes(st_platform, st_devi
 
         worker.run(second)
         assert saved[0].freed and worker.live_domains == {}
-        assert struct.unpack_from(f"<{_NUMEL}f", output.buffer) == (70.0,) * _NUMEL
+        assert struct.unpack_from(f"<{_NUMEL}f", output.shm.buf) == (70.0,) * _NUMEL
     finally:
         worker.close()

@@ -143,6 +143,7 @@ from .buffer import (
     wrap_fork_inherited,
     wrap_vmm_window,
 )
+from .buffer_mapping import MappingResource
 from .callable_identity import (
     CALLABLE_HASH_DIGEST_BYTES,
     CallableHandle,
@@ -240,7 +241,6 @@ from .global_comm_domain import (
     GLOBAL_DOMAIN_MAX_STRING_BYTES,
     GLOBAL_DOMAIN_PROFILE_A3_FABRIC,
     GLOBAL_DOMAIN_PROFILE_IDS,
-    GLOBAL_DOMAIN_PROFILE_SIM,
     GLOBAL_DOMAIN_VERSION,
     LOCAL_COPY_REPLY,
     LOCAL_COPY_REQUEST,
@@ -278,8 +278,7 @@ from .global_comm_domain import (
     resolve_global_comm_capability,
     validate_descriptor_table,
 )
-from .host_domain import HostDomainResource, MappingResource
-from .host_domain_backend import host_attachment_profile, host_backing_type
+from .host_registration import HostRegistration
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
 from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
@@ -913,9 +912,6 @@ _MAX_FLUSH_TIMEOUT_MS = 2**31 - 1
 _CTRL_HOST_VIEW = 28
 _CTRL_DEVICE_VIEW = 30
 _CTRL_OP_NAMES[_CTRL_DEVICE_VIEW] = "device_view"
-_CTRL_HOST_CPU = 29
-_HOST_CPU_REQUEST = struct.Struct("<iI")
-_CTRL_OP_NAMES[_CTRL_HOST_CPU] = "host_cpu"
 _HOST_VIEW_REQUEST = struct.Struct("<iIBBBB")
 _CTRL_OP_NAMES[_CTRL_HOST_VIEW] = "host_view"
 _CTRL_DELEGATED_REGION = 26
@@ -2852,9 +2848,7 @@ def _sub_worker_loop(
 
     def handle_control(sub_cmd: int) -> tuple[int, str]:
         try:
-            if sub_cmd == _CTRL_HOST_CPU:
-                _handle_ctrl_host_cpu(buf, import_registry)
-            elif sub_cmd == _CTRL_IMPORT_RELEASE:
+            if sub_cmd == _CTRL_IMPORT_RELEASE:
                 import_registry.unregister(_unpack_identity_wire(_read_control_digest(buf)))
             else:
                 _handle_py_callable_control(
@@ -3444,36 +3438,6 @@ def _handle_ctrl_release_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_h
     cw.comm_release_domain_windows(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
 
 
-def _handle_ctrl_host_cpu(buf, import_registry):
-    staged, payload, size = _open_ctrl_payload(buf, what="Host CPU import")
-    try:
-        device, path_size = _HOST_CPU_REQUEST.unpack_from(payload)
-        start = _HOST_CPU_REQUEST.size
-        if not path_size:
-            import_registry.unregister(_unpack_identity_wire(bytes(payload[start:size])))
-            return
-        if start + path_size > size:
-            raise ValueError("invalid Host runtime path")
-        path = bytes(payload[start : start + path_size]).decode("utf-8")
-        tail = bytes(payload[start + path_size : size])
-        if not tail:
-            backing = host_backing_type("a2a3")(host_runtime_path=path)
-            _HOST_CPU_REQUEST.pack_into(payload, 0, backing.native.process_identity(device), path_size)
-            return
-        if len(tail) != GLOBAL_DOMAIN_DESCRIPTOR_BYTES + 88:
-            raise ValueError("invalid Host CPU import payload")
-        exported = GlobalDomainDescriptor.decode(tail[:GLOBAL_DOMAIN_DESCRIPTOR_BYTES])
-        descriptor = _decode_buffer_descriptor_wire(tail[GLOBAL_DOMAIN_DESCRIPTOR_BYTES:])
-        if descriptor.address_space != AddressSpace.HOST or descriptor.nbytes > exported.mapping_size:
-            raise ValueError("invalid Host CPU import extent")
-        platform = "a2a3sim" if exported.profile_id == GLOBAL_DOMAIN_PROFILE_IDS[GLOBAL_DOMAIN_PROFILE_SIM] else "a2a3"
-        backing = host_backing_type(platform)(host_runtime_path=path)
-        import_registry.import_native_host(descriptor, backing, device=device, exported=exported)
-    finally:
-        payload.release()
-        staged.close()
-
-
 def _apply_device_view(cw, registry, descriptor, reference, access, *, unmap):
     cw._validate_execution_context()
     if descriptor.address_space != AddressSpace.DEVICE or descriptor.backend_kind not in (
@@ -3517,28 +3481,25 @@ def _handle_ctrl_host_view(cw, buf, *, import_registry, chip_platform):
         device, path_size, reference, access, unmap, reserved = _HOST_VIEW_REQUEST.unpack_from(payload)
         start = _HOST_VIEW_REQUEST.size
         end = start + path_size
-        if size != end + GLOBAL_DOMAIN_DESCRIPTOR_BYTES + 88:
+        if size != end + 88:
             raise ValueError("invalid Host view payload size")
         if not reference or unmap not in (0, 1) or reserved or (unmap and access):
             raise ValueError("invalid Host view request")
         cw._validate_execution_context()
         if device != cw.device_id:
             raise ValueError("Host mapping targets a different device")
-        exported = GlobalDomainDescriptor.decode(bytes(payload[end : end + GLOBAL_DOMAIN_DESCRIPTOR_BYTES]))
-        descriptor = _decode_buffer_descriptor_wire(bytes(payload[end + GLOBAL_DOMAIN_DESCRIPTOR_BYTES : size]))
-        host_attachment_profile(exported, chip_platform)
+        descriptor = _decode_buffer_descriptor_wire(bytes(payload[end:size]))
         if unmap:
             if import_registry.require(descriptor.identity).descriptor != descriptor:
                 raise ValueError("Host unmap differs from its registered backing")
             import_registry.unmap_attachment(descriptor.identity, reference)
         else:
             path = bytes(payload[start:end]).decode("utf-8")
-            backing = host_backing_type(chip_platform)(host_runtime_path=path)
+            backing = HostRegistration(platform=chip_platform, runtime_path=path)
             import_registry.import_device_host(
                 descriptor,
                 backing,
                 device=device,
-                exported=exported,
                 mapping_ref=reference,
                 access=AccessMode(access),
             )
@@ -3781,8 +3742,6 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     buf,
                     base_comm_handle=base_comm_handle,
                 )
-            elif sub_cmd == _CTRL_HOST_CPU:
-                _handle_ctrl_host_cpu(buf, import_registry)
             elif sub_cmd == _CTRL_DEVICE_VIEW:
                 _handle_ctrl_device_view(cw, buf, import_registry)
             elif sub_cmd == _CTRL_HOST_VIEW:
@@ -12499,8 +12458,8 @@ class Worker:
                 self._worker.control_payload(
                     WorkerType.NEXT_LEVEL,
                     worker,
-                    _CTRL_HOST_CPU,
-                    _HOST_CPU_REQUEST.pack(-1, 0) + _pack_identity_wire(identity),
+                    _CTRL_IMPORT_RELEASE,
+                    _pack_identity_wire(identity),
                     self._py_control_timeout_s,
                 )
             self._device_mappings.pop(identity)
@@ -12788,7 +12747,7 @@ class Worker:
                 if resource is None and not tensor.mapping_ref and remote is not None and remote.present:
                     continue
                 if resource is None:
-                    raise ValueError("Host domain Tensor is not a live allocation on this Worker")
+                    raise ValueError("mapped Tensor is not a live allocation on this Worker")
                 resource.validate(
                     tensor,
                     target_worker_id,
@@ -13347,114 +13306,14 @@ class Worker:
     # ------------------------------------------------------------------
 
     def create_buffer(self, nbytes: int) -> Buffer:
-        """Allocate native Host storage; A3 uses VMM/Fabric, simulation retains SHM."""
+        """Allocate native Host storage using the existing POSIX backing."""
         if self.level < 2:
             raise TypeError("create_buffer requires a level >= 2 Worker")
         if isinstance(nbytes, bool):
             raise TypeError("buffer size must be an integer")
         nbytes = operator.index(nbytes)
         with self._operation_lease("create_buffer", allow_continuation=True):
-            if self._config["platform"] == "a2a3" and self.level in (2, 3):
-                return self._create_host_buffer(nbytes)
             return self._create_buffer_locked(nbytes)
-
-    def _host_cpu_control(self, resource, worker_type, worker_id, *, query):
-        path = str(self._host_runtime_path).encode("utf-8")
-        device = self._config["device_ids"][worker_id] if worker_type == WorkerType.NEXT_LEVEL else resource.device
-        request = _HOST_CPU_REQUEST.pack(device, len(path)) + path
-        if not query:
-            request += resource.request()
-        assert self._worker is not None
-        reply = bytes(
-            self._worker.control_payload(
-                worker_type,
-                worker_id,
-                _CTRL_HOST_CPU,
-                request,
-                self._py_control_timeout_s,
-            )
-        )
-        return _HOST_CPU_REQUEST.unpack_from(reply)[0] if query else None
-
-    def _prepare_host_cpu_views(self, resource, workers):
-        targets = [(WorkerType.NEXT_LEVEL, worker) for worker in workers]
-        targets += [(WorkerType.SUB, index) for index in range(len(self._sub_shms))]
-        if self._config["platform"] == "a2a3":
-            pids = [self._host_cpu_control(resource, kind, worker, query=True) for kind, worker in targets]
-            if pids:
-                resource.backend.authorize(pids)
-        for kind, worker in targets:
-            resource._cpu_targets.add((kind, worker))
-            self._host_cpu_control(resource, kind, worker, query=False)
-
-    def _release_host_cpu_views(self, resource):
-        if resource._cpu_targets and self._worker is None:
-            if any((self._chip_pids, self._sub_pids, self._next_level_pids)) or any(
-                kind == "child" for kind, _identity, _cleanup in self._cleanup_journal._entries
-            ):
-                raise RuntimeError("Host CPU imports retained until local consumers are reaped")
-            resource._cpu_targets.clear()
-        for kind, worker in tuple(resource._cpu_targets):
-            assert self._worker is not None
-            self._worker.control_payload(
-                kind,
-                worker,
-                _CTRL_HOST_CPU,
-                _HOST_CPU_REQUEST.pack(-1, 0) + _pack_identity_wire(resource.identity),
-                self._py_control_timeout_s,
-            )
-            resource._cpu_targets.remove((kind, worker))
-
-    def _create_host_buffer(self, nbytes):
-        if self.level not in (2, 3):
-            raise ValueError("Host Fabric default allocation currently supports L2/L3")
-        if isinstance(nbytes, bool) or not 0 < operator.index(nbytes) < 2**63:
-            raise ValueError("Host buffer requires a positive int64 size")
-        workers = (0,) if self.level == 2 else tuple(range(len(self._chip_shms)))
-        device = (
-            self._config.get("device_id", 0)
-            if self.level == 2
-            else (self._config.get("device_ids") or [self._config.get("device_id", 0)])[0]
-        )
-        with self._device_control_admission("create_buffer"):
-            if self.level == 2:
-                assert self._chip_worker is not None
-                if self._chip_worker._execution_environment[4]:
-                    raise ValueError("Host Fabric allocation requires an owned execution context")
-            resource = HostDomainResource(
-                nbytes,
-                self._burn_buffer_identity(),
-                workers,
-                self._config["platform"],
-                device,
-                host_runtime_path=self._host_runtime_path,
-                view_scope=self._host_view_scope,
-                view_control=self._control_host_view,
-            )
-            self._host_buffers[resource.identity] = resource
-            self._cleanup_journal.add_once(
-                "host-buffer", str(resource.identity), lambda: self._release_host_buffer(resource.identity)
-            )
-            try:
-                resource.allocate()
-                buffer = resource.buffer
-                assert buffer is not None
-                if self.level == 2:
-                    registry = self._ensure_chip_import_registry()
-                    registry.register_attachment(
-                        buffer.to_descriptor(),
-                        buffer.base,
-                        mapping_ref=0,
-                        profile=resource.backend.profile,
-                        access=buffer.access,
-                        live=lambda: not resource.closed and not buffer.closed,
-                    )
-                else:
-                    self._prepare_host_cpu_views(resource, workers)
-                return buffer
-            except BaseException:
-                self._release_host_buffer(resource.identity)
-                raise
 
     @contextlib.contextmanager
     def _host_view_scope(self, resource, worker, api):
@@ -13477,17 +13336,17 @@ class Worker:
                 return
             assert self._chip_worker is not None
             self._chip_worker._validate_execution_context()
+            if self._chip_worker._execution_environment[4]:
+                raise ValueError("Host registration requires an owned device context")
             registry = self._ensure_chip_import_registry()
             if unmap:
                 registry.unmap_attachment(resource.identity, reference)
             else:
-                resource.backend.authorize([resource.backend.process_identity()])
-                backing = host_backing_type(self._config["platform"])(host_runtime_path=self._host_runtime_path)
+                backing = HostRegistration(platform=self._config["platform"], runtime_path=self._host_runtime_path)
                 registry.import_device_host(
                     resource._descriptor,
                     backing,
-                    device=resource.device,
-                    exported=resource.export,
+                    device=self._config["device_id"],
                     mapping_ref=reference,
                     access=access,
                     live=lambda: not resource.closed and not resource.buffer.closed and not self._source_context_failed,
@@ -13499,7 +13358,7 @@ class Worker:
                     self._config["device_ids"][worker], len(path), reference, int(access), int(unmap), 0
                 )
                 + path
-                + resource.request()
+                + _encode_buffer_descriptor_wire(resource._descriptor)
             )
             assert self._worker is not None
             self._worker.control_payload(
@@ -13545,6 +13404,19 @@ class Worker:
         else:
             raise ValueError("mapping currently supports local L2/L3 endpoints")
         resource = self._mapping_resource(tensor)
+        if resource is None and tensor.buffer.address_space == AddressSpace.HOST:
+            with self._child_prov_lock, self._registry_lock:
+                owner = self._buffers.get(int(tensor.buffer.identity.buffer_id))
+                if owner is None or owner.to_descriptor() != tensor.buffer:
+                    raise ValueError("Host mapping requires a registered owning POSIX Buffer")
+                resource = self._host_buffers.get(owner.identity)
+                if resource is None:
+                    workers = (0,) if self.level == 2 else tuple(range(len(self._chip_shms)))
+                    resource = MappingResource(owner, workers, self._host_view_scope, self._control_host_view)
+                    self._host_buffers[owner.identity] = resource
+                    self._cleanup_journal.add_once(
+                        "host-buffer", str(owner.identity), lambda: self._release_host_buffer(owner.identity)
+                    )
         if resource is None and tensor.buffer.address_space == AddressSpace.DEVICE:
             with self._child_prov_lock, self._registry_lock:
                 resource = self._device_mappings.get(tensor.buffer.identity)
@@ -13583,12 +13455,14 @@ class Worker:
                     resource._revoked_refs.add(reference)
                     self._control_host_view(resource, worker, reference, 0, unmap=True)
                     resource._mapping_targets.pop(reference)
-            self._release_host_cpu_views(resource)
             if self._chip_import_registry is not None:
                 self._chip_import_registry.unregister(identity)
-            resource.close()
-            del self._host_buffers[identity]
-            self._cleanup_journal.discard("host-buffer", str(identity))
+            resource.closed = True
+            if self._lifecycle is _Lifecycle.CLOSED:
+                resource.buffer.close()
+                self._buffers.pop(int(identity.buffer_id), None)
+                del self._host_buffers[identity]
+                self._cleanup_journal.discard("host-buffer", str(identity))
 
     def alloc_shared_tensor(self, shapes: tuple[int, ...], dtype) -> Buffer:
         """Allocate a runtime-managed intermediate buffer (the ``Tensor`` form of ``orch.alloc``).
@@ -13786,7 +13660,6 @@ class Worker:
                 self._device_control_admission("release_buffer"),
             ):
                 self._release_host_buffer(buffer.identity)
-            return
         if not buffer.closed:
             # Exclusive, not shared: `shared()` would already exclude admission and so
             # satisfy the "never mid-callback" argument above, but this keeps the
@@ -13814,6 +13687,9 @@ class Worker:
             buffer_id = int(buffer.identity.buffer_id)
             if self._buffers.get(buffer_id) is buffer:
                 del self._buffers[buffer_id]
+            if entry is not None:
+                self._host_buffers.pop(buffer.identity, None)
+                self._cleanup_journal.discard("host-buffer", str(buffer.identity))
 
     def teardown_reports(self) -> dict[int, TeardownReport]:
         """What each reaped chip child observed about its own device teardown.
@@ -13850,6 +13726,8 @@ class Worker:
             entries = list(self._buffers.items())
         errors: list[BaseException] = []
         for buffer_id, buffer in entries:
+            if buffer.identity in self._host_buffers:
+                continue
             try:
                 buffer.close()
             except BaseException as exc:  # noqa: BLE001

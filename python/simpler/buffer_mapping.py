@@ -14,16 +14,10 @@ this module's resource and grant-registration helpers are not public APIs.
 
 from __future__ import annotations
 
-from _task_interface import _encode_buffer_descriptor_wire
-
 from .buffer import (
     AccessMode,
-    AddressSpace,
-    BackendKind,
-    Buffer,
     Tensor,
 )
-from .host_domain_backend import host_backing_type
 
 
 class MappingResource:
@@ -104,56 +98,3 @@ class MappingResource:
             and (reference in self._revoked_refs or self._mapping_targets.get(reference) != (worker, True))
         ):
             raise ValueError("Host Tensor requires a live explicit mapping for the target worker")
-
-
-class HostDomainResource(MappingResource):
-    """Worker-owned backing retained until endpoint mappings retire.
-
-    Issued references never repeat within the backing lifetime. Target routes are
-    not grants: only the target registry authorizes a selected access.
-    """
-
-    def __init__(
-        self,
-        nbytes: int,
-        identity,
-        workers,
-        platform,
-        device,
-        *,
-        view_scope,
-        view_control,
-        host_runtime_path=None,
-    ):
-        super().__init__(None, workers, view_scope, view_control, identity=identity)
-        self.nbytes = nbytes
-        self.device = device
-        self.backend = host_backing_type(platform)(host_runtime_path=host_runtime_path)
-        self.export = None
-        self._cpu_targets = set()
-
-    def allocate(self):
-        base, self.export = self.backend.allocate(self.nbytes, self.identity, self.device, max(1, len(self.workers)))
-        self.buffer = Buffer(
-            identity=self.identity,
-            address_space=AddressSpace.HOST,
-            access=AccessMode.READWRITE,
-            backend_kind=BackendKind.REMOTE_SIDECAR,
-            nbytes=self.nbytes,
-            base=base,
-        )
-        self.buffer._host_backing = self.backend
-        self._descriptor = self.buffer.to_descriptor()
-
-    def request(self) -> bytes:
-        if self.closed or self.buffer is None or self.buffer.closed or self.export is None:
-            raise RuntimeError("Host backing is not live")
-        return self.export.encode() + _encode_buffer_descriptor_wire(self._descriptor)
-
-    def close(self):
-        if self._mapping_targets or self._cpu_targets:
-            raise RuntimeError("Host owner retained: mappings remain")
-        self.closed = True
-        if self.buffer is not None:
-            self.buffer.closed = True
-        self.backend.release()

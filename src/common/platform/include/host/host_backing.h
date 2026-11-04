@@ -17,21 +17,11 @@
 #include <exception>
 #include <stdexcept>
 
-// Private same-build host API. A failed operation retains its opaque owner for
-// release retry; none of these handles or function pointers enter device PODs.
+// Private same-build platform calls. Failed cleanup retains its opaque owner.
 extern "C" {
-int host_backing_allocate(
-    void **owner, int device, uint32_t numa, uint64_t bytes, uint64_t *mapping_size, uint8_t *export_data,
-    size_t export_capacity, size_t *export_size, char *error, size_t error_capacity
-);
-int host_backing_import(
-    void **owner, int device, const uint8_t *token, size_t token_size, uint64_t mapping_size, bool device_view,
-    char *error, size_t error_capacity
-);
-int host_backing_authorize(void *owner, const int32_t *identities, size_t count, char *error, size_t error_capacity);
-int host_backing_get_base(void *owner, uint64_t *base, char *error, size_t error_capacity);
-int host_backing_release(void **owner, char *error, size_t error_capacity);
-int host_backing_process_identity(int device, int32_t *identity, char *error, size_t error_capacity);
+int host_register_memory(void **owner, int device, uint64_t host_base, uint64_t bytes, char *error, size_t capacity);
+int host_registration_base(void *owner, uint64_t *base, char *error, size_t capacity);
+int host_registration_release(void **owner, char *error, size_t capacity);
 }
 
 namespace simpler::host {
@@ -39,7 +29,6 @@ inline void check_host_backing_result(int status, const char *error) {
     if (status == 1) throw std::invalid_argument(error);
     if (status) throw std::runtime_error(error);
 }
-
 template <typename Operation>
 int call_host_backing(char *error, size_t capacity, Operation operation) noexcept {
     if (error && capacity) error[0] = '\0';
@@ -52,7 +41,7 @@ int call_host_backing(char *error, size_t capacity, Operation operation) noexcep
     } catch (const std::exception &failure) {
         if (error && capacity) std::snprintf(error, capacity, "%s", failure.what());
     } catch (...) {
-        if (error && capacity) std::snprintf(error, capacity, "%s", "Unknown Host backing failure");
+        if (error && capacity) std::snprintf(error, capacity, "Unknown Host registration failure");
     }
     return 2;
 }

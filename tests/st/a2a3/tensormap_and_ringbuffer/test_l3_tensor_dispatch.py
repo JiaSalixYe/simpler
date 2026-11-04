@@ -98,9 +98,9 @@ class TestL3TensorDispatch(SceneTestCase):
         result = False
         try:
             # torch is used only outside run(): fill inputs before, read output after.
-            a = torch.frombuffer(a_h.buffer, dtype=DTYPE, count=SIZE)
-            b = torch.frombuffer(b_h.buffer, dtype=DTYPE, count=SIZE)
-            out = torch.frombuffer(out_h.buffer, dtype=DTYPE, count=SIZE)
+            a = torch.frombuffer(a_h.shm.buf, dtype=DTYPE, count=SIZE)
+            b = torch.frombuffer(b_h.shm.buf, dtype=DTYPE, count=SIZE)
+            out = torch.frombuffer(out_h.shm.buf, dtype=DTYPE, count=SIZE)
             a.fill_(5.0)
             b.fill_(7.0)
             out.zero_()

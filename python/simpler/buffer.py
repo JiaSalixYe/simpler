@@ -1153,7 +1153,7 @@ class ImportRegistry:
 
         Zero selects native Host access (including explicit H2D at a chip endpoint);
         nonzero selects a Device address. Only confirmed direct mappings belong here.
-        The domain owns physical cleanup and revokes admission before unregistering.
+        The endpoint registry owns physical cleanup and revokes admission before unregistering.
         Neither a Tensor selector nor an unregistered descriptor can create a grant.
         """
         if isinstance(mapping_ref, bool) or not 0 <= operator.index(mapping_ref) <= 255:
@@ -1210,50 +1210,11 @@ class ImportRegistry:
             execution_environment=environment,
         )
 
-    def import_native_host(self, descriptor: BufferDescriptor, backing, *, device, exported) -> None:
-        """Own import cleanup before native side effects, publishing no partial grant."""
-        if descriptor.address_space != AddressSpace.HOST:
-            raise ValueError("native Host import requires HOST backing")
-        if descriptor.nbytes > exported.mapping_size:
-            raise ValueError("native Host import extent exceeds the exported backing")
-        for attachment in self._attachments.values():
-            if attachment.identity == descriptor.identity and attachment.descriptor != descriptor:
-                raise ValueError("one identity names one backing descriptor")
-        old = self._by_identity.get(descriptor.identity)
-        if old is not None:
-            if old.descriptor != descriptor or old.host_backing is None:
-                raise ValueError("native Host import conflicts with an existing backing")
-            if not self._attachment_is_live(old):
-                raise RuntimeError("native Host import cleanup is unconfirmed")
-            return
-        select_adapter(descriptor, self._context, confirmed_profile=backing.profile)
-        pending = ImportedBuffer(
-            descriptor.identity,
-            0,
-            descriptor.nbytes,
-            AddressSpace.HOST,
-            descriptor=descriptor,
-            host_backing=backing,
-            closing=True,
-        )
-        self._by_identity[descriptor.identity] = pending
-        try:
-            backing.import_shared(device, exported)
-            del self._by_identity[descriptor.identity]
-            self.register_native_host(descriptor, backing)
-        except BaseException as failure:
-            self._by_identity[descriptor.identity] = pending
-            try:
-                self.unregister(descriptor.identity)
-            except BaseException as cleanup:
-                raise failure from cleanup
-            raise
-
     def import_device_host(
-        self, descriptor, backing, *, device, exported, mapping_ref, access, live: Callable[[], bool] | None = None
+        self, descriptor, backing, *, device, mapping_ref, access, live: Callable[[], bool] | None = None
     ):
         """Retain device import cleanup before establishing a restricted Host view."""
-        if descriptor.address_space != AddressSpace.HOST or descriptor.nbytes > exported.mapping_size:
+        if descriptor.address_space != AddressSpace.HOST or descriptor.backend_kind != BackendKind.POSIX_SHM:
             raise ValueError("device Host import requires a covered HOST backing")
         if isinstance(mapping_ref, bool) or not 0 < operator.index(mapping_ref) <= 255:
             raise ValueError("device Host import requires a nonzero mapping reference")
@@ -1295,7 +1256,7 @@ class ImportRegistry:
         self._attachments[key] = pending
         try:
             if physical is None:
-                backing.import_device(device, exported)
+                backing.register(device, self.materialize(descriptor))
                 physical = backing
             del self._attachments[key]
             self.register_attachment(
@@ -1334,26 +1295,6 @@ class ImportRegistry:
         for source, reference in tuple(self._attachments):
             if source == identity and reference:
                 del self._attachments[(source, reference)]
-
-    def register_native_host(self, descriptor: BufferDescriptor, backing) -> None:
-        """Retain one backend-confirmed CPU import until unregister succeeds."""
-        if descriptor.address_space != AddressSpace.HOST:
-            raise ValueError("native Host import requires HOST backing")
-        old = self._by_identity.get(descriptor.identity)
-        if old is not None:
-            if old.descriptor != descriptor or old.host_backing is not backing or old.closing:
-                raise ValueError("native Host import conflicts with an existing backing")
-            return
-        self.register_attachment(
-            descriptor,
-            backing.base,
-            mapping_ref=0,
-            profile=backing.profile,
-            live=lambda: not backing.closing,
-        )
-        imported = self._attachments[(descriptor.identity, 0)]
-        imported.host_backing = backing
-        self._by_identity[descriptor.identity] = imported
 
     def _attachment_is_live(self, attachment: ImportedBuffer) -> bool:
         if (

@@ -610,7 +610,7 @@ class AdapterProfile(str, Enum):
     HOST_VMM_COPY = "HOST_VMM_COPY"
     # Process-local owner binding registered after allocation, not a region-planner
     # candidate or a GlobalDomainCommand profile. It has no wire profile id.
-    HOST_VMM_MAP = "HOST_VMM_MAP"
+    HOST_REGISTER_MAP = "HOST_REGISTER_MAP"
     DEVICE_VMM_PEER_IMPORT = "DEVICE_VMM_PEER_IMPORT"
     DEVICE_FABRIC_V2_PEER_IMPORT = "DEVICE_FABRIC_V2_PEER_IMPORT"
     REMOTE_COPY = "REMOTE_COPY"
@@ -874,6 +874,7 @@ class DefaultRegionAccessService:
         if candidate.profile in (
             AdapterProfile.HOST_VMM_COPY,
             AdapterProfile.HOST_SHM_MAP,
+            AdapterProfile.HOST_REGISTER_MAP,
             AdapterProfile.FORK_INHERITED_VA,
             AdapterProfile.DEVICE_LOCAL,
             AdapterProfile.OWNER_DEVICE_COPY,
@@ -1104,16 +1105,16 @@ def buffer_adapter_candidates(query: BufferAccessQuery) -> tuple[_AdapterCandida
             and query.same_node
             and query.runtime in ("host_build_graph", "tensormap_and_ringbuffer")
             and (
-                (profile is AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT and device and query.platform == "a2a3")
+                (
+                    profile is AdapterProfile.HOST_REGISTER_MAP
+                    and device
+                    and query.platform in ("a2a3", "a2a3sim")
+                    and query.backend_kind is BackendKind.POSIX_SHM
+                )
                 or (
                     profile is AdapterProfile.HOST_SHM_MAP
                     and query.consumer_deployment in (HOST_CPU, DEVICE_AICORE, DEVICE_AICPU)
                     and query.platform == "a2a3sim"
-                )
-                or (
-                    profile is AdapterProfile.HOST_VMM_MAP
-                    and query.consumer_deployment is HOST_CPU
-                    and query.platform == "a2a3"
                 )
             )
         )

@@ -108,12 +108,12 @@ requires matching torch/torch_npu/CANN and does not enable capture submission.
 | `free(handle)` | Releases a device `Buffer` returned by either allocation method |
 | `copy_to(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `nbytes` defaults to the rest of the host side after `src_offset`, so `copy_to(dst, src)` transfers the whole host backing |
 | `copy_from(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). Same defaulting, measured from `dst_offset` on the host side |
-| `create_buffer(nbytes) -> Buffer` | A3 L2/L3 defaults to Host NUMA VMM/Fabric; simulation and A5 ordinary allocation retain POSIX shared memory. Use `buffer.buffer` for native CPU bytes |
+| `create_buffer(nbytes) -> Buffer` | Retains ordinary POSIX shared memory; A3 device registration is lazy at map_view. Use `buffer.buffer` for native CPU bytes |
 | `map_view(tensor, *, target=None, access=AccessMode.READWRITE) -> Tensor` | Shared Host/local DEVICE mapping entry. At L2 target defaults to `device_location`; at L3 use a local next-level worker id. Returns a new restricted view without modifying the native Tensor or backing identity |
 | `unmap_view(tensor) -> None` | Revokes one issued mapping after accepted uses finish. The last Host mapping detaches its device view; DEVICE mapping revocation does not free source HBM. Cleanup failure remains closed and retryable |
-| `release_buffer(buffer)` | For the Host communication backing, pass the original Buffer returned by this Worker after all accepted uses finish. A borrowed alias cannot release it |
+| `release_buffer(buffer)` | For the Host backing, pass the original Buffer returned by this Worker after all accepted uses finish. A borrowed alias cannot release it |
 | `Buffer.buffer` | Native CPU memoryview over the logical Host bytes, read-only for READ backing; retained native exports and their derived views prevent physical release |
-| `Buffer.close()` | Revokes new use of that handle and releases directly owned storage. A Host communication Buffer borrows its physical allocation: use `release_buffer` at L2/L3 after mappings and accepted uses retire |
+| `Buffer.close()` | Revokes new use of that handle and releases directly owned storage. Use `release_buffer` after mappings and accepted uses retire |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
 
 A partial update names the **whole allocation plus an offset** — `copy_to(dev, src,
@@ -123,11 +123,10 @@ Both offsets are bounded together with the length against the *registered* exten
 cannot walk a legal-looking length past the end.
 
 `AccessMode`, `AddressSpace` and `TensorTransfer` are available from
-`simpler.task_interface`. A3 Host creation supports local L2/L3 with an initialized,
-owned execution context. Logical byte sizes need not be multiples of 64; the
-backend rounds physical allocation internally. Explicit Host communication on A5
-and cross-node Host creation are not implemented here. Direct simulator Host
-qualification uses its shared-memory correctness backend.
+`simpler.task_interface`. Host creation retains ordinary POSIX semantics. A3
+L2/L3 device mapping requires a supported initialized execution context; A5 and
+cross-node Host mapping are outside this implementation. Simulation validates
+mapping semantics without hardware registration.
 
 Build the native Tensor from the Buffer, then call `map_view` for the intended
 device endpoint and use `TensorTransfer.NONE`. Allocation preserves native CPU access
@@ -148,8 +147,7 @@ does not revive revoked Tensors. Mapping lifetime is independent of domains.
 CPU pointer writes bypass scheduling checks and require
 caller-established completion and exclusion of concurrent use.
 
-The A3 default allocator changes in this experiment; migrate POSIX-specific
-`.shm.buf` callers to `.buffer`. Other allocation APIs remain available. Use matching
+Allocation behavior is unchanged; use matching
 Python and native builds. A runtime without the required private Host
 import/cleanup support rejects that operation explicitly. L2 mapping does not create a synthetic domain.
 See the [Host mechanism and lifetime guide](../../a3-host-domain.md)

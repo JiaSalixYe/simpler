@@ -131,7 +131,7 @@ def _reject_device_args(args: object, *, kind: str, worker=None) -> None:
     """
     if not isinstance(args, TaskArgs):
         return
-    from .buffer import AddressSpace, BackendKind  # noqa: PLC0415
+    from .buffer import AddressSpace  # noqa: PLC0415
 
     for i in range(args.tensor_count()):
         desc = args.tensor(i).buffer
@@ -140,11 +140,6 @@ def _reject_device_args(args: object, *, kind: str, worker=None) -> None:
                 f"{kind}: argument {i} is a DEVICE-space tensor ({desc.backend_kind.name}); a Python "
                 f"sub-worker runs on the host and can only take HOST-space tensors"
             )
-        if worker is not None and desc.backend_kind == BackendKind.REMOTE_SIDECAR:
-            resource = worker._mapping_resource(args.tensor(i))
-            if resource is None:
-                raise ValueError("Host CPU argument requires a live owned backing")
-            resource._check_source(args.tensor(i))
 
 
 def _remote_data_eligible_worker_ids(
@@ -713,7 +708,7 @@ class Orchestrator:
         ):
             return self._copy_domain_locked(handle, rank, data, buffer, offset, writing=writing)
 
-    def _copy_domain_locked(self, handle, rank, data, buffer, offset, *, writing):  # noqa: PLR0912 -- keep staging and its ordered cleanup in one transaction
+    def _copy_domain_locked(self, handle, rank, data, buffer, offset, *, writing):
         assert self._worker is not None
         if not handle.borrowed:
             if handle._ref is None or handle._ref.owner_instance_id != self._worker._owner_instance_id:
@@ -744,22 +739,19 @@ class Orchestrator:
             host = self._worker.create_buffer(size)
             try:
                 if writing:
-                    host.buffer[:size] = data
+                    host.shm.buf[:size] = data
                 for device, device_offset, host_offset, count in ranges:
                     if writing:
                         self.copy_to(device, host, dst_offset=device_offset, src_offset=host_offset, nbytes=count)
                     else:
                         self.copy_from(host, device, dst_offset=host_offset, src_offset=device_offset, nbytes=count)
-                return None if writing else bytes(host.buffer[:size])
+                return None if writing else bytes(host.shm.buf[:size])
             finally:
                 # Control copies have finished and this private staging buffer was never submitted.
-                if host.identity in self._worker._host_buffers:
-                    self._worker._release_host_buffer(host.identity)
-                else:
-                    host.close()
-                    self._worker._release_import_recursive(host.identity)
-                    with self._worker._registry_lock:
-                        self._worker._buffers.pop(int(host.identity.buffer_id), None)
+                host.close()
+                self._worker._release_import_recursive(host.identity)
+                with self._worker._registry_lock:
+                    self._worker._buffers.pop(int(host.identity.buffer_id), None)
 
     def create_worker_chip_region(self, *, worker_id: int, payload_bytes: int, counter_bytes: int):
         """Create an L3-L2 communication region on one NEXT_LEVEL chip worker."""

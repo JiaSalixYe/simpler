@@ -14,42 +14,26 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <utility>
-#include <vector>
 
 #include "host/host_backing.h"
 #include "runtime_module.h"
 
 namespace simpler::host {
-
-int query_host_backing_identity(const RuntimeModule &module, int device = -1);
-
-class HostBackingOwner {
+class HostRegistration {
 public:
-    explicit HostBackingOwner(const std::string &runtime_path);
-    ~HostBackingOwner();
-    HostBackingOwner(const HostBackingOwner &) = delete;
-    HostBackingOwner &operator=(const HostBackingOwner &) = delete;
-
-    std::pair<uint64_t, std::vector<uint8_t>> allocate(int device, uint32_t numa, uint64_t bytes);
-    void import_shared(int device, const std::vector<uint8_t> &token, uint64_t size, bool device_view = false);
-    uint64_t acquire_export(uint64_t bytes);
-    void release_export() noexcept { --exports_; }
-    void authorize(const std::vector<int32_t> &identities);
-    void require_mapping_support() const;
+    explicit HostRegistration(const std::string &runtime_path);
+    ~HostRegistration();
+    HostRegistration(const HostRegistration &) = delete;
+    HostRegistration &operator=(const HostRegistration &) = delete;
+    void register_memory(int device, uint64_t host_base, uint64_t bytes);
     uint64_t base() const;
     void release();
-    int process_identity(int device = -1) const;
 
 private:
     std::shared_ptr<RuntimeModule> module_;
-    void *owner_{nullptr};
-    uint64_t size_ = 0;
-    bool device_view_ = false;
-    size_t exports_ = 0;
-    decltype(&host_backing_allocate) allocate_;
-    decltype(&host_backing_authorize) authorize_;
-    decltype(&host_backing_get_base) base_;
-    decltype(&host_backing_release) release_;
+    void *owner_ = nullptr;
+    decltype(&host_register_memory) register_;
+    decltype(&host_registration_base) base_;
+    decltype(&host_registration_release) release_;
 };
 }  // namespace simpler::host

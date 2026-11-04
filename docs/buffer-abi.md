@@ -28,7 +28,7 @@ forget it on.
 
 | Type | What it is | Where it lives |
 | ---- | ---------- | -------------- |
-| **`Buffer`** | An owned backing (Host VMM/Fabric / POSIX shm / fork-COW / device malloc) with a canonical identity + lifecycle. Stays with the Worker that created it. | owner side (L3+) |
+| **`Buffer`** | An owned backing (POSIX shm / fork-COW / device malloc) with a canonical identity + lifecycle. Stays with the Worker that created it. | owner side (L3+) |
 | **`Tensor`** | A **self-describing task argument**: the full buffer descriptor embedded + a strided view `(byte_offset, shapes, strides, dtype)`. The wire element of `TaskArgs`. Carries no materialized address. | `simpler.task_interface` (public import) |
 | **`ChipTensor`** | A task argument as it arrives at the chip runtime: a resolved address plus a strided view, and nothing else. Exists **only** at the L2 device-runtime boundary. | L2 leaf |
 | **`simpler::{hbg,tmr}::Tensor`** | One runtime's working form — a `ChipTensor`'s geometry plus what that runtime decided about it (producing task, overlap version, dependency treatment, derived caches). `Runtime::set_orch_args` adopts each argument into it, on the host. | inside one runtime |
@@ -267,17 +267,15 @@ type change rather than a silently wrong address.
 ## Allocating buffers
 
 ```python
-h  = worker.create_buffer(nbytes)                 # shared Host buffer; A3 defaults to VMM/Fabric
+h  = worker.create_buffer(nbytes)                 # ordinary shared Host buffer
 h  = worker.alloc_shared_tensor((M, N), dtype)    # kind3: shape-sized create_buffer
 # inside an orch fn, for device (chip-private) memory:
 d  = orch.alloc_child_tensor(worker, (M, N), dtype)  # kind4: DEVICE_MALLOC on that chip
 ```
 
-`create_buffer` on A3 L2/L3 returns a VMM/Fabric Host Buffer. Native CPU imports
-are prepared through explicit control and retained by the existing ImportRegistry;
-NPU consumption requires explicit mapping. Other ordinary backends retain POSIX
-map-once resolution. Logical extent and backing identity are independent of the
-physical allocation alignment;
+`create_buffer` retains POSIX backing and CPU map-once resolution. Explicit A3
+mapping registers the target process's local Host address for device access;
+registration and its shared-memory import stay live until unmap succeeds.
 `alloc_shared_tensor` returns a runtime-managed intermediate over a FORK_SHM ring
 VA. `alloc_child_tensor` allocates device memory on a specific next-level worker
 and wraps the pointer; its `.base` is the device pointer (the `orch.copy_to`
@@ -429,7 +427,7 @@ gates, or keys on it.
 | `FORK_COW` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork plain host buffer: copy-on-write, so **READ only** |
 | `VMM_WINDOW` | the device VA of the window carved by `allocate_domain`, no map | exactly 8 bytes, a non-zero u64 LE base | communication-domain window / buffer |
 | `DEVICE_MALLOC` | the device pointer, no map (chip-local) | exactly 8 bytes, a non-zero u64 LE base | `alloc_child_tensor` |
-| `REMOTE_SIDECAR` | an explicit endpoint attachment or remote transport binding | empty | A3 Host VMM/Fabric references and remote L3 arguments; generic descriptor-only mapping is refused |
+| `REMOTE_SIDECAR` | an explicit endpoint attachment or remote transport binding | empty | remote L3 arguments; generic descriptor-only mapping is refused |
 
 **The body rule is enforced, not advisory.** `backend_kind` is what selects how a
 consumer reads `body`, so a body that does not fit that reading is not a smaller

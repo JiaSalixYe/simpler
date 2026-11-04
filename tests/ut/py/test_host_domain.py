@@ -9,7 +9,6 @@
 
 
 import os
-import threading
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -21,8 +20,6 @@ from simpler.buffer import (
     AccessMode,
     AddressSpace,
     BackendKind,
-    Buffer,
-    CanonicalIdentity,
     ImportContext,
     ImportRegistry,
     create_host_shared_buffer,
@@ -77,7 +74,7 @@ def direct_worker(monkeypatch):
 
 @pytest.fixture
 def direct_host(direct_worker):
-    buffer = direct_worker._create_host_buffer(128)
+    buffer = direct_worker.create_buffer(128)
     native = buffer.tensor((16,), DataType.FLOAT32)
     try:
         yield direct_worker, buffer, native
@@ -89,11 +86,11 @@ def direct_host(direct_worker):
             resource.closed = buffer.closed = False
             for reference in tuple(resource._mapping_targets):
                 direct_worker.unmap_view(native._with_mapping_ref(reference))
-            direct_worker.release_buffer(buffer)
+        direct_worker.release_buffer(buffer)
 
 
 def test_host_maps_local_endpoints_without_domain(host_worker):
-    buffers = [host_worker._create_host_buffer(128) for _ in range(2)]
+    buffers = [host_worker.create_buffer(128) for _ in range(2)]
     for buffer in buffers:
         native = buffer.tensor((16,), DataType.FLOAT32)
         views = [host_worker.map_view(native, target=worker, access=AccessMode.READ) for worker in range(2)]
@@ -111,7 +108,7 @@ def test_host_maps_local_endpoints_without_domain(host_worker):
     assert not host_worker._live_domains
 
 
-def test_a3_l4_create_buffer_preserves_existing_allocator(direct_worker, monkeypatch):
+def test_create_buffer_uses_existing_allocator(direct_worker, monkeypatch):
     direct_worker.level = 4
     direct_worker._config["platform"] = "a2a3"
     allocate = Mock(return_value=object())
@@ -122,91 +119,12 @@ def test_a3_l4_create_buffer_preserves_existing_allocator(direct_worker, monkeyp
 
 @pytest.mark.parametrize("target", [None, True, -1, 2, "0"])
 def test_host_map_rejects_invalid_local_endpoint(host_worker, target):
-    buffer = host_worker._create_host_buffer(128)
+    buffer = host_worker.create_buffer(128)
     try:
         with pytest.raises(ValueError, match="target"):
             host_worker.map_view(buffer.tensor((16,), DataType.FLOAT32), target=target)
     finally:
         host_worker.release_buffer(buffer)
-
-
-def test_parent_cpu_import_queries_actual_pids_before_authorization(monkeypatch):
-    worker = Worker(level=3, platform="a2a3sim", device_ids=[12, 13], num_sub_workers=0)
-    worker._config["platform"] = "a2a3"
-    worker._host_runtime_path = "/test/runtime.so"
-    worker._sub_shms = [object()]
-    events = []
-    resource = SimpleNamespace(device=12, backend=MagicMock(), _cpu_targets=set(), request=lambda: b"export")
-    resource.backend.authorize.side_effect = lambda pids: events.append(("authorize", pids))
-
-    def control(kind, member, command, payload, _timeout):
-        assert command == worker_module._CTRL_HOST_CPU
-        device, path_size = worker_module._HOST_CPU_REQUEST.unpack_from(payload)
-        path_end = worker_module._HOST_CPU_REQUEST.size + path_size
-        assert payload[worker_module._HOST_CPU_REQUEST.size : path_end] == b"/test/runtime.so"
-        query = len(payload) == path_end
-        events.append(("query" if query else "import", kind, member, device))
-        if not query:
-            assert ("authorize", [3101, 3100, 3200]) in events
-            assert payload[path_end:] == b"export"
-        return worker_module._HOST_CPU_REQUEST.pack(
-            3100 + member if kind == worker_module.WorkerType.NEXT_LEVEL else 3200, path_size
-        )
-
-    worker._worker = MagicMock(control_payload=control)
-    try:
-        worker._prepare_host_cpu_views(resource, (1, 0))
-        assert events[:3] == [
-            ("query", worker_module.WorkerType.NEXT_LEVEL, 1, 13),
-            ("query", worker_module.WorkerType.NEXT_LEVEL, 0, 12),
-            ("query", worker_module.WorkerType.SUB, 0, 12),
-        ]
-        assert events[3] == ("authorize", [3101, 3100, 3200])
-        assert all(event[0] == "import" for event in events[4:])
-        assert resource._cpu_targets == {
-            (worker_module.WorkerType.NEXT_LEVEL, 1),
-            (worker_module.WorkerType.NEXT_LEVEL, 0),
-            (worker_module.WorkerType.SUB, 0),
-        }
-    finally:
-        worker._worker = None
-        worker._sub_shms = []
-        worker.close()
-
-
-def test_host_release_is_serialized_and_removes_cleanup_debt(direct_worker, monkeypatch):
-    from simpler.buffer import buffer_reference  # noqa: PLC0415
-
-    worker = direct_worker
-    buffer = worker._create_host_buffer(128)
-    resource = worker._host_buffers[buffer.identity]
-    release = Mock(wraps=resource.backend.release)
-    monkeypatch.setattr(resource.backend, "release", release)
-    with pytest.raises(ValueError, match="original owning"):
-        worker.release_buffer(buffer_reference(buffer.to_descriptor()))
-    assert not buffer.closed
-    gate, lock, errors = threading.Barrier(2), threading.Lock(), []
-
-    def synchronized(_worker):
-        gate.wait(timeout=5)
-        return lock
-
-    monkeypatch.setattr(worker, "_child_prov_worker_lock", synchronized)
-
-    def close():
-        try:
-            worker._release_host_buffer(buffer.identity)
-        except BaseException as error:
-            errors.append(error)
-
-    threads = [threading.Thread(target=close) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=10)
-    assert not any(thread.is_alive() for thread in threads)
-    assert not errors and worker._cleanup_journal.empty
-    release.assert_called_once()
 
 
 def test_map_view_issues_only_requested_record(direct_host):
@@ -231,7 +149,10 @@ def test_unmap_preserves_native_and_remap_never_revives_old_reference(direct_hos
     worker, buffer, native = direct_host
     first = worker.map_view(native, access=AccessMode.READ)
     worker.unmap_view(first)
-    assert not buffer.closed and worker._chip_import_registry.resolve_tensor(native).base == buffer.base
+    assert not buffer.closed
+    buffer.buffer[:4] = b"live"
+    imported = worker._chip_import_registry.resolve_tensor(native)
+    assert bytes(imported.shm.buf[:4]) == b"live"
     with pytest.raises(ValueError, match="no granted attachment"):
         worker._chip_import_registry.resolve_tensor(first)
     second = worker.map_view(native, access=AccessMode.READ)
@@ -281,9 +202,9 @@ def test_unmap_failure_revokes_and_retains_cleanup_until_retry(direct_host, monk
 @pytest.mark.parametrize("unmap", [False, True])
 def test_host_view_lost_reply_keeps_revoked_route_and_blocks_reuse(direct_host, monkeypatch, unmap):
     worker, buffer, native = direct_host
+    first = worker.map_view(native)
     resource = worker._host_buffers[buffer.identity]
     original = resource._view_control
-    first = worker.map_view(native)
 
     def lost_reply(*args, **kwargs):
         original(*args, **kwargs)
@@ -317,6 +238,7 @@ def test_unmap_refuses_inflight_before_revocation(direct_host):
 
 def test_mapping_reference_exhaustion_does_not_reuse_retired_ids(direct_host):
     worker, buffer, native = direct_host
+    worker.map_view(native)
     worker._host_buffers[buffer.identity]._next_reference = 254
     for reference in range(254, 256):
         mapped = worker.map_view(native)
@@ -338,29 +260,12 @@ def test_mapped_record_rejects_closed_owner_or_unconfirmed_completion(direct_hos
         worker._chip_import_registry.resolve_tensor(mapped)
 
 
-def test_host_allocation_rejects_borrowed_context_before_side_effects(direct_worker):
-    worker = direct_worker
-    worker._chip_worker._execution_environment = (os.getpid(), 1, 1, 0, True)
-    with pytest.raises(ValueError, match="owned execution context"):
-        worker._create_host_buffer(128)
-    worker._chip_worker.comm_init.assert_not_called()
-    assert not worker._host_buffers
-
-
 _REFS = {AccessMode.READWRITE: 1, AccessMode.READ: 2, AccessMode.WRITE: 3}
 
 
 @pytest.fixture
 def mapping():
-    identity = CanonicalIdentity(mint_owner_instance_id(), 1, 1)
-    buffer = Buffer(
-        identity=identity,
-        address_space=AddressSpace.HOST,
-        access=AccessMode.READWRITE,
-        backend_kind=BackendKind.REMOTE_SIDECAR,
-        nbytes=64,
-        base=4096,
-    )
+    buffer = create_host_shared_buffer(64, mint_owner_instance_id(), 1)
     environment = (os.getpid(), 1, 1, 0, False)
     registry = ImportRegistry(
         ImportContext(
@@ -377,10 +282,14 @@ def mapping():
             8192,
             mapping_ref=_REFS[access],
             access=access,
-            profile=AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT,
+            profile=AdapterProfile.HOST_REGISTER_MAP,
             live=lambda: True,
         )
-    return buffer, registry
+    try:
+        yield buffer, registry
+    finally:
+        registry.close()
+        buffer.close()
 
 
 @pytest.mark.parametrize(
@@ -425,7 +334,7 @@ def test_mapping_rejects_grant_and_descriptor_changes(mapping):
             8192,
             mapping_ref=_REFS[AccessMode.READ],
             access=AccessMode.READWRITE,
-            profile=AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT,
+            profile=AdapterProfile.HOST_REGISTER_MAP,
             live=lambda: True,
         )
     forged = replace(buffer, nbytes=128).tensor((16,), DataType.FLOAT32)._with_mapping_ref(_REFS[AccessMode.READ])
@@ -474,7 +383,7 @@ def test_attachment_cannot_widen_source_grant(mapping):
             8192,
             mapping_ref=5,
             access=AccessMode.READWRITE,
-            profile=AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT,
+            profile=AdapterProfile.HOST_REGISTER_MAP,
             live=lambda: True,
         )
 
@@ -482,13 +391,7 @@ def test_attachment_cannot_widen_source_grant(mapping):
 def test_close_attachment_revokes_only_its_record_and_cannot_be_registered_again(mapping):
     buffer, registry = mapping
     native = buffer.tensor((16,), DataType.FLOAT32)
-    registry.register_attachment(
-        buffer.to_descriptor(),
-        4096,
-        mapping_ref=0,
-        profile=AdapterProfile.HOST_VMM_MAP,
-        live=lambda: True,
-    )
+    native_import = registry.materialize(buffer.to_descriptor())
     read = native._with_mapping_ref(_REFS[AccessMode.READ])
     write = native._with_mapping_ref(_REFS[AccessMode.WRITE])
     registry.close_attachment(buffer.identity, read.mapping_ref)
@@ -503,13 +406,13 @@ def test_close_attachment_revokes_only_its_record_and_cannot_be_registered_again
             8192,
             mapping_ref=read.mapping_ref,
             access=AccessMode.READ,
-            profile=AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT,
+            profile=AdapterProfile.HOST_REGISTER_MAP,
             live=lambda: True,
         )
     registry.close_attachment(buffer.identity, write.mapping_ref)
     registry.close_attachment(buffer.identity, _REFS[AccessMode.READWRITE])
     assert not registry.has_active_attachments(buffer.identity)
-    assert registry.resolve_tensor(native).base == 4096
+    assert registry.resolve_tensor(native) is native_import
     registry.unregister(buffer.identity)
     assert not registry.has_active_attachments(buffer.identity)
     with pytest.raises(ValueError, match="no granted attachment"):
@@ -526,7 +429,7 @@ def test_mapping_rejects_changed_target_environment(mapping, index):
         buffer.to_descriptor(),
         8192,
         mapping_ref=1,
-        profile=AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT,
+        profile=AdapterProfile.HOST_REGISTER_MAP,
         live=lambda: True,
     )
     view = buffer.tensor((16,), DataType.FLOAT32)._with_mapping_ref(1)
@@ -558,7 +461,7 @@ def test_mapping_registration_requires_current_target_environment(mapping, conte
             buffer.to_descriptor(),
             8192,
             mapping_ref=1,
-            profile=AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT,
+            profile=AdapterProfile.HOST_REGISTER_MAP,
             live=lambda: True,
         )
 
@@ -566,15 +469,13 @@ def test_mapping_registration_requires_current_target_environment(mapping, conte
 @pytest.mark.parametrize(
     "profile,deployment,platform,supported",
     [
-        (AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT, DEVICE_AICPU, "a2a3", True),
-        (AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT, DEVICE_AICORE, "a2a3", True),
+        (AdapterProfile.HOST_REGISTER_MAP, DEVICE_AICPU, "a2a3", True),
+        (AdapterProfile.HOST_REGISTER_MAP, DEVICE_AICORE, "a2a3", True),
         (AdapterProfile.HOST_SHM_MAP, DEVICE_AICPU, "a2a3sim", True),
         (AdapterProfile.HOST_SHM_MAP, HOST_CPU, "a2a3sim", True),
-        (AdapterProfile.HOST_VMM_MAP, HOST_CPU, "a2a3", True),
-        (AdapterProfile.HOST_VMM_MAP, DEVICE_AICPU, "a2a3", False),
-        (AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT, HOST_CPU, "a2a3", False),
-        (AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT, DEVICE_AICPU, "a5", False),
-        (AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT, DEVICE_AICPU, "a2a3sim", False),
+        (AdapterProfile.HOST_REGISTER_MAP, HOST_CPU, "a2a3", False),
+        (AdapterProfile.HOST_REGISTER_MAP, DEVICE_AICPU, "a5", False),
+        (AdapterProfile.HOST_REGISTER_MAP, DEVICE_AICPU, "a2a3sim", True),
         (AdapterProfile.HOST_SHM_MAP, DEVICE_AICPU, "a2a3", False),
         (AdapterProfile.REMOTE_COPY, DEVICE_AICPU, "a2a3", False),
         (AdapterProfile.DEVICE_LOCAL, DEVICE_AICPU, "a2a3", False),
@@ -602,15 +503,15 @@ def test_confirmed_host_adapter_uses_platform_and_consumer_policy(mapping, profi
 )
 def test_confirmed_profile_cannot_bypass_default_service_by_stripping_diagnostic(query_changes):
     query = BufferAccessQuery(
-        BackendKind.REMOTE_SIDECAR,
+        BackendKind.POSIX_SHM,
         DEVICE_AICPU,
         same_node=True,
         platform="a2a3",
         runtime="tensormap_and_ringbuffer",
-        confirmed_profile=AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT,
+        confirmed_profile=AdapterProfile.HOST_REGISTER_MAP,
         source_address_space=AddressSpace.HOST,
     )
-    candidate = _AdapterCandidate(AdapterKind.DIRECT_MAP, AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT)
+    candidate = _AdapterCandidate(AdapterKind.DIRECT_MAP, AdapterProfile.HOST_REGISTER_MAP)
     decision = DefaultRegionAccessService().evaluate_buffer_access(replace(query, **query_changes), candidate)
     assert not decision.supported
 
@@ -641,7 +542,7 @@ class TestExplicitMappedTensor:
                 backing.to_descriptor(),
                 0x8000,
                 mapping_ref=1,
-                profile=AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT,
+                profile=AdapterProfile.HOST_REGISTER_MAP,
                 live=lambda: True,
             )
             args = TaskArgs()
@@ -713,7 +614,7 @@ def test_chip_import_cleanup_requires_confirmed_native_lane_close():
 
 
 def test_worker_close_unmaps_remaining_local_views(host_worker):
-    buffer = host_worker._create_host_buffer(128)
+    buffer = host_worker.create_buffer(128)
     native = buffer.tensor((16,), DataType.FLOAT32)
     mapped = host_worker.map_view(native, target=1)
     resource = host_worker._host_buffers[buffer.identity]

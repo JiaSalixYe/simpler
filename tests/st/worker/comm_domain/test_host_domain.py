@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Worker-owned Host Fabric mappings for L2/L3, MTE and PTO SDMA."""
+"""Worker-owned Host mappings for L2/L3, MTE and PTO SDMA."""
 
 import ctypes
 import struct
@@ -40,19 +40,7 @@ HOST_RUNTIMES = (
 )
 
 
-def require_a3_host_fabric(platform):
-    if platform == "a2a3":
-        acl = ctypes.CDLL("libascendcl.so")
-        acl.aclrtGetSocName.restype = ctypes.c_char_p
-        soc = acl.aclrtGetSocName()
-        assert soc is not None, "aclrtGetSocName failed"
-        if soc.startswith(b"Ascend910B"):
-            pytest.skip(f"A3 Host Fabric is not qualified on {soc.decode()}")
-
-
 def create_host_buffer(worker, nbytes):
-    if worker._config["platform"].endswith("sim"):
-        return worker._create_host_buffer(nbytes)
     return worker.create_buffer(nbytes)
 
 
@@ -147,7 +135,6 @@ def test_host_domain_two_chip_transfer(st_platform, st_device_ids, engine, host_
     domains = []
     try:
         worker.init()
-        require_a3_host_fabric(st_platform)
         results = [worker.create_buffer(SIZE) for _ in range(2)]
         host = create_host_buffer(worker, SIZE * 3)
         mapped_views = []
@@ -240,7 +227,6 @@ def test_host_domain_release_after_accepted_tasks(st_platform, st_device_ids, ru
     saved = []
     try:
         worker.init()
-        require_a3_host_fabric(st_platform)
         outputs = [worker.create_buffer(SIZE) for _ in range(2)]
         host = create_host_buffer(worker, SIZE)
         host.buffer[:] = struct.pack(f"<{N}f", *([7.0] * N))
@@ -303,7 +289,6 @@ def test_device_selected_bf16_rows(st_platform, st_device_ids, runtime):
     saved = []
     try:
         worker.init()
-        require_a3_host_fabric(st_platform)
         ids = [worker.create_buffer(6 * 4) for _ in range(2)]
         results = [worker.create_buffer(output_size) for _ in range(2)]
         host = create_host_buffer(worker, table_size)
@@ -360,12 +345,11 @@ def test_device_selected_bf16_rows(st_platform, st_device_ids, runtime):
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.device_count(1)
-def test_direct_host_fabric_two_live_buffers(st_platform, st_device_ids):
+def test_direct_host_two_live_buffers(st_platform, st_device_ids):
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
     chip = worker.register(build_chip_callable(st_platform, RUNTIME))
     try:
         worker.init()
-        require_a3_host_fabric(st_platform)
         sources = [create_host_buffer(worker, SIZE) for _ in range(2)]
         result = worker.create_buffer(SIZE)
         for iteration, source in enumerate(sources):
@@ -431,7 +415,6 @@ def test_direct_host_native_control_and_mapped_data(st_platform, st_device_ids):
     count, offset = 64 * 64, 64
     try:
         worker.init()
-        require_a3_host_fabric(st_platform)
         source = create_host_buffer(worker, offset + count * 4)
         native = source.tensor((1,), DataType.INT32)
         mapped = worker.map_view(source.tensor((64, 64), DataType.FLOAT32, byte_offset=offset), access=AccessMode.READ)
@@ -504,7 +487,6 @@ def test_direct_host_mapped_writeback(st_platform, st_device_ids, runtime, acces
     offset, extent = 64, count * 4
     try:
         worker.init()
-        require_a3_host_fabric(st_platform)
         source = worker.create_buffer(extent)
         target = create_host_buffer(worker, extent + 128)
         ctypes.memset(target.base, 0xA5, extent + 128)
