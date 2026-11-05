@@ -5382,7 +5382,9 @@ def _exit_after_host_log_flush(status: int) -> NoReturn:
     os._exit(status)
 
 
-def _forked_child_main(buf: memoryview, label: str, setup, serve, make_group_leader: bool = False) -> None:
+def _forked_child_main(
+    buf: memoryview, label: str, setup, serve, make_group_leader: bool = False, *, close_on_cancel=None
+) -> None:
     """Run a forked child to completion, always terminating via ``os._exit``.
 
     ``setup()`` runs the child's fallible init and returns an opaque context;
@@ -5395,10 +5397,11 @@ def _forked_child_main(buf: memoryview, label: str, setup, serve, make_group_lea
     with one ``killpg``; deeper descendants inherit the group and do not set
     their own. During ``setup`` a SIGTERM is a cooperative cancel: it raises
     ``_StartupCancelled``, which unwinds ``setup`` (recursively tearing down any
-    grandchildren and their nested shms) before the child exits. Once the setup
-    frame has returned or unwound, SIGTERM terminates directly instead of
-    injecting another Python exception into readiness publication or failure
-    handling.
+    grandchildren and their nested shms) before the child exits. A next-level
+    child keeps the startup handler until the parent acknowledges READY.
+    Cancellation after successful setup requests mailbox shutdown. On the
+    failure path SIGTERM terminates directly without interrupting publication
+    with another Python exception.
 
     Load-bearing invariant: a forked child must NEVER let an exception unwind
     back into the forked copy of the parent's ``_start_hierarchical`` frames.
@@ -5415,11 +5418,17 @@ def _forked_child_main(buf: memoryview, label: str, setup, serve, make_group_lea
                 os.setpgid(0, 0)
 
         state_addr = _buffer_field_addr(buf, _OFF_STATE)
+        shutdown_addr = _buffer_field_addr(buf, _OFF_SHUTDOWN)
+        parent_pid = os.getppid()
         setup_active = True
+        ready_for_shutdown = False
 
         def _on_cancel(_signum, _frame):
             # Make cancellation one-shot so setup unwinding cannot be interrupted again.
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            if ready_for_shutdown:
+                _mailbox_store_i32(shutdown_addr, _SHUTDOWN_REQUESTED)
+                return
             if setup_active:
                 raise _StartupCancelled()
             os._exit(1)
@@ -5431,22 +5440,35 @@ def _forked_child_main(buf: memoryview, label: str, setup, serve, make_group_lea
                 # setup may recursively fork a complete lower-level subtree.
                 # Starting here keeps every C++ writer behind the final fork.
                 _start_host_log_writer()
+                ready_for_shutdown = close_on_cancel is not None
             finally:
                 setup_active = False
         except _StartupCancelled:
-            # Parent cancelled us mid-init; setup() already unwound its own subtree.
+            # Setup can be interrupted after the inner Worker has committed READY.
+            if close_on_cancel is not None:
+                with contextlib.suppress(BaseException):
+                    close_on_cancel()
             _tb.print_exc()
         except BaseException as e:  # noqa: BLE001
             _tb.print_exc()
             _write_error(buf, 1, _format_exc(f"{label} init", e))
             _mailbox_store_i32(state_addr, _INIT_FAILED)
         else:
-            # Serving is torn down via the SHUTDOWN mailbox state, not the cancel signal.
+            _mailbox_store_i32(state_addr, _INIT_READY)
+            if ready_for_shutdown:
+                while (
+                    _mailbox_load_i32(state_addr) == _INIT_READY
+                    and _mailbox_load_i32(shutdown_addr) != _SHUTDOWN_REQUESTED
+                ):
+                    if os.getppid() != parent_pid:
+                        _mailbox_store_i32(shutdown_addr, _SHUTDOWN_REQUESTED)
+                        break
+                    _sleep(_STARTUP_POLL_INTERVAL_S)
             # signal.signal returns None when the prior handler was not installed from
             # Python (e.g. a C library / host default); restore SIG_DFL in that case so
             # the round-trip does not raise TypeError.
-            signal.signal(signal.SIGTERM, prev_term if prev_term is not None else signal.SIG_DFL)
-            _mailbox_store_i32(state_addr, _INIT_READY)
+            if _mailbox_load_i32(shutdown_addr) != _SHUTDOWN_REQUESTED:
+                signal.signal(signal.SIGTERM, prev_term if prev_term is not None else signal.SIG_DFL)
             try:
                 serve(ctx)
             except BaseException:  # noqa: BLE001
@@ -9680,6 +9702,7 @@ class Worker:
                         path,
                     ),
                     make_group_leader=self._is_startup_root,
+                    close_on_cancel=inner_worker.close,
                 )
             else:
                 self._next_level_pids.append(pid)
@@ -9788,8 +9811,9 @@ class Worker:
                 addr = _buffer_field_addr(buf, _OFF_STATE)
                 state = _mailbox_load_i32(addr)
                 if state == _INIT_READY:
-                    _mailbox_store_i32(addr, _IDLE)
+                    # Acknowledgement releases the child's startup SIGTERM handler.
                     self._startup_ready_pids.add(pids[i])
+                    _mailbox_store_i32(addr, _IDLE)
                     continue
                 if state == _INIT_FAILED:
                     raise RuntimeError(f"{kind} worker {i} (pid {pids[i]}) failed during init: {_read_error_msg(buf)}")

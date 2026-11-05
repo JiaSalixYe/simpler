@@ -31,6 +31,7 @@ instead of hanging CI.
 
 import math
 import os
+import signal
 import struct
 import threading
 import time
@@ -438,6 +439,50 @@ class TestNextLevelStartupFailure:
             assert w4._next_level_pids == []
         finally:
             allow_failure.set()
+            w4.close()
+
+    def test_sibling_ready_after_rollback_scan_still_closes(self, monkeypatch):
+        allow_ready, closed = Event(), Event()
+        good = _l3_child()
+        bad = _l3_child()
+        init, close = good.init, good.close
+
+        def delayed_init(**kwargs):
+            assert allow_ready.wait(_TEST_WALL_BUDGET_S)
+            init(**kwargs)
+
+        def observed_close():
+            close()
+            closed.set()
+
+        good.init, good.close = delayed_init, observed_close
+        bad.init = _init_raises
+        w4 = Worker(level=4, num_sub_workers=0, startup_timeout_s=_DEADLINE_AFTER_WATCHDOG_S)
+        w4.register(_trivial_orch)
+        w4.add_worker(good)
+        w4.add_worker(bad)
+        kill = os.kill
+        parent_pid = os.getpid()
+
+        def release_before_sigterm(pid, sig):
+            if os.getpid() == parent_pid and sig == signal.SIGTERM and pid == w4._next_level_pids[0]:
+                addr = worker_mod._buffer_field_addr(w4._next_level_shms[0].buf, worker_mod._OFF_STATE)
+                assert worker_mod._mailbox_load_i32(addr) == worker_mod._IDLE
+                allow_ready.set()
+                deadline = time.monotonic() + 3.0
+                while worker_mod._mailbox_load_i32(addr) != worker_mod._INIT_READY:
+                    assert time.monotonic() < deadline, "healthy sibling did not publish READY"
+                    time.sleep(0.001)
+            return kill(pid, sig)
+
+        monkeypatch.setattr(os, "kill", release_before_sigterm)
+        try:
+            with _hard_timeout(_TEST_WALL_BUDGET_S):
+                with pytest.raises(RuntimeError, match="injected inner init failure"):
+                    w4.init()
+            assert closed.is_set(), "the healthy sibling skipped close() after READY"
+        finally:
+            allow_ready.set()
             w4.close()
 
     def test_second_child_failure_reaps_first(self, monkeypatch):
