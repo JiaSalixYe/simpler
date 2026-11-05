@@ -230,8 +230,9 @@ class TestNextLevelStartupFailure:
         finally:
             buf.release()
 
-    def test_sigterm_during_setup_unwinds_before_child_exit(self, monkeypatch):
-        """Cooperative cancellation lets setup release its resources before exit."""
+    @pytest.mark.parametrize("cancel_at_publication", [False, True], ids=["during-setup", "before-ready"])
+    def test_sigterm_before_ready_unwinds_before_child_exit(self, monkeypatch, cancel_at_publication):
+        """Cancellation before READY closes the inner worker without publishing READY."""
         import simpler.worker as worker_mod  # noqa: PLC0415
 
         class ExitCalled(BaseException):
@@ -247,17 +248,29 @@ class TestNextLevelStartupFailure:
 
         setup_events = []
 
-        def cancel_during_setup():
+        def cancel():
+            handlers[worker_mod.signal.SIGTERM](worker_mod.signal.SIGTERM, None)
+
+        def setup():
             try:
-                handlers[worker_mod.signal.SIGTERM](worker_mod.signal.SIGTERM, None)
+                if not cancel_at_publication:
+                    cancel()
             finally:
-                setup_events.append("unwound")
+                setup_events.append("setup exited")
+
+        store = worker_mod._mailbox_store_i32
+
+        def store_with_cancel(addr, value):
+            if cancel_at_publication and value == worker_mod._INIT_READY:
+                cancel()
+            store(addr, value)
 
         def record_exit(code):
             raise ExitCalled(code)
 
         monkeypatch.setattr(worker_mod.signal, "signal", install_handler)
         monkeypatch.setattr(worker_mod.os, "_exit", record_exit)
+        monkeypatch.setattr(worker_mod, "_mailbox_store_i32", store_with_cancel)
 
         buf = memoryview(bytearray(worker_mod.MAILBOX_FRAME_SIZE))
         try:
@@ -265,11 +278,14 @@ class TestNextLevelStartupFailure:
                 worker_mod._forked_child_main(
                     buf,
                     "next_level worker 1",
-                    cancel_during_setup,
+                    setup,
                     lambda _ctx: setup_events.append("served"),
+                    close_on_cancel=lambda: setup_events.append("closed"),
                 )
             assert exit_info.value.code == 1
-            assert setup_events == ["unwound"]
+            assert setup_events == ["setup exited", "closed"]
+            state_addr = worker_mod._buffer_field_addr(buf, worker_mod._OFF_STATE)
+            assert worker_mod._mailbox_load_i32(state_addr) == worker_mod._IDLE
             assert handlers[worker_mod.signal.SIGTERM] == worker_mod.signal.SIG_IGN
         finally:
             buf.release()
@@ -483,6 +499,67 @@ class TestNextLevelStartupFailure:
             assert closed.is_set(), "the healthy sibling skipped close() after READY"
         finally:
             allow_ready.set()
+            w4.close()
+
+    @pytest.mark.parametrize("parent_exits", [False, True], ids=["no-sleep", "parent-exit"])
+    def test_next_level_ready_handoff(self, monkeypatch, parent_exits):
+        waiting, slept, serving, closed = Event(), Event(), Event(), Event()
+        parent_pid = os.getpid()
+        w4 = Worker(level=4, num_sub_workers=0)
+        inner = _l3_child()
+        w4.register(_trivial_orch)
+        w4.add_worker(inner)
+        load, sleep, getppid = worker_mod._mailbox_load_i32, worker_mod._sleep, os.getppid
+        await_ready, serve, close = Worker._await_children_ready, worker_mod._run_mailbox_loop, inner.close
+        waiting_on_ack = in_serve = False
+
+        def observe_ready(addr):
+            nonlocal waiting_on_ack
+            state = load(addr)
+            if state == worker_mod._INIT_READY and not waiting_on_ack and os.getpid() != parent_pid:
+                outer_addr = worker_mod._buffer_field_addr(w4._next_level_shms[0].buf, worker_mod._OFF_STATE)
+                if addr == outer_addr:
+                    waiting_on_ack = True
+                    waiting.set()
+            return state
+
+        def observe_sleep(seconds):
+            if waiting_on_ack and not in_serve:
+                slept.set()
+            sleep(seconds)
+
+        def await_after_child_polls(self, shms, pids, kind, deadline):
+            if self is w4 and kind == "next_level":
+                assert waiting.wait(_TEST_WALL_BUDGET_S)
+            return await_ready(self, shms, pids, kind, deadline)
+
+        def enter_serve(*args, **kwargs):
+            nonlocal in_serve
+            if waiting_on_ack:
+                in_serve = True
+                serving.set()
+            return serve(*args, **kwargs)
+
+        def observe_close():
+            close()
+            closed.set()
+
+        inner.close = observe_close
+        monkeypatch.setattr(worker_mod, "_mailbox_load_i32", observe_ready)
+        monkeypatch.setattr(worker_mod, "_sleep", observe_sleep)
+        monkeypatch.setattr(Worker, "_await_children_ready", await_after_child_polls)
+        monkeypatch.setattr(worker_mod, "_run_mailbox_loop", enter_serve)
+        # Reparent only after ACK, at the handoff into the real serve loop.
+        monkeypatch.setattr(os, "getppid", lambda: parent_pid + 1 if parent_exits and in_serve else getppid())
+        try:
+            with _hard_timeout(_TEST_WALL_BUDGET_S):
+                w4.init()
+                assert serving.wait(3)
+                if parent_exits:
+                    assert closed.wait(3), "the child missed reparenting at the READY handoff"
+                else:
+                    assert not slept.is_set(), "the child slept while waiting for READY acknowledgement"
+        finally:
             w4.close()
 
     def test_second_child_failure_reaps_first(self, monkeypatch):

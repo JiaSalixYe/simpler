@@ -2661,6 +2661,7 @@ def _run_mailbox_loop(
     handle_task,
     handle_control,
     on_shutdown=None,
+    parent_pid: int | None = None,
 ) -> None:
     """The mailbox state machine every forked child runs.
 
@@ -2688,14 +2689,15 @@ def _run_mailbox_loop(
     A parent that dies without sending SHUTDOWN (SIGKILL from a timeout, an OOM
     kill, a cancelled CI job) would otherwise leave this loop polling a mailbox
     nobody writes to, for the lifetime of the machine. The loop therefore
-    samples its own parent and leaves by the SHUTDOWN path once it changes.
+    checks the original parent PID and leaves by the SHUTDOWN path once it
+    changes. Next-level children carry that PID across the startup handshake.
 
     Termination is read from the sticky ``_OFF_SHUTDOWN`` word as well as the
     state word: the ``_CONTROL_DONE`` this loop publishes for an in-flight
     control command overwrites a concurrent ``_SHUTDOWN`` store, and only the
     sticky word survives that.
     """
-    parent_pid = os.getppid()
+    parent_pid = os.getppid() if parent_pid is None else parent_pid
     liveness_countdown = _PARENT_LIVENESS_POLL_INTERVAL
     shutdown_addr = _buffer_field_addr(buf, _OFF_SHUTDOWN)
     mailbox_addr = _buffer_field_addr(buf, 0)
@@ -2784,7 +2786,7 @@ def _run_mailbox_loop(
                 liveness_countdown -= 1
                 if liveness_countdown <= 0:
                     liveness_countdown = _PARENT_LIVENESS_POLL_INTERVAL
-                    # Comparing against the pid captured at entry rather than
+                    # Comparing against the original parent pid rather than
                     # testing for pid 1: a subreaper (container init, systemd
                     # user session) adopts orphans instead of init, so the pid
                     # changes but never becomes 1. A live parent's pid cannot
@@ -4518,6 +4520,8 @@ def _child_worker_loop(
     inner_worker: Worker,
     global_node: _GlobalNodeRuntime | None = None,
     control_path: str | None = None,
+    *,
+    parent_pid: int,
 ) -> None:
     """Runs in forked child process. Any-level Worker as child of its parent.
 
@@ -4631,12 +4635,15 @@ def _child_worker_loop(
             return 1, _format_exc(f"child_worker level={inner_worker.level} {op}", e)
         return 0, ""
 
+    if os.getppid() != parent_pid:
+        _request_child_shutdown(buf)
     _run_mailbox_loop(
         buf,
         state_addr,
         handle_task=handle_task,
         handle_control=handle_control,
         on_shutdown=inner_worker.close,
+        parent_pid=parent_pid,
     )
 
 
@@ -5383,7 +5390,14 @@ def _exit_after_host_log_flush(status: int) -> NoReturn:
 
 
 def _forked_child_main(
-    buf: memoryview, label: str, setup, serve, make_group_leader: bool = False, *, close_on_cancel=None
+    buf: memoryview,
+    label: str,
+    setup,
+    serve,
+    make_group_leader: bool = False,
+    *,
+    close_on_cancel=None,
+    parent_pid: int | None = None,
 ) -> None:
     """Run a forked child to completion, always terminating via ``os._exit``.
 
@@ -5399,7 +5413,7 @@ def _forked_child_main(
     ``_StartupCancelled``, which unwinds ``setup`` (recursively tearing down any
     grandchildren and their nested shms) before the child exits. A next-level
     child keeps the startup handler until the parent acknowledges READY.
-    Cancellation after successful setup requests mailbox shutdown. On the
+    Cancellation while waiting for acknowledgement requests mailbox shutdown. On the
     failure path SIGTERM terminates directly without interrupting publication
     with another Python exception.
 
@@ -5419,7 +5433,7 @@ def _forked_child_main(
 
         state_addr = _buffer_field_addr(buf, _OFF_STATE)
         shutdown_addr = _buffer_field_addr(buf, _OFF_SHUTDOWN)
-        parent_pid = os.getppid()
+        parent_pid = os.getppid() if parent_pid is None else parent_pid
         setup_active = True
         ready_for_shutdown = False
 
@@ -5440,7 +5454,9 @@ def _forked_child_main(
                 # setup may recursively fork a complete lower-level subtree.
                 # Starting here keeps every C++ writer behind the final fork.
                 _start_host_log_writer()
-                ready_for_shutdown = close_on_cancel is not None
+                if close_on_cancel is not None:
+                    _mailbox_store_i32(state_addr, _INIT_READY)
+                    ready_for_shutdown = True
             finally:
                 setup_active = False
         except _StartupCancelled:
@@ -5454,7 +5470,6 @@ def _forked_child_main(
             _write_error(buf, 1, _format_exc(f"{label} init", e))
             _mailbox_store_i32(state_addr, _INIT_FAILED)
         else:
-            _mailbox_store_i32(state_addr, _INIT_READY)
             if ready_for_shutdown:
                 while (
                     _mailbox_load_i32(state_addr) == _INIT_READY
@@ -5463,12 +5478,13 @@ def _forked_child_main(
                     if os.getppid() != parent_pid:
                         _mailbox_store_i32(shutdown_addr, _SHUTDOWN_REQUESTED)
                         break
-                    _sleep(_STARTUP_POLL_INTERVAL_S)
             # signal.signal returns None when the prior handler was not installed from
             # Python (e.g. a C library / host default); restore SIG_DFL in that case so
             # the round-trip does not raise TypeError.
-            if _mailbox_load_i32(shutdown_addr) != _SHUTDOWN_REQUESTED:
+            if not ready_for_shutdown or _mailbox_load_i32(shutdown_addr) != _SHUTDOWN_REQUESTED:
                 signal.signal(signal.SIGTERM, prev_term if prev_term is not None else signal.SIG_DFL)
+            if not ready_for_shutdown:
+                _mailbox_store_i32(state_addr, _INIT_READY)
             try:
                 serve(ctx)
             except BaseException:  # noqa: BLE001
@@ -9650,6 +9666,7 @@ class Worker:
         # allocator share one reverse-binding.
         for inner_worker in self._next_level_workers:
             inner_worker._freeze_subtree_device_endpoint_identities()
+        parent_pid = os.getpid()
         for idx, inner_worker in enumerate(self._next_level_workers):
             worker_id = self._next_level_worker_ids[idx]
             global_node = global_nodes.get(worker_id)
@@ -9700,9 +9717,11 @@ class Worker:
                         inner,
                         node,
                         path,
+                        parent_pid=parent_pid,
                     ),
                     make_group_leader=self._is_startup_root,
                     close_on_cancel=inner_worker.close,
+                    parent_pid=parent_pid,
                 )
             else:
                 self._next_level_pids.append(pid)
@@ -9793,8 +9812,8 @@ class Worker:
 
         Polls each child's mailbox: INIT_READY resets the slot to _IDLE (so the
         C++ dispatch state machine resumes from the canonical "ready for work"
-        state), records the pid as having reached its serve loop, and retires
-        it; INIT_FAILED surfaces the child's own error; ``waitpid(WNOHANG)``
+        state), records the pid as ready, and retires it; INIT_FAILED surfaces
+        the child's own error; ``waitpid(WNOHANG)``
         catches a child that died before signalling (recording the reaped pid so
         rollback never re-SIGKILLs a possibly-reused PID). ``deadline`` is the
         single startup-epoch deadline shared by every child group and every
@@ -9892,9 +9911,8 @@ class Worker:
         # A next-level child may have published INIT_READY in the window between
         # the barrier last polling it and aborting on a failing sibling — its
         # mailbox still reads INIT_READY (only the barrier resets it to IDLE).
-        # Promote it to READY so it is torn down gracefully (SHUTDOWN unlinks its
-        # own nested shms) rather than cooperatively cancelled after it has
-        # already restored the default SIGTERM disposition.
+        # Prefer mailbox SHUTDOWN for these children. Their startup SIGTERM
+        # handler remains installed until the barrier acknowledges READY.
         for idx, pid in enumerate(self._next_level_pids):
             if pid in reaped or pid in self._startup_ready_pids:
                 continue
