@@ -1712,6 +1712,30 @@ class _SharedMemoryOwner:
         return shm
 
 
+class _HostWindowOwner(_SharedMemoryOwner):
+    """Retain failed Host backing cleanup until a later Worker.close()."""
+
+    def close(self) -> None:
+        def release(slot: _OwnedSharedMemorySlot) -> None:
+            shm = slot.shm
+            if shm is None:
+                return
+            if slot.owns_name:
+                name = shm._name  # noqa: SLF001 -- tracker keys use the POSIX name
+                resource_tracker.register(name, "shared_memory")
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    resource_tracker.unregister(name, "shared_memory")
+                slot.owns_name = False
+            _release_owned_shm_buffer(slot)
+            _close_owned_shm_mmap(slot)
+            _close_owned_shm_fd(slot)
+            slot.shm = None
+
+        _raise_first(release, self._slots[: self._attempted])
+
+
 def _remember_cleanup_error(first_error: BaseException | None, exc: BaseException) -> BaseException:
     return exc if first_error is None else first_error
 
@@ -10692,7 +10716,7 @@ class Worker:
             self._use_domain(handle)
             return handle
 
-    def _allocate_domain(  # noqa: PLR0912 -- linear input-validation + per-chip shm staging + dispatch + reply unpack; splitting obscures the fail-fast ordering
+    def _allocate_domain(  # noqa: PLR0912, PLR0915 -- linear staging, dispatch, reply unpack and rollback
         self,
         *,
         name: str,
@@ -10722,7 +10746,7 @@ class Worker:
         # per-chip reply shm.  We let the chip child write back its own slot.
         buffer_count = len(buffers)
         req_size = _DOMAIN_REQ_HEADER.size + buffer_count * 8 + len(workers) * 4
-        host_owner = _SharedMemoryOwner(len(workers)) if memory_source == AddressSpace.HOST else None
+        host_owner = _HostWindowOwner(len(workers)) if memory_source == AddressSpace.HOST else None
         req_size += _CTRL_SHM_NAME_BYTES if host_owner is not None else 0
         reply_size = _DOMAIN_REPLY_HEADER.size + buffer_count * 8
         # Precompute worker → dense rank for O(1) lookup in the staging /
@@ -10875,8 +10899,9 @@ class Worker:
                         resources.live_domains.pop(name)
                     resources.requires_ordered_cleanup = previous_ordered_cleanup
                 if host_owner is not None and (not dispatch_started or (handle is not None and not handle.workers)):
-                    cleanup_error = _close_unlink_shms(host_owner)
-                    if cleanup_error is not None:
+                    try:
+                        self._rollback_host_windows(allocation_id, host_owner)
+                    except BaseException as cleanup_error:
                         raise allocation_error from cleanup_error
                 raise
             assert handle is not None
@@ -10904,6 +10929,14 @@ class Worker:
         )
         assert handle is not None and published_handle is handle
         return handle
+
+    def _rollback_host_windows(self, allocation_id: int, owner: _HostWindowOwner) -> None:
+        try:
+            owner.close()
+        except BaseException:
+            with self._hierarchical_start_cv:
+                self._cleanup_journal.add_once("host-domain-backing", str(allocation_id), owner.close)
+            raise
 
     def _release_domain_handle(self, handle: CommDomainHandle, resources: _RunResources) -> None:
         """Mark a handle for release.  Actual backend free is deferred.
@@ -11103,6 +11136,7 @@ class Worker:
                 failure = self._domain_free_results[handle.allocation_id]
                 if failure is not None:
                     raise failure
+                self._close_domain_host_windows(handle)
                 return
             # Absence means no backend attempt has been claimed. Once the
             # isolated target is admitted it publishes a conservative outcome
@@ -11138,6 +11172,7 @@ class Worker:
                 raise result.error
             if not result.completed:
                 raise RuntimeError("CommDomain backend release did not publish an outcome")
+            self._close_domain_host_windows(handle)
 
     def _release_domain_claimed(self, handle: CommDomainHandle) -> None:
         """Drive CTRL_RELEASE_DOMAIN. Caller holds this allocation's claim."""
@@ -11176,8 +11211,6 @@ class Worker:
                 allocation_id=handle.allocation_id,
             )
 
-            self._close_domain_host_windows(handle)
-
         def retire_live_handle() -> None:
             if self._live_domains.get(handle.name) is handle:
                 self._live_domains.pop(handle.name)
@@ -11194,13 +11227,20 @@ class Worker:
         owner = getattr(handle, "_host_window_owner", None)
         if owner is None:
             return
-        for mapping in handle._host_mappings:
-            mapping.close()
-        handle._host_mappings.clear()
-        cleanup_error = _close_unlink_shms(owner)
-        if cleanup_error is not None:
-            raise cleanup_error
-        handle._host_window_owner = None
+
+        def close() -> None:
+            for mapping in handle._host_mappings:
+                mapping.close()
+            handle._host_mappings.clear()
+            owner.close()
+            handle._host_window_owner = None
+
+        result = _IsolatedCallResult()
+        _run_isolated_call(result, close, name_prefix="host-domain-close-")
+        if result.error is not None:
+            raise result.error
+        if not result.completed:
+            raise RuntimeError("Host domain backing cleanup did not publish an outcome")
 
     def _dispatch_control_domain(
         self,
@@ -12257,7 +12297,10 @@ class Worker:
                 self._free_domain_after_fence(handle)
             except BaseException:
                 self._defer_domain_retirement(handle)
-                if resources is not None:
+                if resources is not None or (
+                    getattr(handle, "_host_window_owner", None) is not None
+                    and self._domain_free_results.get(handle.allocation_id, False) is None
+                ):
                     raise
             if live_domains.get(handle.name) is handle:
                 live_domains.pop(handle.name)

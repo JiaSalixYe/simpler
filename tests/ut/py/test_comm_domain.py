@@ -1374,3 +1374,49 @@ def test_a3_host_domain_reclaims_owned_backing_after_lost_reply(domain_worker, m
         with pytest.raises(RuntimeError, match="killed by signal"):
             worker.close()
     assert all(not backing_exists(name) for name in names)
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+def test_a3_host_domain_retries_only_failed_unlink_on_close(domain_worker, monkeypatch):
+    worker, members = domain_worker
+    monkeypatch.setitem(worker._config, "platform", "a2a3")
+    monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
+    released = []
+
+    def dispatch(*, workers, request_shms, reply_shms, op, allocation_id):
+        if op == "release":
+            released.extend(workers)
+            return
+        for chip in workers:
+            reply = reply_shms[chip].buf
+            worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply, 0, 1, 0xC0, 0x1000, 4096, 1)
+            struct.pack_into("<Q", reply, worker_mod._DOMAIN_REPLY_HEADER.size, 0x1000)
+
+    monkeypatch.setattr(worker, "_dispatch_control_domain", dispatch)
+    domains = []
+    request = _request(members, memory_source=AddressSpace.HOST)
+    worker.run(lambda orch, _args, _cfg: domains.append(orch.allocate_domain(**request)))
+    domain = domains[0]
+    names = [domain.member(rank).buffers["payload"].shm.name for rank in range(2)]
+    calls = []
+    unlink = shared_memory.SharedMemory.unlink
+
+    def unlink_once_fails(shm):
+        if shm.name in names:
+            calls.append(shm.name)
+            if shm.name == names[0] and calls.count(shm.name) == 1:
+                raise PermissionError("injected Host unlink failure")
+        unlink(shm)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(shared_memory.SharedMemory, "unlink", unlink_once_fails)
+        with pytest.raises(PermissionError, match="injected Host unlink failure"):
+            worker.close()
+        assert calls == names
+        worker.close()
+        assert calls == [*names, names[0]]
+    assert released == members
+    assert domain.freed
+    for name in names:
+        with pytest.raises(FileNotFoundError):
+            getattr(shared_memory, "_posixshmem").shm_open(f"/{name}", os.O_RDONLY, 0)
