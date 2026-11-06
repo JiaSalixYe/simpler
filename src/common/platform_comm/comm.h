@@ -37,6 +37,21 @@ extern "C" {
 
 typedef struct CommHandle_ *CommHandle;
 
+// Allocation capability. The per-callable CCU binding is passed in the run context.
+enum { COMM_DOMAIN_WORKSPACE_CCU = 1u << 3 };
+
+typedef struct CommCcuModuleEntry {
+    const void *binary;
+    size_t binary_size;
+    const char *symbol;
+} CommCcuModuleEntry;
+
+int comm_prepare_ccu(
+    CommHandle h, uint64_t allocation_id, const char *prefix, const CommCcuModuleEntry *entries, size_t count,
+    uint64_t *binding
+);
+int comm_rollback_ccu(CommHandle h, uint64_t allocation_id, const char *prefix);
+
 // Domain allocation failures that callers can distinguish from generic ACL errors.
 typedef enum CommDomainStatus {
     COMM_DOMAIN_WORKSPACE_UNSUPPORTED = -2,

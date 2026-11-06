@@ -430,6 +430,12 @@ public:
         uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
         size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr
     );
+    uint64_t comm_prepare_ccu(
+        uint64_t comm_handle, uint64_t allocation_id, const std::string &prefix,
+        const std::vector<std::pair<std::string, std::string>> &entries
+    );
+    void comm_rollback_ccu(uint64_t comm_handle, uint64_t allocation_id, const std::string &prefix);
+
     /// Pair to `comm_alloc_domain_windows`: collectively free the per-rank
     /// pool and the device CommContext, then drop the allocation record.
     /// `rank_count` + `domain_rank` size the subset barrier; the rank list
@@ -624,6 +630,9 @@ private:
     using CommGetLocalWindowBaseFn = int (*)(void *, uint64_t *);
     using CommGetWindowSizeFn = int (*)(void *, size_t *);
     using CommDeriveContextFn = int (*)(void *, const uint32_t *, size_t, uint32_t, size_t, size_t, uint64_t *);
+    using CommPrepareCcuFn =
+        int (*)(CommHandle, uint64_t, const char *, const CommCcuModuleEntry *, size_t, uint64_t *);
+    using CommRollbackCcuFn = int (*)(CommHandle, uint64_t, const char *);
     using CommAllocDomainWindowsFn = int (*)(
         void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, uint64_t *, uint64_t *, size_t *
     );
@@ -765,6 +774,8 @@ private:
     CommGetLocalWindowBaseFn comm_get_local_window_base_fn_ = nullptr;
     CommGetWindowSizeFn comm_get_window_size_fn_ = nullptr;
     CommDeriveContextFn comm_derive_context_fn_ = nullptr;
+    CommPrepareCcuFn comm_prepare_ccu_fn_ = nullptr;
+    CommRollbackCcuFn comm_rollback_ccu_fn_ = nullptr;
     CommAllocDomainWindowsFn comm_alloc_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_abort_domain_windows_fn_ = nullptr;

@@ -71,6 +71,7 @@ def _require_handle(
     kind: str,
     worker: Any = None,
     expected_namespace: str | None = None,
+    allow_ccu: bool = False,
 ) -> tuple[bytes, str, str, tuple[int, ...]]:
     """Validate a submit argument is a registered CallableHandle.
 
@@ -89,6 +90,8 @@ def _require_handle(
         raise TypeError(f"{kind} expects a CallableHandle returned by Worker.register")
     if worker is not None:
         state = worker._resolve_handle(callable_or_handle, expected_namespace=expected_namespace)
+        if state.target_namespace == "LOCAL_CHIP" and state.target.ccu_function_count and not allow_ccu:
+            raise ValueError("CCU callables require ccu_domain on submit_next_level_group")
         return state.digest, state.kind, state.target_namespace, state.eligible_worker_ids
     if expected_namespace is not None and callable_or_handle.target_namespace != expected_namespace:
         raise TypeError(
@@ -372,6 +375,7 @@ class Orchestrator:
         config: CallConfig | None = None,
         *,
         workers: list,
+        ccu_domain: CommDomainRef | None = None,
     ) -> TaskHandle:
         """Submit a group of NEXT_LEVEL tasks (N TaskArgs → N worker selections, 1 DAG node).
 
@@ -382,6 +386,10 @@ class Orchestrator:
         ``workers[i]`` executes only ``args_list[i]``. A single worker id remains
         directed and is never silently widened to the whole group.
         Returns one opaque ``TaskHandle`` for the group DAG node.
+
+        CCU callables require ``ccu_domain`` and both local domain workers.
+        Prepare the binding before the first submit if this run submits a
+        producer first.
         """
         cfg = config if config is not None else CallConfig()
         worker_ids = [_require_next_level_worker_id(value, argument="workers entries") for value in workers]
@@ -415,6 +423,7 @@ class Orchestrator:
             kind="orch.submit_next_level_group",
             worker=self._worker,
             expected_namespace=expected_namespace,
+            allow_ccu=ccu_domain is not None,
         )
         if target_namespace != "REMOTE_TASK_DISPATCHER" and self._worker is not None:
             for worker_id in worker_ids:
@@ -453,6 +462,11 @@ class Orchestrator:
         # must be live on that member's exact submitted target.
         # Run this fallible analysis before publishing remote-ref ownership.
         worker = self._worker
+        if ccu_domain is not None:
+            if worker is None:
+                raise ValueError("ccu_domain requires an L3 Worker")
+            allocation_id = worker._prepare_ccu_group(callable_handle, ccu_domain, worker_ids)
+            cfg = cfg._with_ccu_domain(allocation_id + 1)
         member_checks: list[tuple[int, TaskArgs]] = []
         if worker is not None:
             for g, c_args in enumerate(c_args_list):
@@ -546,9 +560,10 @@ class Orchestrator:
         ``workers`` is the legacy L3 spelling; it cannot be combined with ``members``.
         Retained domains survive successful runs until explicit release or Worker.close().
         Domains provide synchronous mapped-window communication by default.
-        On A5, workspace_engines adds asynchronous resources from sdma/urma/rdma.
+        On A5, workspace_engines selects sdma, urma, rdma or ccu.
         SDMA and URMA may share a domain. RDMA requires a separate domain with
         its own low-address window. Explicit selection is limited to L3 A5.
+        CCU requires two ranks and the tensormap_and_ringbuffer runtime.
         """
         if (members is None) == (workers is None):
             raise TypeError("provide exactly one of members or legacy workers")
@@ -595,6 +610,12 @@ class Orchestrator:
             reuse=reuse,
             workspace_engines=workspace_engines,
         )
+
+    def prepare_ccu(self, callable_handle: CallableHandle, ccu_domain: CommDomainRef) -> None:
+        """Prepare a callable's CCU programs for both ranks before the first task submit."""
+        if self._worker is None:
+            raise ValueError("prepare_ccu requires an L3 Worker")
+        self._worker._prepare_ccu_group(callable_handle, ccu_domain)
 
     def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:
         """Look up an owned domain by name or ref, or borrow an already-granted domain by ref."""

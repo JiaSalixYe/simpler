@@ -39,14 +39,20 @@ if(NOT ASCENDCL_LIBRARY OR NOT RUNTIME_LIBRARY OR NOT HCOMM_LIBRARY OR NOT HCCL_
     message(FATAL_ERROR "CANN ascendcl/runtime/hcomm/hccl/c_sec libraries were not found below ASCEND_HOME_PATH")
 endif()
 add_library(ccu_broadcast_session SHARED host/ccu_session.cpp)
-target_compile_features(ccu_broadcast_session PRIVATE cxx_std_17)
-target_compile_options(ccu_broadcast_session PRIVATE -Wall -Wextra)
-target_include_directories(ccu_broadcast_session PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../../../src/common")
-target_link_options(ccu_broadcast_session PRIVATE -Wl,--no-undefined)
-target_include_directories(ccu_broadcast_session SYSTEM PRIVATE
-    ${ACL_INCLUDE} ${HCCL_INCLUDE} ${CCU_INCLUDE}
-    "${HCCL_INCLUDE}/hccl" "${CCU_INCLUDE}/hcomm" "${CCU_INCLUDE}/hcomm/ccu"
-    "${CANN_ROOT}/pkg_inc/hcomm/ccu" "${CANN_ROOT}/include/experiment" "${CANN_ROOT}/include/experiment/runtime")
-target_link_libraries(ccu_broadcast_session PRIVATE
-    -Wl,--no-as-needed ${ASCENDCL_LIBRARY} ${RUNTIME_LIBRARY} ${HCOMM_LIBRARY}
-    ${HCCL_LIBRARY} ${SECUREC_LIBRARY} -Wl,--as-needed dl pthread)
+add_library(ccu_broadcast_builder SHARED host/ccu_broadcast_builder.cpp)
+target_include_directories(ccu_broadcast_builder PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/../../../../src/a5/platform/onboard/host")
+
+foreach(target IN ITEMS ccu_broadcast_session ccu_broadcast_builder)
+    target_compile_features(${target} PRIVATE cxx_std_17)
+    target_compile_options(${target} PRIVATE -Wall -Wextra)
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../../../src/common")
+    target_link_options(${target} PRIVATE -Wl,--no-undefined)
+    target_include_directories(${target} SYSTEM PRIVATE
+        ${ACL_INCLUDE} ${HCCL_INCLUDE} ${CCU_INCLUDE}
+        "${HCCL_INCLUDE}/hccl" "${CCU_INCLUDE}/hcomm" "${CCU_INCLUDE}/hcomm/ccu"
+        "${CANN_ROOT}/pkg_inc/hcomm/ccu" "${CANN_ROOT}/include/experiment" "${CANN_ROOT}/include/experiment/runtime")
+    target_link_libraries(${target} PRIVATE
+        -Wl,--no-as-needed ${ASCENDCL_LIBRARY} ${RUNTIME_LIBRARY} ${HCOMM_LIBRARY}
+        ${HCCL_LIBRARY} ${SECUREC_LIBRARY} -Wl,--as-needed dl pthread)
+endforeach()

@@ -1609,6 +1609,7 @@ public:
             caller_stream(std::exchange(other.caller_stream, nullptr)),
             recording(other.recording),
             resources_owned(std::exchange(other.resources_owned, false)),
+            ccu_service_acquired(std::exchange(other.ccu_service_acquired, false)),
             aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
             joinable_boundary(other.joinable_boundary),
             join(other.join),
@@ -1656,6 +1657,7 @@ public:
         rtStream_t caller_stream{nullptr};
         bool recording{false};
         bool resources_owned{false};
+        bool ccu_service_acquired{false};
         bool aicore_retirement_attempted{false};
         /**
          * Whether this run constructs a whole-operator completion boundary: an

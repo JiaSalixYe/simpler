@@ -1534,12 +1534,19 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
             }
             if (poll.state == CompletionPollState::READY) {
                 cond.satisfied = true;
-                cond.retire();
+                if (cond.completion_type != COMPLETION_TYPE_CCU_REQUEST) cond.retire();
                 entry.waiting_completion_count--;
             }
         }
 
         if (entry.normal_done && entry.waiting_completion_count <= 0) {
+            // CCU slots are reusable only after both the request and the
+            // AIV task have finished. Release the slot before task fanout.
+            for (int32_t c = 0; c < entry.condition_count; ++c) {
+                if (entry.conditions[c].completion_type == COMPLETION_TYPE_CCU_REQUEST) {
+                    entry.conditions[c].retire();
+                }
+            }
 #if SIMPLER_SCHED_PROFILING
             sched->on_task_complete(*entry.slot_state, thread_idx);
 #else

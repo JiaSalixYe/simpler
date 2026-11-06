@@ -16,6 +16,7 @@
 #include <cstdint>
 
 #include "aicpu/platform_regs.h"
+#include "backend/ccu/ccu_completion_scheduler.h"
 #include "backend/rdma/rdma_completion_scheduler.h"
 #include "backend/sdma/sdma_completion_scheduler.h"
 #include "backend/urma/urma_completion_scheduler.h"
@@ -97,12 +98,24 @@ inline void rdma_event_handle_retire_op(CompletionCondition &cond) {
     pto2::rdma_backend::retire_rdma_event_handle(cond.addr, cond.backend_cookie);
 }
 
+inline CompletionPollResult ccu_request_poll_op(const CompletionCondition &cond) {
+    if (cond.engine != ASYNC_ENGINE_CCU) {
+        return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
+    }
+    return pto2::ccu_backend::poll_request(cond.addr, cond.backend_cookie);
+}
+
+inline void ccu_request_retire_op(CompletionCondition &cond) {
+    pto2::ccu_backend::retire_request(cond.addr, cond.backend_cookie);
+}
+
 inline const CompletionBackendOps *completion_backend_ops_for(int completion_type) {
     static const CompletionBackendOps kOps[] = {
         {counter_poll_op, counter_retire_op},                      // COMPLETION_TYPE_COUNTER = 0
         {sdma_event_record_poll_op, sdma_event_record_retire_op},  // COMPLETION_TYPE_SDMA_EVENT_RECORD = 1
         {urma_event_handle_poll_op, urma_event_handle_retire_op},  // COMPLETION_TYPE_URMA_EVENT_HANDLE = 2
         {rdma_event_handle_poll_op, rdma_event_handle_retire_op},  // COMPLETION_TYPE_RDMA_EVENT_HANDLE = 3
+        {ccu_request_poll_op, ccu_request_retire_op},              // COMPLETION_TYPE_CCU_REQUEST = 4
     };
     constexpr int kOpsCount = static_cast<int>(sizeof(kOps) / sizeof(kOps[0]));
     if (completion_type < 0 || completion_type >= kOpsCount) return nullptr;

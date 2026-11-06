@@ -383,7 +383,9 @@ _CFG_FMT = struct.Struct("=iiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "
 # Tensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
 # SIGBUS on strict-alignment platforms (aarch64 atomics, some ARM cores).
 _PIPELINE_LEASE_FMT = struct.Struct("=IIQ")
-_OFF_PIPELINE_LEASE = (_OFF_CONFIG + _CFG_FMT.size + 7) & ~7
+_CCU_CFG_FMT = struct.Struct("=QQ")
+_OFF_CCU_CONFIG = _OFF_CONFIG + _CFG_FMT.size
+_OFF_PIPELINE_LEASE = (_OFF_CCU_CONFIG + _CCU_CFG_FMT.size + 7) & ~7
 _OFF_ARGS = (_OFF_PIPELINE_LEASE + _PIPELINE_LEASE_FMT.size + 7) & ~7
 assert _OFF_ARGS % 8 == 0, "_OFF_ARGS must be 8-aligned for Tensor.data"
 _OFF_TASK_CALLABLE_HASH = _OFF_ARGS
@@ -398,7 +400,7 @@ _DISPOSITION_NONE = 0
 _VALIDATED_ONLY = 1
 _NATIVE_PREPARED = 2
 _TASK_ACCEPTED = 1
-_TASK_PROTOCOL_VERSION = 7
+_TASK_PROTOCOL_VERSION = 8
 
 # A request frame's own header: which run-state entry this payload belongs to,
 # that entry's generation, and this frame's generation — which the child echoes
@@ -898,6 +900,10 @@ _CTRL_OP_NAMES[_CTRL_DEVICE_MEMORY_INFO] = "device_memory_info"
 # Publish every diagnostic run this chip child has closed. 26 is the delegated
 # region control; 27 mirrors worker_manager.h::CTRL_DFX_FLUSH.
 _CTRL_DFX_FLUSH = 27
+_CTRL_CCU_PREPARE = 28
+_CTRL_CCU_ROLLBACK = 29
+_CCU_CONTROL_HEADER = struct.Struct("<QQ32s")
+_CCU_CONTROL_TIMEOUT_S = 90.0
 _CTRL_OP_NAMES[_CTRL_DFX_FLUSH] = "flush_diagnostics"
 # The native flush wait takes a millisecond count in a C `int`. The wire field
 # is 64-bit, so a malformed frame is clamped here rather than left to fail
@@ -3402,7 +3408,7 @@ def _teardown_chip_process_resources(
     raise aggregated
 
 
-def _handle_ctrl_release_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_handle: int) -> None:
+def _handle_ctrl_release_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_handle: int) -> int:
     """Release a published domain or locally abort an unpublished allocation."""
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     req_shm = SharedMemory(name=request_shm_name)
@@ -3419,6 +3425,7 @@ def _handle_ctrl_release_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_h
         raise ValueError("invalid domain release mode")
     release = cw.comm_abort_domain_windows if abort_initialization else cw.comm_release_domain_windows
     release(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
+    return allocation_id
 
 
 def _require_base_communicator(handle: int) -> int:
@@ -3492,6 +3499,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         )
     )
     global_domain_store = _L2GlobalDomainStore()
+    ccu_bindings: dict[tuple[int, bytes], tuple[str, int]] = {}
     base_comm_handle = 0
     diagnostic_capture_index = 0
 
@@ -3507,6 +3515,15 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             chip_rank=chip_rank,
             capture_index=capture_index,
         )
+        domain_key, binding = _CCU_CFG_FMT.unpack_from(task_buf, _OFF_CCU_CONFIG)
+        callable = registry[identity_table[callable_digest]]
+        if binding or bool(domain_key) != bool(callable.ccu_function_count):
+            raise RuntimeError("CCU callable requires a prepared L3 domain binding")
+        if domain_key:
+            prepared_ccu = ccu_bindings.get((domain_key - 1, callable_digest))
+            if prepared_ccu is None:
+                raise RuntimeError("CCU binding is missing on this chip")
+            cfg._ccu_binding = prepared_ccu[1]
         # Same gate as the rankN/dN redirect in _read_config_from_mailbox: a loop
         # with no Rank identity writes at the case root, and a sidecar naming a
         # Rank it does not have would be a lie.
@@ -3641,7 +3658,33 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             elif sub_cmd == _CTRL_ALLOC_DOMAIN:
                 _handle_ctrl_alloc_domain(cw, buf, base_comm_handle=base_comm_handle)
             elif sub_cmd == _CTRL_RELEASE_DOMAIN:
-                _handle_ctrl_release_domain(cw, buf, base_comm_handle=base_comm_handle)
+                released = _handle_ctrl_release_domain(cw, buf, base_comm_handle=base_comm_handle)
+                for key in [key for key in ccu_bindings if key[0] == released]:
+                    del ccu_bindings[key]
+            elif sub_cmd in (_CTRL_CCU_PREPARE, _CTRL_CCU_ROLLBACK):
+                staged, payload, size = _open_ctrl_payload(buf, what="CCU")
+                view = payload[:size]
+                try:
+                    allocation_id, binding, digest = _CCU_CONTROL_HEADER.unpack_from(view)
+                    prefix = os.fsdecode(bytes(view[_CCU_CONTROL_HEADER.size :]))
+                    if binding or not prefix or "\0" in prefix:
+                        raise ValueError("invalid CCU control request")
+                    comm = _require_base_communicator(base_comm_handle)
+                    key = (allocation_id, digest)
+                    if sub_cmd == _CTRL_CCU_ROLLBACK:
+                        cw._comm_rollback_ccu(comm, allocation_id, prefix)
+                        if key in ccu_bindings and ccu_bindings[key][0] == prefix:
+                            del ccu_bindings[key]
+                    else:
+                        functions = registry[identity_table[digest]].ccu_functions
+                        if not functions or key in ccu_bindings:
+                            raise ValueError("invalid or duplicate CCU binding")
+                        entries = [(item.binary, item.entry) for item in functions]
+                        binding = cw._comm_prepare_ccu(comm, allocation_id, prefix, entries)
+                        ccu_bindings[key] = (prefix, binding)
+                        _CCU_CONTROL_HEADER.pack_into(view, 0, allocation_id, binding, digest)
+                finally:
+                    _release_ctrl_payload(staged, payload, view)
             elif sub_cmd == _CTRL_COMM_INIT:
                 base_comm_handle = _handle_ctrl_comm_init(cw, buf)
             elif sub_cmd == _CTRL_DELEGATED_REGION:
@@ -5819,6 +5862,7 @@ class Worker:
         # among live handles).  ``orch.allocate_domain`` adds entries here;
         # ``release()`` removes them and queues a deferred backend free.
         self._live_domains: dict[str, CommDomainHandle] = {}
+        self._ccu_prepare_lock = threading.Lock()
         self._live_global_domains: dict[str, GlobalCommDomainHandle] = {}
         self._global_node_domains: dict[int, _GlobalNodeDomainState] = {}
         self._global_cluster_id = uuid.uuid4().hex
@@ -10500,6 +10544,9 @@ class Worker:
                 raise ValueError("workspace_engines selection is supported only on L3 domains")
             if self._config.get("platform") != "a5":
                 raise ValueError("domain workspace selection requires A5; A2/A3 SDMA uses enable_sdma")
+            if "ccu" in config.workspace_engines:
+                if self._config.get("runtime") != "tensormap_and_ringbuffer" or len(config.members) != 2:
+                    raise ValueError("CCU domains require two local A5 tensormap_and_ringbuffer ranks")
             if "urma" in config.workspace_engines:
                 if self._config.get("runtime") != "tensormap_and_ringbuffer":
                     raise ValueError("URMA domain workspaces require the A5 tensormap_and_ringbuffer runtime")
@@ -10655,6 +10702,78 @@ class Worker:
                     return state.borrowed_handle
             self._use_domain(handle)
             return handle
+
+    def _prepare_ccu_group(
+        self, callable_handle: CallableHandle, ref: CommDomainRef, workers: list[int] | None = None
+    ) -> int:
+        if _callback_frame_for(self) is None:
+            raise RuntimeError("CCU preparation requires this Worker's orchestration callback")
+        if not isinstance(ref, CommDomainRef):
+            raise TypeError("CCU requires a live CommDomainRef")
+        if self.level != 3 or (self._config.get("platform"), self._config.get("runtime")) != (
+            "a5",
+            "tensormap_and_ringbuffer",
+        ):
+            raise ValueError("CCU requires a local L3 A5 tensormap_and_ringbuffer Worker")
+        state = self._resolve_handle(callable_handle, expected_namespace="LOCAL_CHIP")
+        if not state.target.ccu_function_count:
+            raise ValueError("CCU requires a callable with registered CCU functions")
+        domain = self._get_domain(ref)
+        if domain._config is None or "ccu" not in domain._config.workspace_engines:
+            raise ValueError("CCU requires a local domain allocated with workspace_engines=('ccu',)")
+        if len(domain.workers) != 2 or (workers is not None and set(workers) != set(domain.workers)):
+            raise ValueError("CCU requires a group with exactly the two domain workers")
+        for worker_id in domain.workers:
+            self._require_local_next_level_target(worker_id, api="prepare_ccu")
+        if state.eligible_worker_ids and not set(domain.workers).issubset(state.eligible_worker_ids):
+            raise ValueError("CCU callable is not registered on all domain workers")
+        if state.digest in domain._ccu_prepared:
+            return domain.allocation_id
+
+        with self._control_admission("prepare_ccu"), self._ccu_prepare_lock:
+            domain._require_live()
+            if state.digest not in domain._ccu_prepared:
+                self._bind_ccu_domain(domain, state.digest)
+        return domain.allocation_id
+
+    def _bind_ccu_domain(self, domain: CommDomainHandle, digest: bytes) -> None:
+        native = self._worker
+        assert native is not None
+        with tempfile.TemporaryDirectory(prefix="simpler-ccu-") as rendezvous:
+            prefix = os.fsencode(os.path.join(rendezvous, "prepare"))
+            request = _CCU_CONTROL_HEADER.pack(domain.allocation_id, 0, digest) + prefix
+
+            def collective(command: int) -> None:
+                failures: dict[int, BaseException] = {}
+
+                def invoke(worker_id: int) -> None:
+                    try:
+                        timeout = max(self._py_control_timeout_s, _CCU_CONTROL_TIMEOUT_S)
+                        reply = native.control_payload(WorkerType.NEXT_LEVEL, worker_id, command, request, timeout)
+                        if command == _CTRL_CCU_PREPARE:
+                            allocation_id, binding, reply_digest = _CCU_CONTROL_HEADER.unpack_from(reply)
+                            if (allocation_id, reply_digest) != (domain.allocation_id, digest) or not binding:
+                                raise RuntimeError("invalid CCU prepare response")
+                    except BaseException as exc:  # noqa: BLE001 -- join all rank controls before rollback
+                        failures[worker_id] = exc
+
+                _start_and_join_threads(domain.workers, invoke, name_prefix="ccu-domain-control-")
+                if failures:
+                    detail = "; ".join(f"worker {rank}: {exc}" for rank, exc in sorted(failures.items()))
+                    raise RuntimeError(detail) from next(iter(failures.values()))
+
+            try:
+                collective(_CTRL_CCU_PREPARE)
+                domain._ccu_prepared.add(digest)
+            except BaseException as error:
+                domain._ccu_prepared.discard(digest)
+                try:
+                    collective(_CTRL_CCU_ROLLBACK)
+                except BaseException as cleanup_error:
+                    raise self._record_unreclaimable(
+                        "CCU preparation failed and rollback was unconfirmed", cleanup_error
+                    ) from error
+                raise
 
     def _allocate_domain(  # noqa: PLR0912 -- linear input-validation + per-chip shm staging + dispatch + reply unpack; splitting obscures the fail-fast ordering
         self,
@@ -13512,6 +13631,8 @@ class Worker:
         if self.level == 2:
             assert self._chip_worker is not None
             state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
+            if state.target.ccu_function_count:
+                raise ValueError("CCU callables require L3 group submission with ccu_domain")
             if getattr(cfg, "output_prefix", ""):
                 _bind_host_log_session_directory()
             submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}

@@ -25,6 +25,7 @@
 #include "platform_comm/comm.h"
 #include "platform_comm/comm_context.h"
 
+#include "ccu_backend.h"
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
 #include "host/raii_scope_guard.h"
@@ -109,6 +110,9 @@ struct DomainAllocation {
     std::unique_ptr<pto::comm::rdma::RdmaWorkspaceManager> rdma_workspace;
     void *rdma_workspace_addr = nullptr;
 #endif
+    uint32_t workspace_mask = 0;
+    size_t window_size = 0;
+    std::map<std::string, void *> ccu_bindings;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
     size_t mapping_size = 0;
 };
@@ -828,6 +832,9 @@ static uint32_t compiled_comm_workspaces() {
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
     mask |= comm_workspace_bit(CommWorkspaceKind::RDMA);
 #endif
+#ifdef SIMPLER_A5_TMR_RUNTIME
+    if (simpler::ccu::Available()) mask |= COMM_DOMAIN_WORKSPACE_CCU;
+#endif
     return mask;
 }
 
@@ -923,7 +930,22 @@ static bool urma_domain_drained(const DomainAllocation &alloc) {
 static bool domain_drained(const DomainAllocation &alloc) {
     if (alloc.cleanup_failed) return false;
     if (!alloc.initialized) return true;  // Failed initialization never publishes device users.
+    for (const auto &binding : alloc.ccu_bindings) {
+        if (!simpler::ccu::Drained(binding.second)) return false;
+    }
     return urma_domain_drained(alloc);
+}
+
+static bool close_ccu_bindings(DomainAllocation &alloc) {
+    while (!alloc.ccu_bindings.empty()) {
+        auto entry = alloc.ccu_bindings.begin();
+        if (entry->second != nullptr && simpler::ccu::Close(entry->second) != 0) {
+            LOG_ERROR("[comm] CCU close: %s", simpler::ccu::LastError());
+            return false;
+        }
+        alloc.ccu_bindings.erase(entry);
+    }
+    return true;
 }
 
 // Callers establish local/peer quiescence before closing a published domain.
@@ -931,6 +953,7 @@ static bool domain_drained(const DomainAllocation &alloc) {
 static bool close_domain_resources(DomainAllocation &alloc) {
     if (alloc.cleanup_failed) return false;
     alloc.cleanup_failed = true;
+    if (!alloc.ccu_bindings.empty()) return false;
     if (alloc.urma_comm != nullptr) {
         if (hccl_comm_destroy(alloc.urma_comm) != HCCL_SUCCESS) return false;
         alloc.urma_comm = nullptr;
@@ -1899,6 +1922,10 @@ extern "C" int comm_alloc_domain_windows(
         LOG_ERROR("[comm rank %d] alloc_domain: unsupported workspace combination 0x%x", h->rank, workspace_mask);
         return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     }
+    if ((workspace_mask & COMM_DOMAIN_WORKSPACE_CCU) != 0 && rank_count != 2) {
+        LOG_ERROR("[comm rank %d] alloc_domain: CCU requires two local ranks", h->rank);
+        return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
+    }
     if ((workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0 &&
         !rank_ids_are_dense_prefix(rank_ids, rank_count)) {
         LOG_ERROR("[comm rank %d] alloc_domain: URMA requires dense prefix ranks", h->rank);
@@ -1933,6 +1960,8 @@ extern "C" int comm_alloc_domain_windows(
     auto &alloc = entry->second;
     alloc->rank = static_cast<int>(domain_rank);
     alloc->nranks = static_cast<int>(rank_count);
+    alloc->window_size = window_size;
+    alloc->workspace_mask = workspace_mask;
     int rc = -1;
     try {
         rc = domain_alloc_via_ipc(
@@ -1965,6 +1994,81 @@ extern "C" int comm_alloc_domain_windows(
     return COMM_RECLAMATION_UNCONFIRMED;
 }
 
+extern "C" int comm_prepare_ccu(
+    CommHandle h, uint64_t allocation_id, const char *prefix, const CommCcuModuleEntry *entries, size_t count,
+    uint64_t *binding
+) try {
+    if (h == nullptr || prefix == nullptr || entries == nullptr || count == 0 || binding == nullptr ||
+        h->cleanup_failed) {
+        return -1;
+    }
+    auto found = h->domain_allocations.find(allocation_id);
+    if (found == h->domain_allocations.end()) return -1;
+    auto &alloc = *found->second;
+    if (!alloc.initialized || alloc.cleanup_failed || (alloc.workspace_mask & COMM_DOMAIN_WORKSPACE_CCU) == 0 ||
+        alloc.ccu_bindings.size() >= 16) {
+        return -1;
+    }
+    int32_t device = -1;
+    if (aclrtGetDevice(&device) != ACL_SUCCESS) return -1;
+    std::vector<simpler::ccu::ModuleEntry> modules;
+    modules.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        modules.push_back({entries[i].binary, entries[i].binary_size, entries[i].symbol});
+    }
+    auto [position, inserted] = alloc.ccu_bindings.try_emplace(prefix, nullptr);
+    if (!inserted) return -1;
+    simpler::ccu::DomainConfig config{
+        device,
+        static_cast<uint32_t>(alloc.rank),
+        reinterpret_cast<uint64_t>(alloc.device_ctx),
+        reinterpret_cast<uint64_t>(alloc.local_buf),
+        alloc.window_size,
+        prefix
+    };
+    int rc = simpler::ccu::Prepare(config, modules.data(), modules.size(), &position->second, binding);
+    if (rc != 0) {
+        LOG_ERROR("[comm rank %d] CCU prepare: %s", h->rank, simpler::ccu::LastError());
+        if (position->second == nullptr) alloc.ccu_bindings.erase(position);
+    }
+    return rc;
+} catch (const std::exception &e) {
+    LOG_ERROR("[comm] CCU prepare: %s", e.what());
+    return -1;
+} catch (...) {
+    LOG_ERROR("[comm] CCU prepare: unknown exception");
+    return -1;
+}
+
+extern "C" int comm_rollback_ccu(CommHandle h, uint64_t allocation_id, const char *prefix) try {
+    if (h == nullptr || prefix == nullptr) return -1;
+    if (h->cleanup_failed) return COMM_RECLAMATION_UNCONFIRMED;
+    auto found = h->domain_allocations.find(allocation_id);
+    if (found == h->domain_allocations.end()) return 0;
+    auto &alloc = *found->second;
+    auto entry = alloc.ccu_bindings.find(prefix);
+    if (entry == alloc.ccu_bindings.end()) return 0;
+    if (entry->second != nullptr && simpler::ccu::Close(entry->second) != 0) {
+        LOG_ERROR("[comm rank %d] CCU rollback: %s", h->rank, simpler::ccu::LastError());
+        alloc.cleanup_failed = true;
+        h->cleanup_failed = true;
+        return COMM_RECLAMATION_UNCONFIRMED;
+    }
+    alloc.ccu_bindings.erase(entry);
+    return 0;
+} catch (...) {
+    if (h) h->cleanup_failed = true;
+    return COMM_RECLAMATION_UNCONFIRMED;
+}
+
+static bool close_domain_ccu(CommHandle h, uint64_t allocation_id, DomainAllocation &alloc, const char *phase) {
+    if ((alloc.workspace_mask & COMM_DOMAIN_WORKSPACE_CCU) == 0 || !alloc.initialized) return true;
+    return close_ccu_bindings(alloc) &&
+           file_barrier(
+               h->rootinfo_path, alloc.rank, alloc.nranks, domain_barrier_tag(allocation_id, phase), h->run_token
+           );
+}
+
 static int release_domain_windows(
     CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank, bool collective
 ) try {
@@ -1993,7 +2097,7 @@ static int release_domain_windows(
                            h->rootinfo_path, static_cast<int>(domain_rank), static_cast<int>(rank_count),
                            domain_barrier_tag(allocation_id, "release"), h->run_token
                        )) ||
-        !close_domain_resources(*alloc)) {
+        (collective && !close_domain_ccu(h, allocation_id, *alloc, "ccu-release")) || !close_domain_resources(*alloc)) {
         alloc->cleanup_failed = true;
         h->cleanup_failed = true;
         LOG_ERROR("[comm rank %d] release_domain: reclamation unconfirmed; retaining owner", h->rank);
@@ -2053,7 +2157,10 @@ extern "C" int comm_destroy(CommHandle h) try {
     // Allocation IDs impose the same child-communicator close order on all ranks.
     while (!h->domain_allocations.empty()) {
         auto entry = std::prev(h->domain_allocations.end());
-        if (!close_domain_resources(*entry->second)) return COMM_RECLAMATION_UNCONFIRMED;
+        if (!close_domain_ccu(h, entry->first, *entry->second, "ccu-destroy") ||
+            !close_domain_resources(*entry->second)) {
+            return COMM_RECLAMATION_UNCONFIRMED;
+        }
         h->domain_allocations.erase(entry);
     }
     if (h->hccl_comm != nullptr) {

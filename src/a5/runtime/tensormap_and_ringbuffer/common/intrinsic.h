@@ -125,14 +125,22 @@ struct GlobalContext {
     // config into every core's context during cold start.
     // Read via get_dma_workspace(args, kind).
     uint64_t dma_workspace[DMA_WORKSPACE_KIND_COUNT];
+    uint64_t ccu_binding;
 };
 
-struct AsyncCtx {
+// Keep the per-dispatch payload layout stable. The kernel-side view also
+// carries the cold binding from GlobalContext.
+struct AsyncCtxStorage {
     volatile __gm__ uint32_t *completion_count;
     volatile __gm__ int32_t *completion_error_code;
     volatile __gm__ DeferredCompletionEntry *completion_entries;
     uint32_t completion_capacity;
+    bool ccu_eligible;  // Single-block standalone AIV on a prepared run.
     TaskId task_token;
+};
+
+struct AsyncCtx : AsyncCtxStorage {
+    uint64_t ccu_binding;
 
     static inline AsyncCtx make(TaskId task_token, volatile __gm__ DeferredCompletionSlab *buffer) {
         AsyncCtx ctx{};
@@ -159,7 +167,7 @@ struct LocalContext {
     int32_t block_num;  // How many logical blocks this task requires.
                         // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
                         // which controls how many physical cores the runtime launches.
-    AsyncCtx async_ctx;
+    AsyncCtxStorage async_ctx;
 };
 
 /**

@@ -38,11 +38,14 @@ struct ChipCallableLayout {
 };
 
 /**
- * Compute byte-size and content hash for a ChipCallable buffer.
+ * Compute byte-size and content hash for the device portion of a ChipCallable.
+ *
+ * The optional Host CCU section does not affect device upload or kernel-table
+ * reuse. Registration identity uses the complete serialized buffer instead.
  *
  * `storage_used` is max(binary_size, child_offset[i] + CoreCallable header +
  * child binary_size) over all children — same arithmetic make_callable<>()
- * uses when emitting the host buffer.
+ * uses when emitting the device image.
  */
 inline ChipCallableLayout compute_chip_callable_layout(const ChipCallable *callable) {
     constexpr size_t kHeaderSize = offsetof(ChipCallable, storage_);

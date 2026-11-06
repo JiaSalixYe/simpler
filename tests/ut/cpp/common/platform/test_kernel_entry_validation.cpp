@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+#include "chip_callable_layout.h"
 #include "host/kernel_entry_validation.h"
 
 namespace {
@@ -182,6 +183,24 @@ TEST(KernelEntryValidation, CallableImageRejectsTruncatedVariableTail) {
     const auto image = make_chip_callable(nullptr, 0, "orch", kBinary, sizeof(kBinary), &child_id, children, 1, "");
     ASSERT_GT(image.size(), sizeof(ChipCallable));
     EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), 0);
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size() - 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+}
+
+TEST(KernelEntryValidation, CallableImageValidatesHostCcuSectionAndKeepsDeviceSpan) {
+    auto image = make_chip_callable(nullptr, 0, "orch", kBinary, sizeof(kBinary), nullptr, nullptr, 0, "");
+    const size_t device_size = image.size();
+    simpler::ccu::CallableSection section;
+    section.module_count = 1;
+    section.function_count = 2;
+    section.modules[0] = "module";
+    section.functions[0] = {0, "copy"};
+    section.functions[1] = {0, "reduce"};
+    simpler::ccu::append_callable_section(image, section);
+
+    EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), 0);
+    EXPECT_EQ(
+        compute_chip_callable_layout(reinterpret_cast<const ChipCallable *>(image.data())).total_size, device_size
+    );
     EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size() - 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
 }
 

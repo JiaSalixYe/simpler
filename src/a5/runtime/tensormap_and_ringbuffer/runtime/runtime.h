@@ -243,6 +243,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     uint32_t chip_swimlane_level;
     uint32_t pmu_event_type;   // PmuEventType; zero while PMU is disabled.
     uint32_t dump_args_level;  // DumpArgsLevel; zero while argument dumping is disabled.
+    uint64_t ccu_binding_;     // Device binding for this run; zero when no CCU is selected.
 
     // Entry args, adopted on the host. Last of the uploaded fields, because it
     // is the only one whose useful length is a property of the run: a
@@ -332,6 +333,8 @@ public:
     const simpler::tmr::EntryArgsStorage &get_orch_args() const;
     void set_gm_sm_ptr(void *p);
     void set_orch_args(const ChipStorageTaskArgs &args);
+    void set_ccu_binding(uint64_t addr) { dev.ccu_binding_ = addr; }
+    uint64_t get_ccu_binding() const { return dev.ccu_binding_; }
 
     // Entry-argument route, as the run that published this descriptor named it.
     // The host writes these three words into the publication itself rather than

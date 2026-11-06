@@ -137,6 +137,8 @@ void SchedulerContext::build_payload(
     dispatch_payload.local_context.block_idx = block_idx;
     dispatch_payload.local_context.block_num = slot_state.logical_block_num;
     dispatch_payload.local_context.async_ctx.task_token = slot_state.task->task_id;
+    dispatch_payload.local_context.async_ctx.ccu_eligible = ccu_binding_ != 0 && slot_state.logical_block_num == 1 &&
+                                                            slot_state.active_mask.to_shape() == ResourceShape::AIV;
 }
 
 SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(

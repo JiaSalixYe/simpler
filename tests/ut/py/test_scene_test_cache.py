@@ -28,7 +28,7 @@ from pathlib import Path
 from threading import Barrier, Event, Lock
 
 import pytest
-from _task_interface import ArgDirection, ChipCallable  # pyright: ignore[reportMissingImports]
+from _task_interface import ArgDirection, CcuFunction, ChipCallable  # pyright: ignore[reportMissingImports]
 
 # ``simpler_setup/__init__.py`` re-exports the ``scene_test`` *decorator*,
 # which shadows the submodule attribute when accessed via ``simpler_setup``.
@@ -266,6 +266,27 @@ def test_compile_cache_survives_session_cache_clear(monkeypatch, tmp_path):
     assert second.func_name == first.func_name
     assert second.binary_size == first.binary_size
     assert second.child_count == first.child_count
+
+
+def test_compile_cache_tracks_ccu_modules_and_entry_order(monkeypatch, tmp_path):
+    _configure_fake_compilation(monkeypatch, tmp_path)
+    spec, _header = _cacheable_spec(tmp_path)
+    cache_key = ("TestScene", "a5", "host_build_graph", "pin")
+
+    for entries in (
+        [(b"module", "copy"), (b"module", "reduce")],
+        [(b"module", "reduce"), (b"module", "copy")],
+        [(b"updated", "reduce"), (b"module", "copy")],
+    ):
+        spec["ccu_functions"] = [CcuFunction.build(binary=binary, entry=entry) for binary, entry in entries]
+        first = compile_chip_callable_spec(spec, "a5sim", "host_build_graph", cache_key)
+        assert [(fn.binary, fn.entry) for fn in first.ccu_functions] == entries
+        clear_compile_cache()
+        second = compile_chip_callable_spec(spec, "a5sim", "host_build_graph", cache_key)
+        assert [(fn.binary, fn.entry) for fn in second.ccu_functions] == entries
+
+    assert _FakeKernelCompiler.orchestration_compiles == 3
+    assert _FakeKernelCompiler.incore_compiles == 1
 
 
 def test_compile_cache_invalidates_transitive_include(monkeypatch, tmp_path):

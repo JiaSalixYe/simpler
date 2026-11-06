@@ -454,6 +454,8 @@ void ChipWorker::init(
         comm_get_local_window_base_fn_ = module->required<CommGetLocalWindowBaseFn>("comm_get_local_window_base");
         comm_get_window_size_fn_ = module->required<CommGetWindowSizeFn>("comm_get_window_size");
         comm_derive_context_fn_ = module->required<CommDeriveContextFn>("comm_derive_context");
+        comm_prepare_ccu_fn_ = module->optional<CommPrepareCcuFn>("comm_prepare_ccu");
+        comm_rollback_ccu_fn_ = module->optional<CommRollbackCcuFn>("comm_rollback_ccu");
         comm_alloc_domain_windows_fn_ = module->required<CommAllocDomainWindowsFn>("comm_alloc_domain_windows");
         comm_release_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_release_domain_windows");
         comm_abort_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_abort_domain_windows");
@@ -927,6 +929,8 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_get_local_window_base_fn_ = nullptr;
     comm_get_window_size_fn_ = nullptr;
     comm_derive_context_fn_ = nullptr;
+    comm_prepare_ccu_fn_ = nullptr;
+    comm_rollback_ccu_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
     comm_abort_domain_windows_fn_ = nullptr;
@@ -2615,6 +2619,39 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
         throw std::runtime_error("comm_alloc_domain_windows returned null device_ctx / local_window_base");
     }
     return {device_ctx, local_window_base, actual_window_size};
+}
+
+uint64_t ChipWorker::comm_prepare_ccu(
+    uint64_t comm_handle, uint64_t allocation_id, const std::string &prefix,
+    const std::vector<std::pair<std::string, std::string>> &entries
+) {
+    require_comm_reclamation_safe();
+    if (comm_prepare_ccu_fn_ == nullptr || comm_rollback_ccu_fn_ == nullptr) {
+        throw std::runtime_error("CCU is not supported by this runtime");
+    }
+    std::vector<CommCcuModuleEntry> descriptors;
+    descriptors.reserve(entries.size());
+    for (const auto &[binary, symbol] : entries) {
+        descriptors.push_back({binary.data(), binary.size(), symbol.c_str()});
+    }
+    uint64_t binding = 0;
+    int rc = comm_prepare_ccu_fn_(
+        reinterpret_cast<CommHandle>(comm_handle), allocation_id, prefix.c_str(), descriptors.data(),
+        descriptors.size(), &binding
+    );
+    if (rc != 0 || binding == 0) {
+        throw std::runtime_error("comm_prepare_ccu failed with code " + std::to_string(rc));
+    }
+    return binding;
+}
+
+void ChipWorker::comm_rollback_ccu(uint64_t comm_handle, uint64_t allocation_id, const std::string &prefix) {
+    if (comm_rollback_ccu_fn_ == nullptr) return;
+    int rc = comm_rollback_ccu_fn_(reinterpret_cast<CommHandle>(comm_handle), allocation_id, prefix.c_str());
+    if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_comm_cleanup();
+    if (rc != 0) {
+        throw std::runtime_error("comm_rollback_ccu failed with code " + std::to_string(rc));
+    }
 }
 
 void ChipWorker::comm_release_domain_windows(

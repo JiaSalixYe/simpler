@@ -74,6 +74,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     TEARDOWN_REPORT_SCHEMA,
     ArgDirection,
     CallConfig,
+    CcuFunction,
     ChipCallable,
     ChipStorageTaskArgs,
     ChipTensor,
@@ -250,6 +251,7 @@ __all__ = [
     "ArgDirection",
     "CoreCallable",
     "ChipCallable",
+    "CcuFunction",
     "CallConfig",
     "RuntimeEnv",
     "ChipWorker",
@@ -1173,6 +1175,7 @@ class CommDomainHandle:
         "attachments",
         "_config",
         "_ref",
+        "_ccu_prepared",
         "requested_window_size",
     )
 
@@ -1221,6 +1224,7 @@ class CommDomainHandle:
         self._released = False
         self._freed = False
         self._ref = ref
+        self._ccu_prepared: set[bytes] = set()
         self.requested_window_size = self.mapping_size if requested_window_size is None else int(requested_window_size)
 
     def __getitem__(self, chip_idx: int) -> ChipDomainContext:
@@ -1233,6 +1237,8 @@ class CommDomainHandle:
         Native allocation validates provider descriptors before publishing this
         handle. Engine selection is immutable for its lifetime. This method also
         records scalar-only context use in the current orchestration run.
+        For CCU, the context identifies the window; callable-specific resources
+        are prepared separately before dispatch.
         """
         context = self[worker]
         required = normalize_workspace_engines(workspace_engines)

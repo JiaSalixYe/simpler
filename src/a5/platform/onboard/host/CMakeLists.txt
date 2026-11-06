@@ -87,6 +87,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/args_dump_retained_runs.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/scope_stats_retained_runs.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ccu_backend.cpp"
 )
 # Add common/aicpu_loader/host sources (LoadAicpuOp)
 list(APPEND HOST_RUNTIME_SOURCES
@@ -235,6 +236,25 @@ elseif(HCOMM_LIB)
 else()
     message(FATAL_ERROR
         "Neither libhccl nor libhcomm found under ${ASCEND_HOME_PATH}/lib64 or ${ASCEND_ARCH_HOME}/lib64")
+endif()
+
+if(SIMPLER_RUNTIME_NAME STREQUAL "tensormap_and_ringbuffer")
+    target_compile_definitions(host_runtime PRIVATE SIMPLER_A5_TMR_RUNTIME)
+    if(HCOMM_LIB AND HCCL_LIB)
+        target_compile_definitions(host_runtime PRIVATE SIMPLER_A5_CCU_CANDIDATE)
+        target_include_directories(host_runtime PRIVATE
+            ${ASCEND_HOME_PATH}/include/hccl
+            ${ASCEND_HOME_PATH}/include/hcomm
+            ${ASCEND_HOME_PATH}/include/hcomm/ccu
+            ${ASCEND_HOME_PATH}/pkg_inc/hccl
+            ${ASCEND_HOME_PATH}/pkg_inc/hcomm/ccu
+            ${ASCEND_ARCH_HOME}/include/hccl
+            ${ASCEND_ARCH_HOME}/include/hcomm
+            ${ASCEND_ARCH_HOME}/include/hcomm/ccu
+            ${ASCEND_ARCH_HOME}/pkg_inc/hccl
+            ${ASCEND_ARCH_HOME}/pkg_inc/hcomm/ccu
+        )
+    endif()
 endif()
 
 # Link against CANN runtime libraries

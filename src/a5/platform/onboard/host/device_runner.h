@@ -274,6 +274,7 @@ private:
     // that, because the discharge is what may raise it. Collectors are not
     // released here: their device resources belong to the worker's lifetime and
     // are released in finalize().
+    int finish_ccu_execution(PreparedExecution &prepared) noexcept;
     void cleanup_execution(PreparedExecution &prepared, bool launched) noexcept;
 
     // Quarantine needs no current device; recovery may drain an owned device.

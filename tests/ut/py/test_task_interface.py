@@ -1716,7 +1716,7 @@ class TestChipCallable:
         assert clone.scalar_count == 7
 
     @pytest.mark.parametrize("signature_count", [-1, 257])
-    def test_scalar_count_rejects_corrupt_cached_signature_count(self, signature_count):
+    def test_corrupt_signature_count_is_rejected_on_deserialize_and_use(self, signature_count):
         chip = ChipCallable.build(
             signature=[ArgDirection.IN, ArgDirection.SCALAR],
             func_name="test_func",
@@ -1726,9 +1726,11 @@ class TestChipCallable:
         raw = bytearray(ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size())))
         # The wire signature contains 256 int32 ArgDirection entries before sig_count.
         struct.pack_into("<i", raw, 256 * struct.calcsize("<i"), signature_count)
-        clone = ChipCallable.from_bytes(bytes(raw))
+        with pytest.raises(ValueError, match="invalid serialized image"):
+            ChipCallable.from_bytes(bytes(raw))
+        ctypes.memmove(chip.buffer_ptr(), bytes(raw), len(raw))
         with pytest.raises(ValueError, match=rf"signature count {signature_count}.*256"):
-            _ = clone.scalar_count
+            _ = chip.scalar_count
 
 
 # ============================================================================

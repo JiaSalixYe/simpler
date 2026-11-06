@@ -177,6 +177,7 @@ private:
     // Per-core dispatch payload storage: dual-buffer for pipelining.
     // buf_idx = reg_task_id & 1; adjacent dispatches alternate automatically.
     DispatchPayload payload_per_core_[RUNTIME_MAX_WORKER][2];
+    uint64_t ccu_binding_{0};
 
     // Per-core deferred-completion software registration storage.  This has
     // the same runtime lifetime as payload_per_core_, but is kept out of the

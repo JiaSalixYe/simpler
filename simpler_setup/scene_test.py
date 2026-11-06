@@ -23,6 +23,7 @@ A scene test class declares three things:
 from __future__ import annotations
 
 import gc
+import hashlib
 import inspect
 import json
 import logging
@@ -1779,8 +1780,13 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
     Worker: the `SceneTestCase` classes below, the `st_worker` pytest fixture,
     and standalone cases that drive an L3 Worker themselves. Key it through
     ``l3_compile_cache_key`` so every path shares one cache entry per
-    orchestration.
+    orchestration. Optional ``ccu_functions`` contains prebuilt ``CcuFunction``
+    entries in callable ID order.
     """
+    ccu_functions = tuple(spec.get("ccu_functions", ()))
+    if ccu_functions:
+        ccu_key = tuple((fn.entry, hashlib.sha256(fn.binary).hexdigest()) for fn in ccu_functions)
+        cache_key = (cache_key, "host-ccu-v1", ccu_key)
     if cache_key in _compile_cache:
         return _compile_cache[cache_key]
 
@@ -1907,6 +1913,7 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
             binary=orch_binary,
             children=kernel_binaries,
             config_name=orch.get("config_name", ""),
+            ccu_functions=ccu_functions,
         )
 
     chip_callable = get_or_compile(artifact_key, compile_callable)

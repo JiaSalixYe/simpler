@@ -1120,7 +1120,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
             int32_t core_id = tracker.get_core_id_by_offset(c * PLATFORM_CORES_PER_BLOCKDIM + sub);
             for (int32_t buf = 0; buf < 2; buf++) {
                 DispatchPayload &dp = payload_per_core_[core_id][buf];
-                AsyncCtx &ac = dp.local_context.async_ctx;
+                auto &ac = dp.local_context.async_ctx;
                 volatile DeferredCompletionSlab *slab = &deferred_slab_per_core_[core_id][buf];
                 ac.completion_count = &slab->count;
                 ac.completion_error_code = &slab->error_code;
@@ -1131,6 +1131,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
                 for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
                     dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
                 }
+                dp.global_context.ccu_binding = ccu_binding_;
                 dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
                 dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
             }
@@ -1261,6 +1262,7 @@ int32_t SchedulerContext::pre_handshake_init(
     memset(retirement_state_, 0, sizeof(retirement_state_));
     retirement_blocked_layout_ = aicpu_thread_num > 1 && !runtime->dev.serial_orch_sched;
     retirement_unassigned_ = false;
+    ccu_binding_ = runtime->get_ccu_binding();
 
     // Wire thread/transition configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
@@ -1450,7 +1452,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     for (int32_t core_id = 0; core_id < RUNTIME_MAX_WORKER; core_id++) {
         for (int32_t buf = 0; buf < 2; buf++) {
             DispatchPayload &dp = payload_per_core_[core_id][buf];
-            AsyncCtx &ac = dp.local_context.async_ctx;
+            auto &ac = dp.local_context.async_ctx;
             volatile DeferredCompletionSlab *slab = &deferred_slab_per_core_[core_id][buf];
             ac.completion_count = &slab->count;
             ac.completion_error_code = &slab->error_code;
@@ -1463,6 +1465,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
                 dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
             }
+            dp.global_context.ccu_binding = ccu_binding_;
             dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
             dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
         }

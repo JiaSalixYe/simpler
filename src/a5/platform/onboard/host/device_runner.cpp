@@ -17,6 +17,8 @@
 
 #include "device_runner.h"
 
+#include "ccu_backend.h"
+
 #include "run_retention_probe.h"
 
 #include "acl/acl.h"
@@ -374,6 +376,11 @@ int DeviceRunner::prepare_execution(
     std::unique_ptr<PreparedExecution> *prepared
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+#ifdef SIMPLER_A5_TMR_RUNTIME
+    runtime.set_ccu_binding(config.ccu_binding);
+#else
+    if (config.ccu_binding != 0) return PTO_RUNTIME_ERR_INTERNAL;
+#endif
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
     execution->scheduler_runtime_mode = last_scheduler_runtime_mode();
     execution->resources_owned = true;
@@ -673,6 +680,14 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
             if (!prepared.recording)
                 (void)mark_run_boundary(RunBoundaryMarks::Position::AicoreStart, prepared.identity, streams.aicore);
 
+            if (prepared.config.ccu_binding != 0 && !prepared.ccu_service_acquired) {
+                if (simpler::ccu::Begin(prepared.config.ccu_binding) != 0) {
+                    LOG_ERROR("Start CCU execution: %s", simpler::ccu::LastError());
+                    mark_device_unusable(PTO_RUNTIME_ERR_INTERNAL);
+                    return PTO_RUNTIME_ERR_INTERNAL;
+                }
+                prepared.ccu_service_acquired = true;
+            }
             LOG_INFO("=== launch_aicore_kernel ===");
             if (!prepared.recording) (void)run_progress_.publish(prepared.identity, RunProgressState::Submitted);
             int launch_rc = launch_aicore_kernel(streams.aicore, prepared.kernel_args.args);
@@ -774,6 +789,7 @@ int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
     prepared.physical_complete = true;
     const int wait_rc = poll_boundary_waits(prepared);
     if (wait_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return wait_rc;
+    if (finish_ccu_execution(prepared) != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     read_device_wall_ns(prepared.pipeline_slot);
     if (prepared.dfx.chip_swimlane_enabled() && prepared.kernel_args.runtime_args_published() &&
         !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
@@ -841,6 +857,9 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         return DrainOutcome::device_error(rc, prepared.physical_complete);
     }
 
+    if (const int ccu_rc = finish_ccu_execution(prepared); ccu_rc != 0) {
+        return DrainOutcome::device_error(ccu_rc, true);
+    }
     read_device_wall_ns(prepared.pipeline_slot);
 
     // Both this run's boundaries completed, so every wait queued on one of them
@@ -946,8 +965,24 @@ void DeviceRunner::emit_device_dep_gen_graph(
     }
 }
 
+int DeviceRunner::finish_ccu_execution(PreparedExecution &prepared) noexcept {
+    if (!prepared.ccu_service_acquired) return 0;
+    if (simpler::ccu::End(prepared.config.ccu_binding) != 0) {
+        LOG_ERROR("Finish CCU execution: %s", simpler::ccu::LastError());
+        mark_device_unusable(PTO_RUNTIME_ERR_INTERNAL);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    prepared.ccu_service_acquired = false;
+    return 0;
+}
+
 void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched) noexcept {
     if (!prepared.resources_owned) return;
+    // Only a positively fenced execution or a proven pre-launch failure may
+    // relinquish its CCU service lease. An uncertain run leaves the domain pinned.
+    if (!launched && !device_unusable_.load(std::memory_order_acquire)) {
+        (void)finish_ccu_execution(prepared);
+    }
 
     // Before anything is released, and before the poison is read: a queued
     // stream wait naming one of this run's boundaries must not outlive the
