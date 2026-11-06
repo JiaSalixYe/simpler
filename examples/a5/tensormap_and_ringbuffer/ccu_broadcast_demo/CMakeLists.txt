@@ -40,10 +40,13 @@ if(NOT ASCENDCL_LIBRARY OR NOT RUNTIME_LIBRARY OR NOT HCOMM_LIBRARY OR NOT HCCL_
 endif()
 add_library(ccu_broadcast_session SHARED host/ccu_session.cpp)
 add_library(ccu_broadcast_builder SHARED host/ccu_broadcast_builder.cpp)
-target_include_directories(ccu_broadcast_builder PRIVATE
-    "${CMAKE_CURRENT_LIST_DIR}/../../../../src/a5/platform/onboard/host")
+add_library(ccu_collectives_builder SHARED host/ccu_collectives_builder.cpp)
+foreach(target IN ITEMS ccu_broadcast_builder ccu_collectives_builder)
+    target_include_directories(${target} PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/../../../../src/a5/platform/onboard/host")
+endforeach()
 
-foreach(target IN ITEMS ccu_broadcast_session ccu_broadcast_builder)
+foreach(target IN ITEMS ccu_broadcast_session ccu_broadcast_builder ccu_collectives_builder)
     target_compile_features(${target} PRIVATE cxx_std_17)
     target_compile_options(${target} PRIVATE -Wall -Wextra)
     target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../../../src/common")
