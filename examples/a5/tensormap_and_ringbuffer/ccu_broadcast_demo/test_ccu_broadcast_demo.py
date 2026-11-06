@@ -36,6 +36,15 @@ def test_ccu_broadcast_demo(st_platform, st_device_ids):
     _driver().run_suite(list(st_device_ids))
 
 
+@pytest.mark.platforms(["a5"])
+@pytest.mark.device_count(2)
+@pytest.mark.runtime("tensormap_and_ringbuffer")
+def test_ccu_reusable_service(st_platform, st_device_ids):
+    if st_platform != "a5":
+        pytest.skip("The reusable CCU service requires real A5 hardware")
+    _driver().run_suite(list(st_device_ids), counts=[64], roots=[0], repeat=1, memory="worker-gm", service_rounds=1000)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--platform", choices=["a5"], default="a5")
@@ -46,7 +55,9 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--memory", choices=["configured-gm", "plain-gm", "worker-gm"], default="configured-gm")
     parser.add_argument("--reuse-runs", type=int, choices=[1, 2], default=1)
-    parser.add_argument("--resident", choices=["deferred", "early-control"])
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--resident", choices=["deferred", "early-control"])
+    mode.add_argument("--service-rounds", type=int, help="Runtime AIV request count for the reusable service")
     args = parser.parse_args()
     _driver().run_suite(
         [int(device) for device in args.devices.split(",")],
@@ -57,4 +68,5 @@ if __name__ == "__main__":
         memory=args.memory,
         reuse_runs=args.reuse_runs,
         resident=None if args.resident is None else args.resident == "deferred",
+        service_rounds=args.service_rounds,
     )

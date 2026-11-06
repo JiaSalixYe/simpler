@@ -41,6 +41,7 @@ endif()
 add_library(ccu_broadcast_session SHARED host/ccu_session.cpp)
 target_compile_features(ccu_broadcast_session PRIVATE cxx_std_17)
 target_compile_options(ccu_broadcast_session PRIVATE -Wall -Wextra)
+target_include_directories(ccu_broadcast_session PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../../../src/common")
 target_link_options(ccu_broadcast_session PRIVATE -Wl,--no-undefined)
 target_include_directories(ccu_broadcast_session SYSTEM PRIVATE
     ${ACL_INCLUDE} ${HCCL_INCLUDE} ${CCU_INCLUDE}

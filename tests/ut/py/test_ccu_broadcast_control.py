@@ -105,3 +105,9 @@ def test_prepare_rejects_incomplete_peer_metadata_without_calling_sdk():
     native = driver.NativeSession.__new__(driver.NativeSession)
     with pytest.raises(ValueError, match="both ranks"):
         native.prepare([(1, 2, 3, 4)], 0)
+
+
+@pytest.mark.parametrize("rounds", [-1, driver.MAX_SERVICE_ROUNDS + 1, True, 1.5])
+def test_service_rejects_invalid_round_counts_before_using_sdk(rounds):
+    with pytest.raises(ValueError, match="Service rounds"):
+        driver.run_suite([0, 1], counts=[64], memory="worker-gm", service_rounds=rounds)

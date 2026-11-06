@@ -25,6 +25,7 @@ HERE = Path(__file__).resolve().parent
 RUNTIME = "tensormap_and_ringbuffer"
 MAX_COUNT = 1024
 MAX_REPEAT = 100
+MAX_SERVICE_ROUNDS = 10000
 ALLOCATION_BYTES = (2 * MAX_COUNT + 3 * 32) * ctypes.sizeof(ctypes.c_float)
 
 
@@ -32,6 +33,7 @@ class Experiment(NamedTuple):
     memory: str
     reuse_runs: int
     resident: bool | None
+    service_rounds: int | None
 
 
 class PeerInfo(ctypes.Structure):
@@ -119,10 +121,12 @@ class NativeSession:
                     ctypes.POINTER(PeerInfo),
                     ctypes.c_size_t,
                     ctypes.c_uint32,
+                    ctypes.c_bool,
                     ctypes.POINTER(ctypes.c_uint64),
                 ],
                 ctypes.c_int,
             ),
+            "ccu_demo_verify_service": ([ctypes.c_void_p, ctypes.c_uint32], ctypes.c_int),
             "ccu_demo_verify_resident": ([ctypes.c_void_p, ctypes.c_bool], ctypes.c_int),
             "ccu_demo_verify_program_retired": ([ctypes.c_int, ctypes.c_uint64], ctypes.c_int),
             "ccu_demo_program_handle": ([ctypes.c_void_p], ctypes.c_uint64),
@@ -177,10 +181,10 @@ class NativeSession:
             raise RuntimeError("CCU prepare returned an empty gate")
         return gate.value, mask.value
 
-    def prepare_resident(self, peers, root):
+    def prepare_resident(self, peers, root, *, service):
         metadata = (PeerInfo * 2)(*(PeerInfo(*peer) for peer in peers))
         mailboxes = ctypes.c_uint64()
-        self.check(self.lib.ccu_demo_prepare_resident(self.handle, metadata, 2, root, ctypes.byref(mailboxes)))
+        self.check(self.lib.ccu_demo_prepare_resident(self.handle, metadata, 2, root, service, ctypes.byref(mailboxes)))
         if not mailboxes.value:
             raise RuntimeError("CCU resident launch returned no mailboxes")
         return mailboxes.value
@@ -197,7 +201,7 @@ class NativeSession:
 def build_helper():
     from simpler_setup.environment import PROJECT_ROOT  # noqa: PLC0415
 
-    output = PROJECT_ROOT / "build" / "examples" / "a5_ccu_contract"
+    output = PROJECT_ROOT / "build" / "examples" / "a5_ccu_contract" / HERE.name
     subprocess.run(
         ["cmake", "-S", str(HERE), "-B", str(output), "-DCMAKE_BUILD_TYPE=RelWithDebInfo"],
         check=True,
@@ -206,10 +210,34 @@ def build_helper():
     return output / "libccu_broadcast_session.so"
 
 
-def build_callable(resident=False):
+def build_callable(resident=False, *, service=False):
     from simpler.task_interface import ArgDirection  # noqa: PLC0415
 
     from simpler_setup.scene_test import compile_chip_callable_spec  # noqa: PLC0415
+
+    if service:
+        signature = [ArgDirection.INOUT, ArgDirection.INOUT] + [ArgDirection.SCALAR] * 5
+        return compile_chip_callable_spec(
+            {
+                "orchestration": {
+                    "source": str(HERE / "kernels/orchestration/ccu_service_orch.cpp"),
+                    "function_name": "ccu_service_orchestration",
+                    "config_name": "ccu_service_config",
+                    "signature": signature,
+                },
+                "incores": [
+                    {
+                        "func_id": 0,
+                        "source": str(HERE / "kernels/aiv/ccu_service_run.cpp"),
+                        "core_type": "aiv",
+                        "signature": signature,
+                    }
+                ],
+            },
+            "a5",
+            RUNTIME,
+            "a5-ccu-reusable-service",
+        )
 
     if resident:
         d = ArgDirection
@@ -274,10 +302,12 @@ def _command(connection, expected):
     return command
 
 
-def _run_trigger(worker, target, native, peer, root, rank, context, resident, iteration):
+def _run_trigger(worker, target, native, peer, root, rank, context, experiment, iteration):
     from simpler.task_interface import CallConfig, ChipStorageTaskArgs, ChipTensor, DataType, TaskArgs  # noqa: PLC0415
 
-    if resident is None:
+    resident = experiment.resident
+    service_rounds = experiment.service_rounds
+    if resident is None and service_rounds is None:
         gate, mask = context
         args = TaskArgs()
         for value in (gate, mask, native.peer.trigger_status, root, rank):
@@ -288,10 +318,17 @@ def _run_trigger(worker, target, native, peer, root, rank, context, resident, it
             args.add_tensor(ChipTensor.make(address, (64,), DataType.FLOAT32, child_memory=True))
         args.add_scalar(context)
         args.add_scalar(peer[1])
-        args.add_scalar(int(resident))
-        args.add_scalar(rank * 10000 + iteration * 1000)
+        if service_rounds is None:
+            args.add_scalar(int(resident))
+            args.add_scalar(rank * 10000 + iteration * 1000)
+        else:
+            args.add_scalar(service_rounds)
+            args.add_scalar(rank * 10000 + iteration * 1000)
+            args.add_scalar(root * 10000 + iteration * 1000)
     worker.run(target, args, config=CallConfig())
-    if resident is None:
+    if service_rounds is not None:
+        native.check(native.lib.ccu_demo_verify_service(native.handle, service_rounds))
+    elif resident is None:
         native.verify(root)
     else:
         native.check(native.lib.ccu_demo_verify_resident(native.handle, resident))
@@ -299,15 +336,17 @@ def _run_trigger(worker, target, native, peer, root, rank, context, resident, it
 
 def _run_rounds(worker, target_handle, native, connection, rank, root, count, iteration, experiment):
     program = None
+    service = experiment.service_rounds is not None
+    resident = experiment.resident is not None or service
     for run_index in range(experiment.reuse_runs):
         command = _command(connection, "prepare")
         if run_index:
-            next_count = 64 if experiment.resident is not None or count != 64 else 1024
+            next_count = 64 if resident or count != 64 else 1024
             native.check(native.lib.ccu_demo_next_run(native.handle, next_count, iteration + run_index))
-        if experiment.resident is None:
-            context = native.prepare(command["peers"], root)
+        if resident:
+            context = native.prepare_resident(command["peers"], root, service=service)
         else:
-            context = native.prepare_resident(command["peers"], root)
+            context = native.prepare(command["peers"], root)
         current_program = native.lib.ccu_demo_program_handle(native.handle)
         if current_program == 0 or (program is not None and current_program != program):
             raise RuntimeError("Native CCU program handle changed inside the same session")
@@ -322,7 +361,7 @@ def _run_rounds(worker, target_handle, native, connection, rank, root, count, it
             root,
             rank,
             context,
-            experiment.resident,
+            experiment,
             iteration + run_index,
         )
         connection.send({"stage": "verified", "rank": rank})
@@ -446,22 +485,33 @@ def run_suite(
     memory="configured-gm",
     reuse_runs=1,
     resident=None,
+    service_rounds=None,
 ):
     validate_request(devices, counts, roots, repeat, timeout)
     if reuse_runs not in (1, 2):
         raise ValueError("Run reuse experiment supports exactly one or two runs")
     if memory not in ("configured-gm", "plain-gm", "worker-gm"):
         raise ValueError("Unknown data allocation mode")
-    if resident is not None and (memory == "configured-gm" or list(counts) != [64]):
+    if service_rounds is not None:
+        if resident is not None:
+            raise ValueError("Select either the fixed-round control or the reusable service")
+        if (
+            isinstance(service_rounds, bool)
+            or not isinstance(service_rounds, int)
+            or not 0 <= service_rounds <= MAX_SERVICE_ROUNDS
+        ):
+            raise ValueError(f"Service rounds must be an integer in [0, {MAX_SERVICE_ROUNDS}]")
+    if (resident is not None or service_rounds is not None) and (memory == "configured-gm" or list(counts) != [64]):
         raise ValueError("Resident experiment requires separate GM and --counts 64")
-    experiment = Experiment(memory, reuse_runs, resident)
+    experiment = Experiment(memory, reuse_runs, resident, service_rounds)
     if "fork" not in mp.get_all_start_methods():
         raise RuntimeError("The real A5 CCU example requires Linux fork-based rank isolation")
     from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
     library = build_helper()
-    target = build_callable(resident is not None)
+    target = build_callable(resident is not None, service=service_rounds is not None)
     bins = RuntimeBuilder("a5").get_binaries(RUNTIME)
+    device_rounds = service_rounds if service_rounds is not None else (1 if resident is None else 2)
     cases = []
     for iteration in range(repeat):
         for root in roots:
@@ -478,7 +528,7 @@ def run_suite(
                     "memory": memory,
                     "runs_per_session": reuse_runs,
                     "one_native_registration_per_rank": True,
-                    "device_rounds": 1 if resident is None else 2,
+                    "device_rounds": device_rounds,
                     "tmr_deferred": resident,
                 }
                 cases.append(result)
@@ -488,7 +538,7 @@ def run_suite(
         "runtime": RUNTIME,
         "cases": len(cases),
         "verified": True,
-        "completion": "host-stream-sync" if resident is None else "ccu-mailbox",
+        "completion": "host-stream-sync" if resident is None and service_rounds is None else "ccu-mailbox",
         "fresh_session_per_case": True,
     }
     print("CCU_BROADCAST_PASS " + json.dumps(summary, sort_keys=True), flush=True)

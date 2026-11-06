@@ -10,6 +10,8 @@
  */
 #include "ccu_session.h"
 #include "../ccu_contract_mailbox.h"
+#include "../ccu_service_probe.h"
+#include "platform_comm/ccu/service_program.h"
 
 #include <array>
 #include <cstdio>
@@ -126,6 +128,57 @@ CcuResult BroadcastProgram(const BroadcastArgs *args) {
     }
 }
 
+void RecordMailboxBroadcast(
+    const BroadcastArgs &args, const AscendC::ccu::Variable &source_token,
+    const AscendC::ccu::Variable &destination_token, const AscendC::ccu::Variable &peer_token,
+    const AscendC::ccu::Variable &input, const AscendC::ccu::Variable &output,
+    const AscendC::ccu::Variable &peer_output, const AscendC::ccu::Variable &bytes
+) {
+    namespace ccu = AscendC::ccu;
+    Check(ccu::NotifyRecord(args.channel, 0, 1), "mailbox notify ready");
+    Check(ccu::NotifyWait(args.channel, 0, 1), "mailbox wait ready");
+    if (args.is_root) {
+        ccu::LocalAddr source, destination;
+        ccu::RemoteAddr remote;
+        source.addr = input;
+        source.token = source_token;
+        destination.addr = output;
+        destination.token = destination_token;
+        remote.addr = peer_output;
+        remote.token = peer_token;
+        ccu::Event copied;
+        ccu::CcuBuffer buffer;
+        Check(ccu::LocalCopy(buffer, source, bytes, copied), "mailbox local read");
+        Check(ccu::EventWait(copied), "mailbox local read wait");
+        Check(ccu::LocalCopy(destination, buffer, bytes, copied), "mailbox local write");
+        Check(ccu::EventWait(copied), "mailbox local write wait");
+        Check(ccu::Write(args.channel, remote, source, bytes, copied), "mailbox remote write");
+        Check(ccu::EventWait(copied), "mailbox remote write wait");
+    }
+    Check(ccu::NotifyRecord(args.channel, 0, 2), "mailbox notify done");
+    Check(ccu::NotifyWait(args.channel, 0, 2), "mailbox wait done");
+}
+
+CcuResult ServiceBroadcastProgram(const BroadcastArgs *args) {
+    namespace ccu = AscendC::ccu;
+    try {
+        ccu::Variable base, source_token, destination_token, peer_token;
+        Check(ccu::LoadArg(base, 0), "service mailbox");
+        Check(ccu::LoadArg(source_token, 1), "source token");
+        Check(ccu::LoadArg(destination_token, 2), "destination token");
+        Check(ccu::LoadArg(peer_token, 3), "peer token");
+        return simpler::ccu_service::RecordService(base, [&](ccu::Array<ccu::Variable> &request) {
+            RecordMailboxBroadcast(
+                *args, source_token, destination_token, peer_token, request[1], request[2], request[3], request[4]
+            );
+            return CCU_SUCCESS;
+        });
+    } catch (const std::exception &error) {
+        last_error = error.what();
+        return CCU_E_INTERNAL;
+    }
+}
+
 CcuResult ResidentBroadcastProgram(const BroadcastArgs *args) {
     namespace ccu = AscendC::ccu;
     try {
@@ -143,10 +196,6 @@ CcuResult ResidentBroadcastProgram(const BroadcastArgs *args) {
         done_offset = offsetof(CcuContractMailbox, done);
         ccu::Variable release_addr, done_addr, ready, released;
         ccu::Array<ccu::Variable> request(5);
-        ccu::LocalAddr source, destination;
-        ccu::RemoteAddr remote;
-        ccu::Event copied;
-        ccu::CcuBuffer buffer;
 
         CCU_WHILE(completed != kCcuContractRounds) {
             ready = 0;
@@ -155,24 +204,9 @@ CcuResult ResidentBroadcastProgram(const BroadcastArgs *args) {
             release_addr = cursor + release_offset;
             released = 0;
             CCU_WHILE(released != 1) { Check(ccu::Load(release_addr, released), "resident wait release"); }
-            Check(ccu::NotifyRecord(args->channel, 0, 1), "resident notify ready");
-            Check(ccu::NotifyWait(args->channel, 0, 1), "resident wait ready");
-            if (args->is_root) {
-                source.addr = request[1];
-                source.token = source_token;
-                destination.addr = request[2];
-                destination.token = destination_token;
-                remote.addr = request[3];
-                remote.token = peer_token;
-                Check(ccu::LocalCopy(buffer, source, request[4], copied), "resident local read");
-                Check(ccu::EventWait(copied), "resident local read wait");
-                Check(ccu::LocalCopy(destination, buffer, request[4], copied), "resident local write");
-                Check(ccu::EventWait(copied), "resident local write wait");
-                Check(ccu::Write(args->channel, remote, source, request[4], copied), "resident remote write");
-                Check(ccu::EventWait(copied), "resident remote write wait");
-            }
-            Check(ccu::NotifyRecord(args->channel, 0, 2), "resident notify done");
-            Check(ccu::NotifyWait(args->channel, 0, 2), "resident wait done");
+            RecordMailboxBroadcast(
+                *args, source_token, destination_token, peer_token, request[1], request[2], request[3], request[4]
+            );
             done_addr = cursor + done_offset;
             Check(ccu::Store(done_addr, one), "resident store completion");
             cursor += record_bytes;
@@ -203,6 +237,7 @@ struct Session {
     bool borrowed_data = false;
     void *trigger_status = nullptr;
     void *mailboxes = nullptr;
+    bool service = false;
     CcuPeerInfo peer{};
     std::vector<ChannelHandle> channels;
     bool launched = false;
@@ -496,7 +531,7 @@ extern "C" int ccu_demo_wait_and_verify(void *handle, uint32_t root, int timeout
 }
 
 extern "C" int ccu_demo_prepare_resident(
-    void *handle, const CcuPeerInfo *peers, size_t peer_count, uint32_t root, uint64_t *mailboxes
+    void *handle, const CcuPeerInfo *peers, size_t peer_count, uint32_t root, bool service, uint64_t *mailboxes
 ) {
     return Protect([&] {
         auto &session = Get(handle);
@@ -505,7 +540,7 @@ extern "C" int ccu_demo_prepare_resident(
             throw std::invalid_argument("Resident test requires separate GM allocations and 64 input floats");
         }
         Check(aclrtSetDevice(session.device), "aclrtSetDevice(resident prepare)");
-        constexpr size_t bytes = sizeof(CcuContractMailbox) * kCcuContractRounds;
+        const size_t bytes = service ? sizeof(CcuServiceProbe) : sizeof(CcuContractMailbox) * kCcuContractRounds;
         if (session.kernel == 0) {
             Check(aclrtMalloc(&session.mailboxes, bytes, ACL_MEM_MALLOC_HUGE_FIRST), "aclrtMalloc(mailboxes)");
             uint32_t instance_count = 0;
@@ -515,17 +550,21 @@ extern "C" int ccu_demo_prepare_resident(
             const BroadcastArgs program{session.channels.at(0), 0, session.rank == root};
             const void *program_args[] = {&program};
             Check(HcommCcuKernelRegisterStart(session.instance), "resident register start");
+            const auto build_program = service ? ServiceBroadcastProgram : ResidentBroadcastProgram;
+            const char *name = service ? "SimplerServiceBroadcast" : "SimplerResidentBroadcast";
             const auto ret = HcommCcuKernelRegister(
-                session.instance, die, "SimplerResidentBroadcast",
-                reinterpret_cast<const void *>(ResidentBroadcastProgram), program_args, 1, &session.kernel
+                session.instance, die, name, reinterpret_cast<const void *>(build_program), program_args, 1,
+                &session.kernel
             );
             if (ret != CCU_SUCCESS && !last_error.empty()) throw std::runtime_error(last_error);
             Check(ret, "resident register");
             Check(HcommCcuKernelRegisterEnd(session.instance), "resident register end");
             session.root = root;
-            std::fprintf(stderr, "CCU_RESIDENT_REGISTER rank=%u io_die=%u\n", session.rank, die);
+            session.service = service;
+            std::fprintf(stderr, "CCU_RESIDENT_REGISTER rank=%u io_die=%u service=%d\n", session.rank, die, service);
         }
-        if (session.root != root || session.mailboxes == nullptr) throw std::invalid_argument("Incompatible program");
+        if (session.root != root || session.service != service || session.mailboxes == nullptr)
+            throw std::invalid_argument("Incompatible program");
         const std::vector<float> empty_input(kWindowFloats, kSentinel);
         const auto input_bytes = empty_input.size() * sizeof(float);
         Check(
@@ -548,7 +587,8 @@ extern "C" int ccu_demo_prepare_resident(
 extern "C" int ccu_demo_verify_resident(void *handle, bool deferred) {
     return Protect([&] {
         auto &session = Get(handle);
-        if (!session.launched || session.mailboxes == nullptr) throw std::invalid_argument("No resident launch");
+        if (!session.launched || session.service || session.mailboxes == nullptr)
+            throw std::invalid_argument("No resident launch");
         Check(aclrtSetDevice(session.device), "aclrtSetDevice(resident verify)");
         Check(aclrtSynchronizeStreamWithTimeout(session.stream, 30000), "resident stream completion");
         session.drained = true;
@@ -598,6 +638,60 @@ extern "C" int ccu_demo_verify_resident(void *handle, bool deferred) {
         }
         std::fprintf(
             stderr, "CCU_RESIDENT_VERIFIED rank=%u rounds=%u deferred=%d\n", session.rank, kCcuContractRounds, deferred
+        );
+    });
+}
+
+extern "C" int ccu_demo_verify_service(void *handle, uint32_t rounds) {
+    return Protect([&] {
+        auto &session = Get(handle);
+        if (!session.launched || !session.service || session.mailboxes == nullptr || rounds > kCcuServiceMaxRounds)
+            throw std::invalid_argument("No compatible service launch");
+        Check(aclrtSetDevice(session.device), "aclrtSetDevice(service verify)");
+        CcuServiceProbe status{};
+        Check(
+            aclrtMemcpy(&status, sizeof(status), session.mailboxes, sizeof(status), ACL_MEMCPY_DEVICE_TO_HOST),
+            "service status readback"
+        );
+        const bool stop_acknowledged =
+            status.slot.completed == rounds + 1 && status.slot.command == simpler::ccu_service::kStop;
+        if (stop_acknowledged) {
+            Check(aclrtSynchronizeStreamWithTimeout(session.stream, 30000), "service exit");
+            session.drained = true;
+        }
+        if (!stop_acknowledged || status.failure != 0 || status.verified != rounds) {
+            throw std::runtime_error(
+                "CCU service rank " + std::to_string(session.rank) + " verified " + std::to_string(status.verified) +
+                " completed " + std::to_string(status.slot.completed) + " command " +
+                std::to_string(status.slot.command) + " failure " + std::to_string(status.failure)
+            );
+        }
+        std::vector<float> input(kWindowFloats), output(kWindowFloats);
+        const size_t bytes = output.size() * sizeof(float);
+        Check(aclrtMemcpy(input.data(), bytes, session.window, bytes, ACL_MEMCPY_DEVICE_TO_HOST), "service input");
+        Check(
+            aclrtMemcpy(output.data(), bytes, session.separate_output, bytes, ACL_MEMCPY_DEVICE_TO_HOST),
+            "service output"
+        );
+        const uint32_t last = rounds == 0 ? 0 : rounds - 1;
+        const uint32_t offset = last % 2 == 0 ? 0 : kCcuServiceOffset;
+        const uint32_t length = last % 2 == 0 ? kCcuServiceShortCount : kCcuServiceLongCount;
+        const uint32_t count = rounds == 0 ? 0 : length;
+        const uint32_t seed = last * kCcuServiceFloats;
+        for (uint32_t i = 0; i < kWindowFloats; ++i) {
+            const bool produced = i >= kGuardCount + offset && i < kGuardCount + offset + count;
+            const bool received = i >= kOutputOffset + offset && i < kOutputOffset + offset + count;
+            const float expected_input =
+                produced ? InputValue(session.rank, session.iteration, seed + i - kGuardCount) : kSentinel;
+            const float expected_output =
+                received ? InputValue(session.root, session.iteration, seed + i - kOutputOffset) : kSentinel;
+            if (input[i] != expected_input || output[i] != expected_output) {
+                throw std::runtime_error("Service result/guard mismatch at float " + std::to_string(i));
+            }
+        }
+        std::fprintf(
+            stderr, "CCU_SERVICE_VERIFIED rank=%u rounds=%u stop_generation=%llu\n", session.rank, rounds,
+            static_cast<unsigned long long>(status.slot.completed)
         );
     });
 }

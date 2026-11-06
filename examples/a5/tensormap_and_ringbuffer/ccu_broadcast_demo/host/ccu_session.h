@@ -37,9 +37,10 @@ int ccu_demo_next_run(void *session, uint32_t count, uint32_t iteration);
 uint64_t ccu_demo_program_handle(void *session);
 int ccu_demo_verify_program_retired(int device, uint64_t kernel);
 int ccu_demo_prepare_resident(
-    void *session, const CcuPeerInfo *peers, size_t peer_count, uint32_t root, uint64_t *mailboxes
+    void *session, const CcuPeerInfo *peers, size_t peer_count, uint32_t root, bool service, uint64_t *mailboxes
 );
 int ccu_demo_verify_resident(void *session, bool deferred);
+int ccu_demo_verify_service(void *session, uint32_t rounds);
 int ccu_demo_prepare(
     void *session, const CcuPeerInfo *peers, size_t peer_count, uint32_t root, uint64_t *gate_va, uint32_t *gate_mask
 );
