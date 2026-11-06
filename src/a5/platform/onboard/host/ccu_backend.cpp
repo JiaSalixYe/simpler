@@ -297,11 +297,18 @@ CcuResult RecordDispatcher(const Session *session) {
         isa::Variable command, idle, status, command_addr, completed_addr, status_addr, tensors_addr, scalars_addr;
         idle = kIdle;
         command = kIdle;
-        command_addr = base + static_cast<uint16_t>(offsetof(Mailbox, command));
-        completed_addr = base + static_cast<uint16_t>(offsetof(Mailbox, completed));
-        status_addr = base + static_cast<uint16_t>(offsetof(Mailbox, status));
-        tensors_addr = base + static_cast<uint16_t>(offsetof(Mailbox, tensors));
-        scalars_addr = base + static_cast<uint16_t>(offsetof(Mailbox, scalars));
+        // A5 CCU V1 lowers variable + variable, but not variable + uint16_t.
+        isa::Variable offset;
+        offset = offsetof(Mailbox, command);
+        command_addr = base + offset;
+        offset = offsetof(Mailbox, completed);
+        completed_addr = base + offset;
+        offset = offsetof(Mailbox, status);
+        status_addr = base + offset;
+        offset = offsetof(Mailbox, tensors);
+        tensors_addr = base + offset;
+        offset = offsetof(Mailbox, scalars);
+        scalars_addr = base + offset;
         isa::Array<isa::Variable> request(4), tensors(kMaxTensors * 2), scalars(kMaxScalars);
         const BuilderContextV1 context{kBuilderAbiVersion, session->rank, session->channel, local_window,
                                        local_token,        peer_window,   peer_token,       request[2],
