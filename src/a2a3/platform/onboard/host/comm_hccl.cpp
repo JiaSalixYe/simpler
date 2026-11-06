@@ -41,6 +41,9 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "acl/acl.h"
@@ -75,8 +78,13 @@ struct VmmWindow {
     VmmWindow &operator=(VmmWindow &&other) noexcept;
 };
 
-// Per-domain dynamic allocation. One of these exists per
-// orch.allocate_domain call and owns every VMM mapping for that domain.
+struct HostWindow {
+    void *cpu = nullptr;
+    uint64_t device_base = 0;
+    bool registered = false;
+};
+
+// Each rank owns its device mappings. L3 owns the POSIX Host backing.
 struct DomainAllocation {
     ~DomainAllocation();
 
@@ -86,6 +94,8 @@ struct DomainAllocation {
     bool release_failed = false;
     VmmWindow local_window;
     std::vector<VmmWindow> peer_windows;
+    std::vector<HostWindow> host_windows;
+    size_t host_window_size = 0;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
 };
 
@@ -369,6 +379,32 @@ static aclError release_domain_windows(DomainAllocation *alloc) {
     aclError first_error = release_vmm_windows(&alloc->peer_windows);
     record_first_error(release_vmm_window(&alloc->local_window), &first_error);
     return first_error;
+}
+
+static int release_host_domain_windows(DomainAllocation &alloc) {
+    if (alloc.device_ctx != nullptr) {
+        if (aclrtFree(alloc.device_ctx) != ACL_SUCCESS) return COMM_RECLAMATION_UNCONFIRMED;
+        alloc.device_ctx = nullptr;
+    }
+    aclError first_error = ACL_SUCCESS;
+    for (auto &window : alloc.host_windows) {
+        if (window.registered) {
+            const aclError status = aclrtHostUnregister(window.cpu);
+            if (status != ACL_SUCCESS) {
+                record_first_error(status, &first_error);
+                continue;
+            }
+            window.registered = false;
+        }
+        if (window.cpu != nullptr) {
+            if (munmap(window.cpu, alloc.host_window_size) != 0) {
+                record_first_error(ACL_ERROR_FAILURE, &first_error);
+            } else {
+                window.cpu = nullptr;
+            }
+        }
+    }
+    return first_error == ACL_SUCCESS ? 0 : COMM_RECLAMATION_UNCONFIRMED;
 }
 
 static aclError release_base_windows(CommHandle h) {
@@ -1486,6 +1522,84 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 }
 
+static int map_host_domain_windows(DomainAllocation &owner, const char *const *names, size_t size) {
+    CommContext ctx{};
+    ctx.rankId = static_cast<uint32_t>(owner.rank);
+    ctx.rankNum = static_cast<uint32_t>(owner.nranks);
+    ctx.winSize = size;
+    owner.host_window_size = size;
+    owner.host_windows.resize(ctx.rankNum);
+    for (uint32_t rank = 0; rank < ctx.rankNum; ++rank) {
+        const std::string name = std::string("/") + names[rank];
+        const int fd = shm_open(name.c_str(), O_RDWR | O_CLOEXEC, 0);
+        if (fd < 0) return -1;
+        struct stat info{};
+        if (fstat(fd, &info) != 0 || info.st_size < static_cast<off_t>(size)) {
+            close(fd);
+            return -1;
+        }
+        void *cpu = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        close(fd);
+        if (cpu == MAP_FAILED) return -1;
+        auto &window = owner.host_windows[rank];
+        window.cpu = cpu;
+        void *device = nullptr;
+        const aclError status = aclrtHostRegister(cpu, size, ACL_HOST_REGISTER_MAPPED, &device);
+        if (status != ACL_SUCCESS) {
+            LOG_ERROR("Host domain: aclrtHostRegister for window %u failed: %d", rank, static_cast<int>(status));
+            return -1;
+        }
+        window.registered = true;
+        if (device == nullptr) return -1;
+        window.device_base = reinterpret_cast<uint64_t>(device);
+        ctx.windowsIn[rank] = ctx.windowsOut[rank] = window.device_base;
+    }
+    void *device_ctx = nullptr;
+    if (aclrtMalloc(&device_ctx, sizeof(ctx), ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) return -1;
+    owner.device_ctx = static_cast<CommContext *>(device_ctx);
+    if (aclrtMemcpy(device_ctx, sizeof(ctx), &ctx, sizeof(ctx), ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) return -1;
+    return 0;
+}
+
+extern "C" int comm_alloc_host_domain_windows(
+    CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size, uint32_t workspace_mask, const char *const *host_shm_names, uint64_t *device_ctx_out,
+    uint64_t *local_window_base_out, size_t *actual_window_size_out
+) try {
+    if (workspace_mask != 0) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
+    if (!h || !rank_ids || !host_shm_names || !device_ctx_out || !local_window_base_out || !actual_window_size_out ||
+        rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0 ||
+        rank_ids[domain_rank] != static_cast<uint32_t>(h->rank))
+        return -1;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0 || window_size > static_cast<size_t>(std::numeric_limits<off_t>::max()) - page_size) return -1;
+    const size_t page = static_cast<size_t>(page_size);
+    const size_t size = ((window_size + page - 1) / page) * page;
+    for (size_t i = 0; i < rank_count; ++i) {
+        const char *name = host_shm_names[i];
+        if (name == nullptr || name[0] == '\0' || strnlen(name, 32) > 31 || std::strchr(name, '/') != nullptr)
+            return -1;
+    }
+    auto alloc = std::make_unique<DomainAllocation>();
+    alloc->rank = static_cast<int>(domain_rank);
+    alloc->nranks = static_cast<int>(rank_count);
+    auto [it, inserted] = h->domain_allocations.emplace(allocation_id, std::move(alloc));
+    if (!inserted) return -1;
+    auto &owner = *it->second;
+    try {
+        if (map_host_domain_windows(owner, host_shm_names, size) != 0) return COMM_INITIALIZATION_ABORT_REQUIRED;
+        owner.initialized = true;
+        *device_ctx_out = reinterpret_cast<uint64_t>(owner.device_ctx);
+        *local_window_base_out = owner.host_windows[domain_rank].device_base;
+        *actual_window_size_out = size;
+        return 0;
+    } catch (...) {
+        return COMM_INITIALIZATION_ABORT_REQUIRED;
+    }
+} catch (...) {
+    return -1;
+}
+
 static int release_domain_allocation(
     CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank, bool collective
 ) try {
@@ -1510,6 +1624,12 @@ static int release_domain_allocation(
             h->rank, rank_count, domain_rank, alloc->nranks, alloc->rank
         );
         return -1;
+    }
+    if (alloc->host_window_size != 0) {
+        // L3 has drained accepted uses; registrations can retire independently.
+        const int rc = release_host_domain_windows(*alloc);
+        if (rc == 0) h->domain_allocations.erase(it);
+        return rc;
     }
     int rc = 0;
     // Published domains enter the subset barrier before local teardown.
@@ -1744,6 +1864,18 @@ extern "C" int comm_global_domain_release(uint64_t domain_id) try {
 
 extern "C" int comm_destroy(CommHandle h) try {
     if (!h) return -1;
+
+    // Keep registration owners and the runtime alive if retirement is unconfirmed.
+    for (auto it = h->domain_allocations.begin(); it != h->domain_allocations.end();) {
+        auto &alloc = *it->second;
+        if (alloc.host_window_size == 0) {
+            ++it;
+            continue;
+        }
+        const int status = release_host_domain_windows(alloc);
+        if (status != 0) return status;
+        it = h->domain_allocations.erase(it);
+    }
 
     // Final barrier is best-effort: if a peer already crashed we still need to
     // release the local resources we own, so timeout just logs and proceeds.

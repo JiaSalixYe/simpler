@@ -288,6 +288,19 @@ int comm_alloc_domain_windows(
 );
 
 /**
+ * Map the L3-owned POSIX Host windows in domain rank order on this device.
+ * Names are bare POSIX names and the caller owns unlink. Each windowsIn/Out
+ * entry addresses this device's mapping of the corresponding Host window.
+ * workspace_mask must be zero. The runtime retains local registrations until
+ * abort/release; the symbol is optional on backends without Host windows.
+ */
+int comm_alloc_host_domain_windows(
+    CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size, uint32_t workspace_mask, const char *const *host_shm_names, uint64_t *device_ctx_out,
+    uint64_t *local_window_base_out, size_t *actual_window_size_out
+);
+
+/**
  * Collectively release a domain window pool allocated by
  * comm_alloc_domain_windows().
  *

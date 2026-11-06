@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from simpler_setup.runtime_builder import RuntimeBinaries
 
     from .callable_identity import CallableHandle
+    from .worker import _SharedMemoryOwner
 
 import _task_interface as _ti_module  # pyright: ignore[reportMissingImports]
 from _task_interface import (  # pyright: ignore[reportMissingImports]
@@ -1174,6 +1175,8 @@ class CommDomainHandle:
         "_config",
         "_ref",
         "requested_window_size",
+        "_memory_source",
+        "_host_window_owner",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1195,10 +1198,13 @@ class CommDomainHandle:
         _domain_ranks: dict[int, int] | None = None,
         ref: CommDomainRef | None = None,
         requested_window_size: int | None = None,
+        memory_source: AddressSpace = AddressSpace.DEVICE,
         _release_scope: Callable[[CommDomainHandle], contextlib.AbstractContextManager] = contextlib.nullcontext,
         _use_fn: Callable[[CommDomainHandle], None] | None = None,
     ) -> None:
         self.name = name
+        self._memory_source = memory_source
+        self._host_window_owner: _SharedMemoryOwner | None = None
         self.workers = tuple(workers)
         self.contexts: dict[int, ChipDomainContext] = dict(contexts or {})
         self.allocation_id = int(allocation_id)
@@ -1222,6 +1228,10 @@ class CommDomainHandle:
         self._freed = False
         self._ref = ref
         self.requested_window_size = self.mapping_size if requested_window_size is None else int(requested_window_size)
+
+    @property
+    def memory_source(self) -> AddressSpace:
+        return self._memory_source
 
     def __getitem__(self, chip_idx: int) -> ChipDomainContext:
         self._require_live()

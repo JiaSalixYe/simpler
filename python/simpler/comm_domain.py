@@ -14,6 +14,8 @@ import operator
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING
 
+from _task_interface import AddressSpace
+
 if TYPE_CHECKING:
     from .task_interface import CommBufferSpec
 
@@ -53,9 +55,19 @@ class DomainConfig:
     retain_after_run: bool
     topology: tuple
     workspace_engines: tuple[str, ...] = ()
+    memory_source: AddressSpace = AddressSpace.DEVICE
 
     @classmethod
-    def capture(cls, members, window_size, buffers, retain_after_run, topology, workspace_engines=()):
+    def capture(
+        cls,
+        members,
+        window_size,
+        buffers,
+        retain_after_run,
+        topology,
+        workspace_engines=(),
+        memory_source=AddressSpace.DEVICE,
+    ):
         snapshot = tuple(
             (
                 str(b.name),
@@ -85,8 +97,12 @@ class DomainConfig:
                 )
         if sum(b[3] for b in snapshot) > window_size:
             raise ValueError("domain buffers exceed window_size")
+        if memory_source not in (AddressSpace.HOST, AddressSpace.DEVICE):
+            raise ValueError("domain memory_source must be AddressSpace.HOST or AddressSpace.DEVICE")
         workspace_engines = normalize_workspace_engines(workspace_engines)
-        return cls(members, window_size, snapshot, bool(retain_after_run), tuple(topology), workspace_engines)
+        return cls(
+            members, window_size, snapshot, bool(retain_after_run), tuple(topology), workspace_engines, memory_source
+        )
 
     def workspace_mask(self) -> int:
         return sum(1 << ("sdma", "urma", "rdma").index(name) for name in self.workspace_engines)

@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 import simpler.worker as worker_mod
-from simpler.buffer import AccessMode, buffer_reference, wrap_vmm_window
+from simpler.buffer import AccessMode, AddressSpace, buffer_reference, wrap_vmm_window
 from simpler.orchestrator import _callback_run
 from simpler.task_interface import CommBufferSpec, CommDomainHandle, DataType, GlobalCommDomainHandle, TaskArgs
 from simpler.worker import Worker
@@ -1318,3 +1318,46 @@ def test_checked_device_context_validates_live_domain_and_scalar_use(domain_work
     handle.release()
     with pytest.raises(RuntimeError, match="released"):
         handle.device_context(handle.workers[0], workspace_engines=("urma",))
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+@pytest.mark.parametrize("committed", [False, True])
+def test_host_source_domain_reclaims_names_after_failed_dispatch(domain_worker, monkeypatch, committed):
+    worker, members = domain_worker
+    monkeypatch.setitem(worker._config, "platform", "a2a3")
+    monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
+    names = []
+    released = []
+
+    def dispatch(*, workers, request_shms, reply_shms, op, allocation_id):
+        if op == "release":
+            released.extend(workers)
+            return
+        slot = worker_mod._CTRL_SHM_NAME_BYTES
+        rank_count = len(workers)
+        for chip in workers:
+            request = request_shms[chip].buf
+            _, _, _, _, count = worker_mod._DOMAIN_REQ_HEADER.unpack_from(request)
+            flags = struct.unpack_from("<I", request, worker_mod._DOMAIN_WORKSPACE_MASK_OFFSET)[0]
+            assert flags == worker_mod._DOMAIN_HOST_WINDOW_FLAG
+            tail = worker_mod._DOMAIN_REQ_HEADER.size + count * 8 + rank_count * 4
+            slots = [worker_mod._read_shm_name(request, tail + rank * slot) for rank in range(rank_count)]
+            if names:
+                assert slots == names
+            else:
+                names.extend(slots)
+        if committed:
+            struct.pack_into("<Q", reply_shms[workers[0]].buf, 0, 1)
+        raise RuntimeError("injected Host registration failure")
+
+    monkeypatch.setattr(worker, "_dispatch_control_domain", dispatch)
+    with pytest.raises(RuntimeError, match="injected Host registration failure"):
+        worker.run(
+            lambda orch, _args, _cfg: orch.get_or_allocate_domain(**_request(members, memory_source=AddressSpace.HOST))
+        )
+    assert len(set(names)) == len(members)
+    assert released == (members[:1] if committed else [])
+    for name in names:
+        with pytest.raises(FileNotFoundError):
+            worker_mod.SharedMemory(name=name)
+    assert worker.live_domains == {}
