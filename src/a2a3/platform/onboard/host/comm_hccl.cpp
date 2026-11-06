@@ -85,7 +85,7 @@ struct HostWindow {
     bool registered = false;
 };
 
-// A rank owns its backing, device mappings and optional SDMA workspace.
+// A rank owns its device mappings and optional SDMA workspace. L3 owns the Host backing.
 struct DomainAllocation {
     ~DomainAllocation();
 
@@ -97,8 +97,6 @@ struct DomainAllocation {
     std::vector<VmmWindow> peer_windows;
     std::vector<HostWindow> host_windows;
     size_t host_window_size = 0;
-    std::string host_shm_name;
-    bool owns_host_shm = false;
     void *sdma_workspace = nullptr;
     bool host_cleanup_unconfirmed = false;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
@@ -1209,10 +1207,6 @@ static int release_host_domain_windows(DomainAllocation &alloc) {
         }
     }
     if (first_error != ACL_SUCCESS) return COMM_RECLAMATION_UNCONFIRMED;
-    if (alloc.owns_host_shm) {
-        if (shm_unlink(alloc.host_shm_name.c_str()) != 0 && errno != ENOENT) return COMM_RECLAMATION_UNCONFIRMED;
-        alloc.owns_host_shm = false;
-    }
     return 0;
 }
 
@@ -1559,21 +1553,13 @@ static bool valid_host_shm_name(const char *name) {
     return true;
 }
 
-static bool map_host_domain_window(DomainAllocation &owner, uint32_t rank, const char *name, bool create) {
+static bool map_host_domain_window(DomainAllocation &owner, uint32_t rank, const char *name) {
     const std::string path = std::string("/") + name;
-    if (create) owner.host_shm_name = path;
-    const int flags = O_RDWR | O_CLOEXEC | (create ? O_CREAT | O_EXCL : 0);
-    const int fd = shm_open(path.c_str(), flags, 0600);
+    const int fd = shm_open(path.c_str(), O_RDWR | O_CLOEXEC, 0);
     if (fd < 0) return false;
     const auto size = static_cast<off_t>(owner.host_window_size);
     struct stat info{};
-    bool sized;
-    if (create) {
-        owner.owns_host_shm = true;
-        sized = ftruncate(fd, size) == 0;
-    } else {
-        sized = fstat(fd, &info) == 0 && info.st_size == size;
-    }
+    const bool sized = fstat(fd, &info) == 0 && info.st_size == size;
     void *cpu = sized ? mmap(nullptr, owner.host_window_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
     close(fd);
     if (cpu == MAP_FAILED) return false;
@@ -1634,13 +1620,13 @@ init_host_domain_context(CommHandle h, uint64_t allocation_id, DomainAllocation 
     ctx.rankNum = static_cast<uint32_t>(owner.nranks);
     ctx.winSize = owner.host_window_size;
     owner.host_windows.resize(ctx.rankNum);
-    const bool mapped = map_host_domain_window(owner, ctx.rankId, name, true);
+    const bool mapped = map_host_domain_window(owner, ctx.rankId, name);
     if (sdma) {
         std::vector<std::string> names;
         if (!exchange_host_window_names(h, allocation_id, owner, mapped ? name : nullptr, names)) return false;
         for (uint32_t peer = 0; peer < ctx.rankNum; ++peer) {
             if (peer == ctx.rankId) continue;
-            if (!map_host_domain_window(owner, peer, names[peer].c_str(), false)) return false;
+            if (!map_host_domain_window(owner, peer, names[peer].c_str())) return false;
             ctx.windowsIn[peer] = owner.host_windows[peer].device_base;
         }
         uint64_t addresses[DMA_WORKSPACE_SDMA + 1]{};

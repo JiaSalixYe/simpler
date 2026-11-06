@@ -9,6 +9,7 @@
 """A3 retained Host windows with local MTE and cross-rank SDMA."""
 
 import struct
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -134,32 +135,42 @@ def test_a3_host_source_domain(st_platform, st_device_ids, sdma, depth):
             state["device"] = orch.get_or_allocate_domain(
                 name="device",
                 members=[1, 0],
-                window_size=2 * nbytes,
-                buffers=[CommBufferSpec(name, "float32", count, nbytes) for name in ("out", "result")],
+                window_size=2 * depth * nbytes,
+                buffers=[CommBufferSpec(name, "float32", depth * count, depth * nbytes) for name in ("out", "result")],
                 retain_after_run=True,
             )
+            if sdma:
+                for rank in range(2):
+                    for name in ("out", "result"):
+                        orch.copy_to_domain(state["device"], rank, bytes(depth * nbytes), buffer=name)
 
         worker.run(prepare)
         host, device = state["host"], state["device"]
         windows = [host.member(rank).buffers["table"].shm for rank in range(2)]
-        with pytest.raises(RuntimeError, match="belongs to L2"):
+        with pytest.raises(RuntimeError, match="belongs to the domain"):
             windows[0].unlink()
         with pytest.raises(ValueError, match="Host domain windows use CPU access"):
             worker.copy_to(host.member(0).buffers["table"], scratch)
         with pytest.raises(ValueError, match="Host domain windows use CPU access"):
             worker.copy_from(scratch, host.member(0).buffers["table"])
 
-        def run_gather(orch, _args, cfg):
+        def run_gather(orch, _args, cfg, *, slot=0):
             assert orch.get_or_allocate_domain(**request) is host
+            byte_offset = slot * nbytes
             for rank in range(2 if sdma else 1):
                 member = host.member(rank)
                 outputs = device.member(rank).buffers
                 args = TaskArgs()
                 args.add_tensor(member.buffers["table"].tensor((count,), DataType.FLOAT32), TensorArgType.INPUT)
                 out = outputs["out"] if sdma else member.buffers["out"]
-                args.add_tensor(out.tensor((count,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+                args.add_tensor(
+                    out.tensor((count,), DataType.FLOAT32, byte_offset=byte_offset), TensorArgType.OUTPUT_EXISTING
+                )
                 if sdma:
-                    args.add_tensor(outputs["result"].tensor((count,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+                    args.add_tensor(
+                        outputs["result"].tensor((count,), DataType.FLOAT32, byte_offset=byte_offset),
+                        TensorArgType.OUTPUT_EXISTING,
+                    )
                 else:
                     args.add_scalar(1)
                 args.add_scalar(host.device_context(member.local_worker_id, workspace_engines=engines))
@@ -167,20 +178,25 @@ def test_a3_host_source_domain(st_platform, st_device_ids, sdma, depth):
 
         offset, _ = host.buffer_range("out")
         for value in (1.0, 5.0):
-            for rank, data in enumerate((value, 2.0)):
+            for rank, data in enumerate((value, value + 1.0)):
                 with windows[rank].buf[prefix : prefix + nbytes] as table:
                     table[:] = struct.pack(f"<{count}f", *([data] * count))
             pending = worker.submit(run_gather)
-            following = worker.submit(run_gather) if depth == 2 else None
+            following = worker.submit(partial(run_gather, slot=1)) if depth == 2 else None
             pending.wait()
             if following is not None:
                 following.wait()
             assert all(bytes(window.buf[:prefix]) == bytes(prefix) for window in windows)
             if sdma:
-                for rank, data in enumerate((2.0, value)):
+                for rank, data in enumerate((value + 1.0, value)):
                     for name, expected in (("out", data), ("result", data + 1.0)):
-                        worker.copy_from(scratch, device.member(rank).buffers[name])
-                        assert struct.unpack_from(f"<{count}f", scratch.shm.buf) == (expected,) * count
+                        for slot in range(depth):
+                            worker.copy_from(scratch, device.member(rank).buffers[name], src_offset=slot * nbytes)
+                            assert struct.unpack_from(f"<{count}f", scratch.shm.buf) == (expected,) * count, (
+                                rank,
+                                name,
+                                slot,
+                            )
             else:
                 assert struct.unpack_from(f"<{count}f", windows[0].buf, offset) == (value,) * count
         with windows[0].buf[prefix : prefix + nbytes] as exported:

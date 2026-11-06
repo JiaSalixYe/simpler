@@ -10722,10 +10722,8 @@ class Worker:
         # per-chip reply shm.  We let the chip child write back its own slot.
         buffer_count = len(buffers)
         req_size = _DOMAIN_REQ_HEADER.size + buffer_count * 8 + len(workers) * 4
-        host_names = {}
-        if memory_source == AddressSpace.HOST:
-            host_names = {chip: "sph_" + uuid.uuid4().hex[:24] for chip in workers}
-            req_size += _CTRL_SHM_NAME_BYTES
+        host_owner = _SharedMemoryOwner(len(workers)) if memory_source == AddressSpace.HOST else None
+        req_size += _CTRL_SHM_NAME_BYTES if host_owner is not None else 0
         reply_size = _DOMAIN_REPLY_HEADER.size + buffer_count * 8
         # Precompute worker → dense rank for O(1) lookup in the staging /
         # context loops below (and again in _release_domain_handle).  Without
@@ -10740,8 +10738,13 @@ class Worker:
             nonlocal handle
             request_shms: dict[int, SharedMemory] = {}
             reply_shms: dict[int, SharedMemory] = {}
+            host_windows: dict[int, SharedMemory] = {}
             dispatch_started = False
             try:
+                if host_owner is not None:
+                    page = os.sysconf("SC_PAGE_SIZE")
+                    size = ((window_size + page - 1) // page) * page
+                    host_windows = {chip: host_owner.create(size) for chip in workers}
                 for chip_idx in workers:
                     req = staged_shms.create(req_size)
                     request_shms[chip_idx] = req
@@ -10767,9 +10770,10 @@ class Worker:
                         struct.pack_into(f"<{buffer_count}Q", req_buf, nbytes_off, *[int(b.nbytes) for b in buffers])
                     rank_ids_off = nbytes_off + buffer_count * 8
                     struct.pack_into(f"<{len(workers)}I", req_buf, rank_ids_off, *[int(w) for w in workers])
-                    if chip_idx in host_names:
-                        host_name_offset = rank_ids_off + len(workers) * 4
-                        struct.pack_into("32s", req_buf, host_name_offset, host_names[chip_idx].encode("ascii"))
+                    if chip_idx in host_windows:
+                        struct.pack_into(
+                            "32s", req_buf, rank_ids_off + len(workers) * 4, host_windows[chip_idx].name.encode("ascii")
+                        )
                     reply = staged_shms.create(reply_size)
                     reply_shms[chip_idx] = reply
 
@@ -10789,6 +10793,7 @@ class Worker:
                     _domain_ranks=worker_to_rank,
                     memory_source=memory_source,
                 )
+                handle._host_window_owner = host_owner
                 handle._allocation_pending = True  # noqa: SLF001 -- owner controls publication/rollback
                 self._live_domains[name] = handle
                 resources.live_domains[name] = handle
@@ -10826,8 +10831,8 @@ class Worker:
                         if buffer_count:
                             ptrs = list(struct.unpack_from(f"<{buffer_count}Q", reply_buf, _DOMAIN_REPLY_HEADER.size))
                         host_mapping = None
-                        if chip_idx in host_names:
-                            host_mapping = HostDomainMapping(host_names[chip_idx], int(actual_window_size))
+                        if chip_idx in host_windows:
+                            host_mapping = HostDomainMapping(host_windows[chip_idx], int(actual_window_size))
                             handle._host_mappings.append(host_mapping)
                         named_buffers: dict[str, Buffer] = {}
                         for i, b in enumerate(buffers):
@@ -10862,13 +10867,17 @@ class Worker:
                         if resources.live_domains.get(name) is handle:
                             resources.live_domains.pop(name)
                         resources.requires_ordered_cleanup = previous_ordered_cleanup
-            except BaseException:  # noqa: BLE001
+            except BaseException as allocation_error:  # noqa: BLE001
                 if handle is not None and not dispatch_started:
                     if self._live_domains.get(name) is handle:
                         self._live_domains.pop(name)
                     if resources.live_domains.get(name) is handle:
                         resources.live_domains.pop(name)
                     resources.requires_ordered_cleanup = previous_ordered_cleanup
+                if host_owner is not None and (not dispatch_started or (handle is not None and not handle.workers)):
+                    cleanup_error = _close_unlink_shms(host_owner)
+                    if cleanup_error is not None:
+                        raise allocation_error from cleanup_error
                 raise
             assert handle is not None
             return handle
@@ -11013,6 +11022,10 @@ class Worker:
 
         with self._hierarchical_start_cv:
             self._cleanup_journal.add_once("domain-retirement", f"{local}:{allocation_id}", retire)
+            if getattr(handle, "_host_window_owner", None) is not None:
+                self._cleanup_journal.add_once(
+                    "host-domain-backing", str(allocation_id), lambda: self._close_domain_host_windows(handle)
+                )
             if self._ordered_cleanup_error is None and (
                 allocation_id not in results or results[allocation_id] is not None
             ):
@@ -11163,10 +11176,7 @@ class Worker:
                 allocation_id=handle.allocation_id,
             )
 
-            for mapping in getattr(handle, "_host_mappings", ()):
-                mapping.close()
-            if getattr(handle, "_host_mappings", None):
-                handle._host_mappings.clear()
+            self._close_domain_host_windows(handle)
 
         def retire_live_handle() -> None:
             if self._live_domains.get(handle.name) is handle:
@@ -11178,6 +11188,19 @@ class Worker:
             name_prefix="shm-domain-release-lifecycle-",
             after_success=retire_live_handle,
         )
+
+    @staticmethod
+    def _close_domain_host_windows(handle: CommDomainHandle) -> None:
+        owner = getattr(handle, "_host_window_owner", None)
+        if owner is None:
+            return
+        for mapping in handle._host_mappings:
+            mapping.close()
+        handle._host_mappings.clear()
+        cleanup_error = _close_unlink_shms(owner)
+        if cleanup_error is not None:
+            raise cleanup_error
+        handle._host_window_owner = None
 
     def _dispatch_control_domain(
         self,
@@ -15152,6 +15175,12 @@ class Worker:
             post_child_err = self._cleanup_journal.drive_kinds({"child", "shm"})
             if post_child_err is not None:
                 errors.append(post_child_err)
+            elif not self._chip_pids:
+                # A reaped chip may have exited abnormally. Retire L3-owned
+                # backing before reporting the child or native teardown error.
+                backing_error = self._cleanup_journal.drive_kinds({"host-domain-backing"})
+                if backing_error is not None:
+                    errors.append(backing_error)
             # Drop next-level worker refs only once their pids/shms are reclaimed.
             if not self._next_level_pids and not self._next_level_shms:
                 self._next_level_workers.clear()

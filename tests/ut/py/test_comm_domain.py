@@ -18,6 +18,7 @@ import threading
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from multiprocessing import shared_memory
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1321,16 +1322,27 @@ def test_checked_device_context_validates_live_domain_and_scalar_use(domain_work
 
 
 @pytest.mark.parametrize("domain_worker", [3], indirect=True)
-def test_a3_host_domain_aborts_only_confirmed_owners(domain_worker, monkeypatch):
+@pytest.mark.parametrize("abort_fails", [False, True])
+def test_a3_host_domain_reclaims_owned_backing_after_lost_reply(domain_worker, monkeypatch, abort_fails):
     worker, members = domain_worker
     monkeypatch.setitem(worker._config, "platform", "a2a3")
     monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
     names = []
     released = []
 
+    def backing_exists(name):
+        try:
+            fd = getattr(shared_memory, "_posixshmem").shm_open(f"/{name}", os.O_RDONLY, 0)
+        except FileNotFoundError:
+            return False
+        os.close(fd)
+        return True
+
     def dispatch(*, workers, request_shms, reply_shms, op, allocation_id):
         if op == "release":
             released.extend(workers)
+            if abort_fails:
+                raise RuntimeError("injected Host abort failure")
             return
         for chip in workers:
             request = request_shms[chip].buf
@@ -1340,7 +1352,10 @@ def test_a3_host_domain_aborts_only_confirmed_owners(domain_worker, monkeypatch)
             tail = worker_mod._DOMAIN_REQ_HEADER.size + count * 8 + rank_count * 4
             assert len(request) >= tail + worker_mod._CTRL_SHM_NAME_BYTES
             names.append(worker_mod._read_shm_name(request, tail))
+            assert backing_exists(names[-1])
         struct.pack_into("<Q", reply_shms[workers[0]].buf, 0, 1)
+        if abort_fails:
+            os.kill(worker._chip_pids[workers[1]], signal.SIGKILL)
         raise RuntimeError("injected Host registration failure")
 
     monkeypatch.setattr(worker, "_dispatch_control_domain", dispatch)
@@ -1353,3 +1368,9 @@ def test_a3_host_domain_aborts_only_confirmed_owners(domain_worker, monkeypatch)
     assert len(set(names)) == len(members)
     assert released == members[:1]
     assert worker.live_domains == {}
+    if abort_fails:
+        assert all(backing_exists(name) for name in names)
+        worker._expected_domain_debt = True
+        with pytest.raises(RuntimeError, match="killed by signal"):
+            worker.close()
+    assert all(not backing_exists(name) for name in names)

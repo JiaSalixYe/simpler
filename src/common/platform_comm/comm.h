@@ -288,8 +288,8 @@ int comm_alloc_domain_windows(
 );
 
 /**
- * Allocate the local POSIX Host window with the given bare name. The runtime
- * owns the allocation and unlink. MTE uses the local mapping. Optional peer
+ * Initialize the local POSIX Host window with the given bare name. On A3
+ * the caller owns the backing and unlink. MTE uses the local mapping. Optional peer
  * access uses the platform's domain workspace (SDMA on A3, URMA on A5).
  * Ownership and abort/release semantics match comm_alloc_domain_windows.
  */

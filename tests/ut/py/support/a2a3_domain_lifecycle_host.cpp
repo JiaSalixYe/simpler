@@ -223,6 +223,9 @@ static void test_host_registration_lifecycle(bool fail_init) {
     const auto size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     const auto name = "simpler_host_ut_" + std::to_string(getpid());
     const auto path = "/" + name;
+    const int fd = shm_open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+    assert(fd >= 0 && ftruncate(fd, static_cast<off_t>(size)) == 0);
+    assert(close(fd) == 0);
     uint64_t ctx = 0, base = 0;
     size_t mapped = 0;
     const uint32_t ranks[] = {0, 1};
@@ -242,7 +245,10 @@ static void test_host_registration_lifecycle(bool fail_init) {
         assert(comm_release_domain_windows(h.get(), 1, 2, 0) == 0);
     }
     assert(h->domain_allocations.empty() && registered_hosts.empty() && mappings.empty());
-    assert(shm_open(path.c_str(), O_RDWR, 0) < 0 && errno == ENOENT);
+    const int owner_fd = shm_open(path.c_str(), O_RDWR, 0);
+    assert(owner_fd >= 0);
+    assert(close(owner_fd) == 0);
+    assert(shm_unlink(path.c_str()) == 0);
 }
 
 int main(int argc, char **argv) {

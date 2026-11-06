@@ -1176,6 +1176,7 @@ class CommDomainHandle:
         "requested_window_size",
         "memory_source",
         "_host_mappings",
+        "_host_window_owner",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1204,6 +1205,7 @@ class CommDomainHandle:
         self.name = name
         self.memory_source = memory_source
         self._host_mappings = []
+        self._host_window_owner = None
         self.workers = tuple(workers)
         self.contexts: dict[int, ChipDomainContext] = dict(contexts or {})
         self.allocation_id = int(allocation_id)
