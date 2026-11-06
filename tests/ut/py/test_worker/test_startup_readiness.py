@@ -196,6 +196,18 @@ def _l3_child(sub_fn=None, num_sub_workers=1):
     return l3
 
 
+def _observe_close(worker):
+    closed = Event()
+    close = worker.close
+
+    def observed_close():
+        close()
+        closed.set()
+
+    worker.close = observed_close
+    return closed
+
+
 def _trivial_orch(orch, args, config):
     return None
 
@@ -457,26 +469,24 @@ class TestNextLevelStartupFailure:
             allow_failure.set()
             w4.close()
 
+    @_hard_timeout(_TEST_WALL_BUDGET_S)
     def test_sibling_ready_after_rollback_scan_still_closes(self, monkeypatch):
-        allow_ready, closed = Event(), Event()
+        allow_ready = Event()
         good = _l3_child()
         bad = _l3_child()
-        init, close = good.init, good.close
+        init = good.init
+        closed = _observe_close(good)
 
         def delayed_init(**kwargs):
             assert allow_ready.wait(_TEST_WALL_BUDGET_S)
             init(**kwargs)
 
-        def observed_close():
-            close()
-            closed.set()
-
-        good.init, good.close = delayed_init, observed_close
+        good.init = delayed_init
         bad.init = _init_raises
         w4 = Worker(level=4, num_sub_workers=0, startup_timeout_s=_DEADLINE_AFTER_WATCHDOG_S)
         w4.register(_trivial_orch)
-        w4.add_worker(good)
-        w4.add_worker(bad)
+        for child in (good, bad):
+            w4.add_worker(child)
         kill = os.kill
         parent_pid = os.getpid()
 
@@ -493,72 +503,50 @@ class TestNextLevelStartupFailure:
 
         monkeypatch.setattr(os, "kill", release_before_sigterm)
         try:
-            with _hard_timeout(_TEST_WALL_BUDGET_S):
-                with pytest.raises(RuntimeError, match="injected inner init failure"):
-                    w4.init()
+            with pytest.raises(RuntimeError, match="injected inner init failure"):
+                w4.init()
             assert closed.is_set(), "the healthy sibling skipped close() after READY"
         finally:
             allow_ready.set()
             w4.close()
 
-    @pytest.mark.parametrize("parent_exits", [False, True], ids=["no-sleep", "parent-exit"])
-    def test_next_level_ready_handoff(self, monkeypatch, parent_exits):
-        waiting, slept, serving, closed = Event(), Event(), Event(), Event()
+    @_hard_timeout(_TEST_WALL_BUDGET_S)
+    def test_next_level_ready_handoff(self, monkeypatch):
+        waiting, slept = Event(), Event()
         parent_pid = os.getpid()
         w4 = Worker(level=4, num_sub_workers=0)
         inner = _l3_child()
+        closed = _observe_close(inner)
         w4.register(_trivial_orch)
         w4.add_worker(inner)
-        load, sleep, getppid = worker_mod._mailbox_load_i32, worker_mod._sleep, os.getppid
-        await_ready, serve, close = Worker._await_children_ready, worker_mod._run_mailbox_loop, inner.close
-        waiting_on_ack = in_serve = False
+        load, sleep = worker_mod._mailbox_load_i32, worker_mod._sleep
+        serve = worker_mod._run_mailbox_loop
 
         def observe_ready(addr):
-            nonlocal waiting_on_ack
             state = load(addr)
-            if state == worker_mod._INIT_READY and not waiting_on_ack and os.getpid() != parent_pid:
+            if state == worker_mod._INIT_READY:
                 outer_addr = worker_mod._buffer_field_addr(w4._next_level_shms[0].buf, worker_mod._OFF_STATE)
-                if addr == outer_addr:
-                    waiting_on_ack = True
+                if addr == outer_addr and os.getpid() == parent_pid:
+                    assert waiting.wait(_TEST_WALL_BUDGET_S)
+                elif addr == outer_addr:
+                    monkeypatch.setattr(worker_mod, "_mailbox_load_i32", load)
+                    monkeypatch.setattr(worker_mod, "_sleep", lambda _seconds: slept.set())
                     waiting.set()
             return state
 
-        def observe_sleep(seconds):
-            if waiting_on_ack and not in_serve:
-                slept.set()
-            sleep(seconds)
-
-        def await_after_child_polls(self, shms, pids, kind, deadline):
-            if self is w4 and kind == "next_level":
-                assert waiting.wait(_TEST_WALL_BUDGET_S)
-            return await_ready(self, shms, pids, kind, deadline)
-
         def enter_serve(*args, **kwargs):
-            nonlocal in_serve
-            if waiting_on_ack:
-                in_serve = True
-                serving.set()
+            if os.getppid() == parent_pid:
+                monkeypatch.setattr(worker_mod, "_sleep", sleep)
+                # Simulate reparenting after ACK, at the actual serve-loop entry.
+                monkeypatch.setattr(os, "getppid", lambda: parent_pid + 1)
             return serve(*args, **kwargs)
 
-        def observe_close():
-            close()
-            closed.set()
-
-        inner.close = observe_close
         monkeypatch.setattr(worker_mod, "_mailbox_load_i32", observe_ready)
-        monkeypatch.setattr(worker_mod, "_sleep", observe_sleep)
-        monkeypatch.setattr(Worker, "_await_children_ready", await_after_child_polls)
         monkeypatch.setattr(worker_mod, "_run_mailbox_loop", enter_serve)
-        # Reparent only after ACK, at the handoff into the real serve loop.
-        monkeypatch.setattr(os, "getppid", lambda: parent_pid + 1 if parent_exits and in_serve else getppid())
         try:
-            with _hard_timeout(_TEST_WALL_BUDGET_S):
-                w4.init()
-                assert serving.wait(3)
-                if parent_exits:
-                    assert closed.wait(3), "the child missed reparenting at the READY handoff"
-                else:
-                    assert not slept.is_set(), "the child slept while waiting for READY acknowledgement"
+            w4.init()
+            assert closed.wait(3), "the child missed reparenting at the READY handoff"
+            assert not slept.is_set(), "the child slept while waiting for READY acknowledgement"
         finally:
             w4.close()
 
