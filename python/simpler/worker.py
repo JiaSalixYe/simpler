@@ -5389,6 +5389,24 @@ def _exit_after_host_log_flush(status: int) -> NoReturn:
     os._exit(status)
 
 
+def _fork_startup_child(pids: list[int], group_leaders: set[int] | None) -> tuple[int, Iterable[int]]:
+    # The child inherits the block until its own handler is installed. The
+    # parent records the PID before unblocking, so cancellation can reap it.
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+    pid = None
+    try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        pid = os.fork()
+        if pid != 0:
+            pids.append(pid)
+            if group_leaders is not None:
+                group_leaders.add(pid)
+        return pid, mask
+    finally:
+        if pid != 0:
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+
 def _forked_child_main(
     buf: memoryview,
     label: str,
@@ -5398,6 +5416,7 @@ def _forked_child_main(
     *,
     close_on_cancel=None,
     parent_pid: int | None = None,
+    startup_sigmask: Iterable[int] | None = None,
 ) -> None:
     """Run a forked child to completion, always terminating via ``os._exit``.
 
@@ -5450,6 +5469,8 @@ def _forked_child_main(
         prev_term = signal.signal(signal.SIGTERM, _on_cancel)
         try:
             try:
+                if startup_sigmask is not None:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, startup_sigmask)
                 ctx = setup()
                 # setup may recursively fork a complete lower-level subtree.
                 # Starting here keeps every C++ writer behind the final fork.
@@ -5470,14 +5491,14 @@ def _forked_child_main(
             _write_error(buf, 1, _format_exc(f"{label} init", e))
             _mailbox_store_i32(state_addr, _INIT_FAILED)
         else:
-            if ready_for_shutdown:
-                while (
-                    _mailbox_load_i32(state_addr) == _INIT_READY
-                    and _mailbox_load_i32(shutdown_addr) != _SHUTDOWN_REQUESTED
-                ):
-                    if os.getppid() != parent_pid:
-                        _mailbox_store_i32(shutdown_addr, _SHUTDOWN_REQUESTED)
-                        break
+            while (
+                ready_for_shutdown
+                and _mailbox_load_i32(state_addr) == _INIT_READY
+                and _mailbox_load_i32(shutdown_addr) != _SHUTDOWN_REQUESTED
+            ):
+                if os.getppid() != parent_pid:
+                    _mailbox_store_i32(shutdown_addr, _SHUTDOWN_REQUESTED)
+                    break
             # signal.signal returns None when the prior handler was not installed from
             # Python (e.g. a C library / host default); restore SIG_DFL in that case so
             # the round-trip does not raise TypeError.
@@ -9544,10 +9565,11 @@ class Worker:
         self._startup_reaped_pids = set()
         self._startup_ready_pids = set()
         self._startup_group_leader_pids = set()
+        group_leaders = self._startup_group_leader_pids if self._is_startup_root else None
 
         # Fork SubWorker processes (MUST be before any C++ threads)
         for i in range(n_sub):
-            pid = os.fork()
+            pid, sigmask = _fork_startup_child(self._sub_pids, group_leaders)
             if pid == 0:
                 buf = self._sub_shms[i].buf
                 assert buf is not None
@@ -9566,11 +9588,8 @@ class Worker:
                     _setup,
                     lambda t, b=buf: _sub_worker_loop(b, *t),
                     make_group_leader=self._is_startup_root,
+                    startup_sigmask=sigmask,
                 )
-            else:
-                self._sub_pids.append(pid)
-                if self._is_startup_root:
-                    self._startup_group_leader_pids.add(pid)
 
         # SUB children have no fallible device/runtime init, but they join the
         # same readiness contract so a child that dies before entering its loop
@@ -9676,7 +9695,7 @@ class Worker:
                 index=int(worker_id),
             )
             inner_worker._delegated_control_path = child_path
-            pid = os.fork()
+            pid, sigmask = _fork_startup_child(self._next_level_pids, group_leaders)
             if pid == 0:
                 buf = self._next_level_shms[idx].buf
                 assert buf is not None
@@ -9722,11 +9741,8 @@ class Worker:
                     make_group_leader=self._is_startup_root,
                     close_on_cancel=inner_worker.close,
                     parent_pid=parent_pid,
+                    startup_sigmask=sigmask,
                 )
-            else:
-                self._next_level_pids.append(pid)
-                if self._is_startup_root:
-                    self._startup_group_leader_pids.add(pid)
 
         # The recursive readiness edge: a next-level child's own init blocks on
         # its descendants, so its INIT_READY means the whole subtree is ready. A

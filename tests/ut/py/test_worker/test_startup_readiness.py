@@ -213,6 +213,58 @@ def _trivial_orch(orch, args, config):
 
 
 class TestNextLevelStartupFailure:
+    def test_fork_interrupted_while_blocking_sigterm_restores_mask(self, monkeypatch):
+        sigmask = signal.pthread_sigmask
+        original_mask = sigmask(signal.SIG_BLOCK, ())
+
+        def interrupt_after_block(how, signals):
+            previous = sigmask(how, signals)
+            if how == signal.SIG_BLOCK and signals:
+                raise KeyboardInterrupt
+            return previous
+
+        monkeypatch.setattr(signal, "pthread_sigmask", interrupt_after_block)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                worker_mod._fork_startup_child([], None)
+            assert sigmask(signal.SIG_BLOCK, ()) == original_mask
+        finally:
+            sigmask(signal.SIG_SETMASK, original_mask)
+
+    @_hard_timeout(_TEST_WALL_BUDGET_S)
+    def test_sigterm_before_nested_child_installs_handler(self, monkeypatch):
+        sent, inherited_handler = Event(), Event()
+        root_pid = os.getpid()
+        original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+        close_fds = worker_mod._close_fork_child_fds
+        leaf = _l3_child()
+        closed = _observe_close(leaf)
+        middle = Worker(level=4, num_sub_workers=0)
+        middle.add_worker(leaf)
+        root = Worker(level=5, num_sub_workers=0)
+        root.add_worker(middle)
+
+        def send_term_before_handler(fds):
+            if os.getppid() != root_pid and not sent.is_set():
+                sent.set()
+                try:
+                    signal.raise_signal(signal.SIGTERM)
+                except worker_mod._StartupCancelled:
+                    inherited_handler.set()
+                    os._exit(1)
+            close_fds(fds)
+
+        monkeypatch.setattr(worker_mod, "_close_fork_child_fds", send_term_before_handler)
+        try:
+            with pytest.raises(RuntimeError, match="exited during init before signalling ready"):
+                root.init()
+            assert sent.is_set()
+            assert not inherited_handler.is_set(), "SIGTERM invoked the parent's startup handler in the child"
+            assert closed.is_set(), "the child's own cancellation handler did not run"
+            assert signal.pthread_sigmask(signal.SIG_BLOCK, ()) == original_mask
+        finally:
+            root.close()
+
     @pytest.mark.parametrize("already_reaped", [False, True])
     @pytest.mark.parametrize("publish_failure", [False, True])
     def test_init_failure_published_between_state_read_and_reap(self, monkeypatch, already_reaped, publish_failure):
