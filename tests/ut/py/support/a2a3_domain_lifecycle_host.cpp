@@ -23,8 +23,7 @@ namespace {
 std::unordered_map<void *, size_t> mappings;
 int physical_handles = 0;
 std::unordered_set<void *> registered_hosts;
-int host_register_calls = 0;
-bool fail_second_host_register = false;
+bool fail_host_register = false;
 bool fail_host_unregister = false;
 bool fail_get_device = false;
 int device_calls = 0;
@@ -68,7 +67,7 @@ aclError unmap_buffer(void *p) {
 }  // namespace
 
 extern "C" aclError aclrtHostRegister(void *cpu, uint64_t, aclrtHostRegisterType, void **device) {
-    if (++host_register_calls == 2 && fail_second_host_register) return ACL_ERROR_FAILURE;
+    if (fail_host_register) return ACL_ERROR_FAILURE;
     assert(registered_hosts.insert(cpu).second);
     *device = cpu;
     return ACL_SUCCESS;
@@ -222,40 +221,28 @@ static void test_host_registration_lifecycle(bool fail_init) {
     h->rank = 0;
     h->nranks = 2;
     const auto size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    const auto prefix = "simpler_host_ut_" + std::to_string(getpid());
-    const auto first = prefix + "a";
-    const auto second = prefix + "b";
-    const char *names[] = {first.c_str(), second.c_str()};
-    for (const auto *name : names) {
-        const std::string path = std::string("/") + name;
-        const int fd = shm_open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
-        assert(fd >= 0);
-        assert(ftruncate(fd, static_cast<off_t>(size)) == 0);
-        close(fd);
-    }
+    const auto name = "simpler_host_ut_" + std::to_string(getpid());
+    const auto path = "/" + name;
     uint64_t ctx = 0, base = 0;
     size_t mapped = 0;
     const uint32_t ranks[] = {0, 1};
-    fail_second_host_register = fail_init;
-    const int rc = comm_alloc_host_domain_windows(h.get(), 1, ranks, 2, 0, size, 0, names, &ctx, &base, &mapped);
+    fail_host_register = fail_init;
+    const int rc = comm_alloc_host_domain_windows(h.get(), 1, ranks, 2, 0, size, 0, name.c_str(), &ctx, &base, &mapped);
     if (fail_init) {
-        assert(rc == COMM_INITIALIZATION_ABORT_REQUIRED && ctx == 0 && registered_hosts.size() == 1);
+        assert(rc == COMM_INITIALIZATION_ABORT_REQUIRED && ctx == 0 && registered_hosts.empty());
         assert(comm_abort_domain_windows(h.get(), 1, 2, 0) == 0);
     } else {
-        assert(rc == 0 && mapped == size && registered_hosts.size() == 2);
+        assert(rc == 0 && mapped == size && registered_hosts.size() == 1);
         const auto *context = reinterpret_cast<const CommContext *>(ctx);
-        assert(context->windowsIn[0] == base && context->windowsIn[1] != 0);
+        assert(context->windowsIn[0] == base && context->windowsIn[1] == 0);
         fail_host_unregister = true;
         assert(comm_destroy(h.get()) == COMM_RECLAMATION_UNCONFIRMED);
-        assert(h->domain_allocations.count(1) == 1 && registered_hosts.size() == 2);
+        assert(h->domain_allocations.count(1) == 1 && registered_hosts.size() == 1);
         fail_host_unregister = false;
         assert(comm_release_domain_windows(h.get(), 1, 2, 0) == 0);
     }
     assert(h->domain_allocations.empty() && registered_hosts.empty() && mappings.empty());
-    for (const auto *name : names) {
-        const std::string path = std::string("/") + name;
-        assert(shm_unlink(path.c_str()) == 0);
-    }
+    assert(shm_open(path.c_str(), O_RDWR, 0) < 0 && errno == ENOENT);
 }
 
 int main(int argc, char **argv) {

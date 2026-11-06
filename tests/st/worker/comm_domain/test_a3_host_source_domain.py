@@ -6,15 +6,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""A3 retained Host windows mapped for both local and peer MTE."""
+"""A3 retained Host windows with local MTE and cross-rank SDMA."""
 
 import struct
+from pathlib import Path
 
 import pytest
-from simpler.task_interface import AddressSpace, CommBufferSpec, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import AddressSpace, ArgDirection, CommBufferSpec, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
 from examples.workers.l4.global_tload_mixed_l3.main import COUNT, _build_tload_callable
+from simpler_setup.scene_test import compile_chip_callable_spec
 
 _RUNTIME = "tensormap_and_ringbuffer"
 
@@ -54,14 +56,50 @@ def test_a3_device_window_baseline(st_platform, st_device_ids):
         worker.close()
 
 
+def _build_sdma_callable(platform):
+    root = Path(__file__).resolve().parents[4]
+    kernels = root / "examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/kernels"
+    direction = ArgDirection
+    return compile_chip_callable_spec(
+        {
+            "name": "a3_host_domain_sdma",
+            "orchestration": {
+                "source": str(kernels / "orchestration/sdma_async_completion_orch.cpp"),
+                "function_name": "sdma_async_completion_orchestration",
+                "signature": [direction.IN, direction.OUT, direction.OUT, direction.IN],
+            },
+            "incores": [
+                {
+                    "func_id": index,
+                    "source": str(kernels / "aiv" / name),
+                    "core_type": "aiv",
+                    "signature": [direction.IN, direction.OUT],
+                }
+                for index, name in enumerate(("kernel_sdma_tget_async.cpp", "kernel_consumer.cpp"))
+            ],
+        },
+        platform,
+        _RUNTIME,
+        ("a3_host_domain_sdma", platform, _RUNTIME),
+    )
+
+
 @pytest.mark.platforms(["a2a3"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(2)
-@pytest.mark.parametrize("depth", [1, 2], ids=["serial", "staged"])
-def test_host_source_domain_maps_peer_windows(st_platform, st_device_ids, depth):
-    nbytes = COUNT * 4
-    # The input offset exercises local Tensor carving and peer window addressing.
+@pytest.mark.parametrize(
+    ("sdma", "depth"),
+    [
+        pytest.param(False, 1, id="local-mte"),
+        pytest.param(True, 1, id="sdma-serial", marks=pytest.mark.sdma),
+        pytest.param(True, 2, id="sdma-staged", marks=pytest.mark.sdma),
+    ],
+)
+def test_a3_host_source_domain(st_platform, st_device_ids, sdma, depth):
+    count = 128 * 128 if sdma else COUNT
+    nbytes = count * 4
     prefix = 64
+    engines = ("sdma",) if sdma else ()
     worker = Worker(
         level=3,
         platform=st_platform,
@@ -72,17 +110,18 @@ def test_host_source_domain_maps_peer_windows(st_platform, st_device_ids, depth)
         pending_run_depth=depth,
         launch_depth=1,
     )
-    chip = worker.register(_build_tload_callable(st_platform, _RUNTIME))
+    chip = worker.register(_build_sdma_callable(st_platform) if sdma else _build_tload_callable(st_platform, _RUNTIME))
     request = dict(
         name="host",
         members=[1, 0],
         window_size=prefix + 2 * nbytes,
         buffers=[
             CommBufferSpec("guard", "uint8", prefix, prefix),
-            CommBufferSpec("table", "float32", COUNT, nbytes),
-            CommBufferSpec("out", "float32", COUNT, nbytes),
+            CommBufferSpec("table", "float32", count, nbytes),
+            CommBufferSpec("out", "float32", count, nbytes),
         ],
         memory_source=AddressSpace.HOST,
+        workspace_engines=engines,
         retain_after_run=True,
     )
     state = {}
@@ -95,19 +134,16 @@ def test_host_source_domain_maps_peer_windows(st_platform, st_device_ids, depth)
             state["device"] = orch.get_or_allocate_domain(
                 name="device",
                 members=[1, 0],
-                window_size=nbytes,
-                buffers=[CommBufferSpec("out", "float32", COUNT, nbytes)],
+                window_size=2 * nbytes,
+                buffers=[CommBufferSpec(name, "float32", count, nbytes) for name in ("out", "result")],
                 retain_after_run=True,
             )
-            for rank in range(2):
-                data = struct.pack(f"<{COUNT}f", *([float(rank + 1)] * COUNT))
-                orch.copy_to_domain(state["host"], rank, data, buffer="table")
-                assert orch.copy_from_domain(state["host"], rank, nbytes, buffer="table") == data
 
         worker.run(prepare)
         host, device = state["host"], state["device"]
-        assert host.memory_source == AddressSpace.HOST and device.memory_source == AddressSpace.DEVICE
-        window = host.member(0).buffers["table"].shm
+        windows = [host.member(rank).buffers["table"].shm for rank in range(2)]
+        with pytest.raises(RuntimeError, match="belongs to L2"):
+            windows[0].unlink()
         with pytest.raises(ValueError, match="Host domain windows use CPU access"):
             worker.copy_to(host.member(0).buffers["table"], scratch)
         with pytest.raises(ValueError, match="Host domain windows use CPU access"):
@@ -115,35 +151,45 @@ def test_host_source_domain_maps_peer_windows(st_platform, st_device_ids, depth)
 
         def run_gather(orch, _args, cfg):
             assert orch.get_or_allocate_domain(**request) is host
-            for rank in range(2):
+            for rank in range(2 if sdma else 1):
                 member = host.member(rank)
-                output = member.buffers["out"] if rank == 0 else device.member(rank).buffers["out"]
+                outputs = device.member(rank).buffers
                 args = TaskArgs()
-                args.add_tensor(member.buffers["table"].tensor((COUNT,), DataType.FLOAT32), TensorArgType.INPUT)
-                args.add_tensor(output.tensor((COUNT,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
-                args.add_scalar(2)
-                args.add_scalar(host.device_context(member.local_worker_id))
+                args.add_tensor(member.buffers["table"].tensor((count,), DataType.FLOAT32), TensorArgType.INPUT)
+                out = outputs["out"] if sdma else member.buffers["out"]
+                args.add_tensor(out.tensor((count,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+                if sdma:
+                    args.add_tensor(outputs["result"].tensor((count,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+                else:
+                    args.add_scalar(1)
+                args.add_scalar(host.device_context(member.local_worker_id, workspace_engines=engines))
                 orch.submit_next_level(chip, args, cfg, worker=member.local_worker_id)
 
         offset, _ = host.buffer_range("out")
         for value in (1.0, 5.0):
-            with window.buf[prefix : prefix + nbytes] as table:
-                table[:] = struct.pack(f"<{COUNT}f", *([value] * COUNT))
+            for rank, data in enumerate((value, 2.0)):
+                with windows[rank].buf[prefix : prefix + nbytes] as table:
+                    table[:] = struct.pack(f"<{count}f", *([data] * count))
             pending = worker.submit(run_gather)
             following = worker.submit(run_gather) if depth == 2 else None
             pending.wait()
             if following is not None:
                 following.wait()
-            assert struct.unpack_from(f"<{COUNT}f", window.buf, offset) == (value + 2.0,) * COUNT
-            assert bytes(window.buf[:prefix]) == bytes(prefix)
-            worker.copy_from(scratch, device.member(1).buffers["out"])
-            assert struct.unpack_from(f"<{COUNT}f", scratch.shm.buf) == (value + 2.0,) * COUNT
-        with window.buf[offset : offset + nbytes] as exported:
+            assert all(bytes(window.buf[:prefix]) == bytes(prefix) for window in windows)
+            if sdma:
+                for rank, data in enumerate((2.0, value)):
+                    for name, expected in (("out", data), ("result", data + 1.0)):
+                        worker.copy_from(scratch, device.member(rank).buffers[name])
+                        assert struct.unpack_from(f"<{count}f", scratch.shm.buf) == (expected,) * count
+            else:
+                assert struct.unpack_from(f"<{count}f", windows[0].buf, offset) == (value,) * count
+        with windows[0].buf[prefix : prefix + nbytes] as exported:
             host.release()
-            assert host.freed and window.buf is None
-            assert struct.unpack_from(f"<{COUNT}f", exported) == (7.0,) * COUNT
-        worker.copy_from(scratch, device.member(1).buffers["out"])
-        assert struct.unpack_from(f"<{COUNT}f", scratch.shm.buf) == (7.0,) * COUNT
+            assert host.freed and all(window.buf is None for window in windows)
+            assert struct.unpack_from(f"<{count}f", exported) == (5.0,) * count
+        if sdma:
+            worker.copy_from(scratch, device.member(1).buffers["out"])
+            assert struct.unpack_from(f"<{count}f", scratch.shm.buf) == (5.0,) * count
         device.release()
     finally:
         worker.close()

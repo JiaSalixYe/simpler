@@ -44,7 +44,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     int rank = static_cast<int>(comm_ctx->rankId);
     int nranks = static_cast<int>(comm_ctx->rankNum);
-    __gm__ uint8_t *sdma_workspace = get_dma_workspace(args, DMA_WORKSPACE_SDMA);
+    auto domain_workspace = comm_workspace<CommWorkspaceKind::SDMA>(*comm_ctx).addr;
+    auto *sdma_workspace = domain_workspace != 0 ? reinterpret_cast<__gm__ uint8_t *>(domain_workspace) :
+                                                   get_dma_workspace(args, DMA_WORKSPACE_SDMA);
     if (nranks != 2 || sdma_workspace == nullptr) {
         pipe_barrier(PIPE_ALL);
         return;

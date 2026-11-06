@@ -429,7 +429,7 @@ public:
     std::tuple<uint64_t, uint64_t, size_t> comm_alloc_domain_windows(
         uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
         size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr,
-        const std::vector<std::string> &host_shm_names = {}
+        const std::string &host_shm_name = {}
     );
     /// Pair to `comm_alloc_domain_windows`: collectively free the per-rank
     /// pool and the device CommContext, then drop the allocation record.
@@ -629,8 +629,8 @@ private:
         void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, uint64_t *, uint64_t *, size_t *
     );
     using CommAllocHostDomainWindowsFn = int (*)(
-        void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, const char *const *, uint64_t *,
-        uint64_t *, size_t *
+        void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, const char *, uint64_t *, uint64_t *,
+        size_t *
     );
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
     using CommGlobalDomainPrepareFn =

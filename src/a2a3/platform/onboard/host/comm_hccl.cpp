@@ -27,6 +27,7 @@
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -84,7 +85,7 @@ struct HostWindow {
     bool registered = false;
 };
 
-// Each rank owns its device mappings. L3 owns the POSIX Host backing.
+// A rank owns its backing, device mappings and optional SDMA workspace.
 struct DomainAllocation {
     ~DomainAllocation();
 
@@ -96,6 +97,10 @@ struct DomainAllocation {
     std::vector<VmmWindow> peer_windows;
     std::vector<HostWindow> host_windows;
     size_t host_window_size = 0;
+    std::string host_shm_name;
+    bool owns_host_shm = false;
+    void *sdma_workspace = nullptr;
+    bool host_cleanup_unconfirmed = false;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
 };
 
@@ -379,32 +384,6 @@ static aclError release_domain_windows(DomainAllocation *alloc) {
     aclError first_error = release_vmm_windows(&alloc->peer_windows);
     record_first_error(release_vmm_window(&alloc->local_window), &first_error);
     return first_error;
-}
-
-static int release_host_domain_windows(DomainAllocation &alloc) {
-    if (alloc.device_ctx != nullptr) {
-        if (aclrtFree(alloc.device_ctx) != ACL_SUCCESS) return COMM_RECLAMATION_UNCONFIRMED;
-        alloc.device_ctx = nullptr;
-    }
-    aclError first_error = ACL_SUCCESS;
-    for (auto &window : alloc.host_windows) {
-        if (window.registered) {
-            const aclError status = aclrtHostUnregister(window.cpu);
-            if (status != ACL_SUCCESS) {
-                record_first_error(status, &first_error);
-                continue;
-            }
-            window.registered = false;
-        }
-        if (window.cpu != nullptr) {
-            if (munmap(window.cpu, alloc.host_window_size) != 0) {
-                record_first_error(ACL_ERROR_FAILURE, &first_error);
-            } else {
-                window.cpu = nullptr;
-            }
-        }
-    }
-    return first_error == ACL_SUCCESS ? 0 : COMM_RECLAMATION_UNCONFIRMED;
 }
 
 static aclError release_base_windows(CommHandle h) {
@@ -1120,7 +1099,7 @@ extern "C" uint32_t dma_workspace_channel_count(void) {
     return pto::comm::sdma::kSdmaMaxChannelGroups;
 }
 
-extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out) {
+static int provision_sdma_workspace(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out) {
     if (!addr_out || !handle_out || count < 0) return -1;
     *handle_out = nullptr;
     for (int i = 0; i < count; ++i)
@@ -1158,13 +1137,13 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
                 LOG_ERROR("dma_workspace_provision: freeing unbound workspace failed");
             }
             (void)manager.release();
-            return -1;
+            return COMM_RECLAMATION_UNCONFIRMED;
         }
         const uint64_t addr = reinterpret_cast<uint64_t>(manager->GetWorkspaceAddr());
         if (addr == 0) {
             (void)manager.release();
             LOG_ERROR("dma_workspace_provision: manager returned a null workspace address");
-            return -1;
+            return COMM_RECLAMATION_UNCONFIRMED;
         }
         addr_out[DMA_WORKSPACE_SDMA] = addr;
         *handle_out = manager.release();
@@ -1175,18 +1154,66 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
     }
 }
 
-extern "C" void dma_workspace_release(void *handle) {
-    if (!handle) return;
+extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out) {
+    return provision_sdma_workspace(required_mask, addr_out, count, handle_out) == 0 ? 0 : -1;
+}
+
+static int release_sdma_workspace(void *handle) {
+    if (!handle) return 0;
     try {
         std::unique_ptr<SdmaManager> manager(static_cast<SdmaManager *>(handle));
         void *workspace_addr = manager->GetWorkspaceAddr();
         manager.reset();
         if (aclrtFree(workspace_addr) != ACL_SUCCESS) {
             LOG_WARN("dma_workspace_release: workspace aclrtFree failed");
+            return COMM_RECLAMATION_UNCONFIRMED;
         }
+        return 0;
     } catch (...) {
         LOG_ERROR("dma_workspace_release: exception while releasing SDMA resources");
+        return COMM_RECLAMATION_UNCONFIRMED;
     }
+}
+
+extern "C" void dma_workspace_release(void *handle) { (void)release_sdma_workspace(handle); }
+
+static int release_host_domain_windows(DomainAllocation &alloc) {
+    if (alloc.host_cleanup_unconfirmed) return COMM_RECLAMATION_UNCONFIRMED;
+    if (alloc.device_ctx != nullptr) {
+        if (aclrtFree(alloc.device_ctx) != ACL_SUCCESS) return COMM_RECLAMATION_UNCONFIRMED;
+        alloc.device_ctx = nullptr;
+    }
+    if (alloc.sdma_workspace != nullptr) {
+        const int rc = release_sdma_workspace(std::exchange(alloc.sdma_workspace, nullptr));
+        if (rc != 0) {
+            alloc.host_cleanup_unconfirmed = true;
+            return rc;
+        }
+    }
+    aclError first_error = ACL_SUCCESS;
+    for (auto &window : alloc.host_windows) {
+        if (window.registered) {
+            const aclError status = aclrtHostUnregister(window.cpu);
+            if (status != ACL_SUCCESS) {
+                record_first_error(status, &first_error);
+                continue;
+            }
+            window.registered = false;
+        }
+        if (window.cpu != nullptr) {
+            if (munmap(window.cpu, alloc.host_window_size) != 0) {
+                record_first_error(ACL_ERROR_FAILURE, &first_error);
+            } else {
+                window.cpu = nullptr;
+            }
+        }
+    }
+    if (first_error != ACL_SUCCESS) return COMM_RECLAMATION_UNCONFIRMED;
+    if (alloc.owns_host_shm) {
+        if (shm_unlink(alloc.host_shm_name.c_str()) != 0 && errno != ENOENT) return COMM_RECLAMATION_UNCONFIRMED;
+        alloc.owns_host_shm = false;
+    }
+    return 0;
 }
 
 // Performs the per-allocation Fabric V2 exchange for one subset rank. rank_ids
@@ -1522,72 +1549,146 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 }
 
-static int map_host_domain_windows(DomainAllocation &owner, const char *const *names, size_t size) {
+static bool valid_host_shm_name(const char *name) {
+    if (name == nullptr || name[0] == '\0' || strnlen(name, 32) > 31) return false;
+    for (const char *p = name; *p != '\0'; ++p) {
+        const char c = *p;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return false;
+    }
+    return true;
+}
+
+static bool map_host_domain_window(DomainAllocation &owner, uint32_t rank, const char *name, bool create) {
+    const std::string path = std::string("/") + name;
+    if (create) owner.host_shm_name = path;
+    const int flags = O_RDWR | O_CLOEXEC | (create ? O_CREAT | O_EXCL : 0);
+    const int fd = shm_open(path.c_str(), flags, 0600);
+    if (fd < 0) return false;
+    const auto size = static_cast<off_t>(owner.host_window_size);
+    struct stat info{};
+    bool sized;
+    if (create) {
+        owner.owns_host_shm = true;
+        sized = ftruncate(fd, size) == 0;
+    } else {
+        sized = fstat(fd, &info) == 0 && info.st_size == size;
+    }
+    void *cpu = sized ? mmap(nullptr, owner.host_window_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+    close(fd);
+    if (cpu == MAP_FAILED) return false;
+    auto &window = owner.host_windows[rank];
+    window.cpu = cpu;
+    void *device = nullptr;
+    const aclError status = aclrtHostRegister(cpu, owner.host_window_size, ACL_HOST_REGISTER_MAPPED, &device);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("Host domain: aclrtHostRegister for window %u failed: %d", rank, static_cast<int>(status));
+        return false;
+    }
+    window.registered = true;
+    window.device_base = reinterpret_cast<uint64_t>(device);
+    return device != nullptr;
+}
+
+static bool exchange_host_window_names(
+    CommHandle h, uint64_t allocation_id, const DomainAllocation &owner, const char *local_name,
+    std::vector<std::string> &names
+) {
+    const auto tag = domain_barrier_tag(allocation_id, "host_window");
+    const auto local = barrier_marker_path(h->rootinfo_path, h->run_token, tag, owner.rank);
+    const auto tmp = local + ".tmp";
+    std::ofstream out(tmp, std::ios::trunc);
+    out << (local_name != nullptr ? local_name : "!") << '\n';
+    out.close();
+    if (!out.good() || std::rename(tmp.c_str(), local.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    if (local_name == nullptr) return false;
+    names.resize(owner.nranks);
+    names[owner.rank] = local_name;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    for (int peer = 0; peer < owner.nranks; ++peer) {
+        if (peer == owner.rank) continue;
+        const auto path = barrier_marker_path(h->rootinfo_path, h->run_token, tag, peer);
+        while (true) {
+            std::ifstream in(path);
+            if (in.is_open()) {
+                if (!(in >> names[peer]) || !valid_host_shm_name(names[peer].c_str())) return false;
+                break;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                LOG_ERROR("Host domain: timed out waiting for window announcement from rank %d", peer);
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    return true;
+}
+
+static bool
+init_host_domain_context(CommHandle h, uint64_t allocation_id, DomainAllocation &owner, const char *name, bool sdma) {
     CommContext ctx{};
     ctx.rankId = static_cast<uint32_t>(owner.rank);
     ctx.rankNum = static_cast<uint32_t>(owner.nranks);
-    ctx.winSize = size;
-    owner.host_window_size = size;
+    ctx.winSize = owner.host_window_size;
     owner.host_windows.resize(ctx.rankNum);
-    for (uint32_t rank = 0; rank < ctx.rankNum; ++rank) {
-        const std::string name = std::string("/") + names[rank];
-        const int fd = shm_open(name.c_str(), O_RDWR | O_CLOEXEC, 0);
-        if (fd < 0) return -1;
-        struct stat info{};
-        if (fstat(fd, &info) != 0 || info.st_size < static_cast<off_t>(size)) {
-            close(fd);
-            return -1;
+    const bool mapped = map_host_domain_window(owner, ctx.rankId, name, true);
+    if (sdma) {
+        std::vector<std::string> names;
+        if (!exchange_host_window_names(h, allocation_id, owner, mapped ? name : nullptr, names)) return false;
+        for (uint32_t peer = 0; peer < ctx.rankNum; ++peer) {
+            if (peer == ctx.rankId) continue;
+            if (!map_host_domain_window(owner, peer, names[peer].c_str(), false)) return false;
+            ctx.windowsIn[peer] = owner.host_windows[peer].device_base;
         }
-        void *cpu = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        close(fd);
-        if (cpu == MAP_FAILED) return -1;
-        auto &window = owner.host_windows[rank];
-        window.cpu = cpu;
-        void *device = nullptr;
-        const aclError status = aclrtHostRegister(cpu, size, ACL_HOST_REGISTER_MAPPED, &device);
-        if (status != ACL_SUCCESS) {
-            LOG_ERROR("Host domain: aclrtHostRegister for window %u failed: %d", rank, static_cast<int>(status));
-            return -1;
+        uint64_t addresses[DMA_WORKSPACE_SDMA + 1]{};
+        const uint32_t mask = uint32_t{1} << DMA_WORKSPACE_SDMA;
+        const int rc = provision_sdma_workspace(mask, addresses, DMA_WORKSPACE_SDMA + 1, &owner.sdma_workspace);
+        if (rc != 0) {
+            owner.host_cleanup_unconfirmed = rc == COMM_RECLAMATION_UNCONFIRMED;
+            return false;
         }
-        window.registered = true;
-        if (device == nullptr) return -1;
-        window.device_base = reinterpret_cast<uint64_t>(device);
-        ctx.windowsIn[rank] = ctx.windowsOut[rank] = window.device_base;
+        uint64_t workspace_size = 0;
+        SdmaManager::GetWorkspaceSize(&workspace_size);
+        set_comm_workspace(ctx, CommWorkspaceKind::SDMA, addresses[DMA_WORKSPACE_SDMA], workspace_size);
+    } else if (!mapped) {
+        return false;
     }
+    ctx.windowsIn[ctx.rankId] = ctx.windowsOut[ctx.rankId] = owner.host_windows[ctx.rankId].device_base;
     void *device_ctx = nullptr;
-    if (aclrtMalloc(&device_ctx, sizeof(ctx), ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) return -1;
+    if (aclrtMalloc(&device_ctx, sizeof(ctx), ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) return false;
     owner.device_ctx = static_cast<CommContext *>(device_ctx);
-    if (aclrtMemcpy(device_ctx, sizeof(ctx), &ctx, sizeof(ctx), ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) return -1;
-    return 0;
+    return aclrtMemcpy(device_ctx, sizeof(ctx), &ctx, sizeof(ctx), ACL_MEMCPY_HOST_TO_DEVICE) == ACL_SUCCESS;
 }
 
 extern "C" int comm_alloc_host_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint32_t workspace_mask, const char *const *host_shm_names, uint64_t *device_ctx_out,
+    size_t window_size, uint32_t workspace_mask, const char *host_shm_name, uint64_t *device_ctx_out,
     uint64_t *local_window_base_out, size_t *actual_window_size_out
 ) try {
-    if (workspace_mask != 0) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
-    if (!h || !rank_ids || !host_shm_names || !device_ctx_out || !local_window_base_out || !actual_window_size_out ||
-        rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0 ||
-        rank_ids[domain_rank] != static_cast<uint32_t>(h->rank))
+    const uint32_t sdma_mask = comm_workspace_bit(CommWorkspaceKind::SDMA);
+    if ((workspace_mask & ~sdma_mask) != 0) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
+    if (!h || !rank_ids || !valid_host_shm_name(host_shm_name) || !device_ctx_out || !local_window_base_out ||
+        !actual_window_size_out || rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count ||
+        window_size == 0 || rank_ids[domain_rank] != static_cast<uint32_t>(h->rank))
         return -1;
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0 || window_size > static_cast<size_t>(std::numeric_limits<off_t>::max()) - page_size) return -1;
     const size_t page = static_cast<size_t>(page_size);
     const size_t size = ((window_size + page - 1) / page) * page;
-    for (size_t i = 0; i < rank_count; ++i) {
-        const char *name = host_shm_names[i];
-        if (name == nullptr || name[0] == '\0' || strnlen(name, 32) > 31 || std::strchr(name, '/') != nullptr)
-            return -1;
-    }
     auto alloc = std::make_unique<DomainAllocation>();
     alloc->rank = static_cast<int>(domain_rank);
     alloc->nranks = static_cast<int>(rank_count);
+    alloc->host_window_size = size;
     auto [it, inserted] = h->domain_allocations.emplace(allocation_id, std::move(alloc));
     if (!inserted) return -1;
     auto &owner = *it->second;
     try {
-        if (map_host_domain_windows(owner, host_shm_names, size) != 0) return COMM_INITIALIZATION_ABORT_REQUIRED;
+        if (!init_host_domain_context(h, allocation_id, owner, host_shm_name, workspace_mask != 0)) {
+            return owner.host_cleanup_unconfirmed ? COMM_RECLAMATION_UNCONFIRMED : COMM_INITIALIZATION_ABORT_REQUIRED;
+        }
         owner.initialized = true;
         *device_ctx_out = reinterpret_cast<uint64_t>(owner.device_ctx);
         *local_window_base_out = owner.host_windows[domain_rank].device_base;

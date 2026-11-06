@@ -2560,8 +2560,7 @@ uint64_t ChipWorker::comm_derive_context(
 
 std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
-    size_t window_size, uint32_t workspace_mask, uint64_t *ownership_flag,
-    const std::vector<std::string> &host_shm_names
+    size_t window_size, uint32_t workspace_mask, uint64_t *ownership_flag, const std::string &host_shm_name
 ) {
     require_comm_cleanup_confirmed();
     if (comm_alloc_domain_windows_fn_ == nullptr) {
@@ -2579,27 +2578,18 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     uint64_t device_ctx = 0;
     uint64_t local_window_base = 0;
     size_t actual_window_size = 0;
-    if (!host_shm_names.empty() && comm_alloc_host_domain_windows_fn_ == nullptr) {
+    if (!host_shm_name.empty() && comm_alloc_host_domain_windows_fn_ == nullptr) {
         throw std::runtime_error("Host-source communication domains are not supported by this runtime");
     }
-    std::vector<const char *> names;
-    if (!host_shm_names.empty()) {
-        if (host_shm_names.size() != rank_ids.size()) {
-            throw std::invalid_argument("Host domain requires one shared memory name per rank");
-        }
-        names.reserve(host_shm_names.size());
-        for (const auto &name : host_shm_names)
-            names.push_back(name.c_str());
-    }
     const int rc =
-        host_shm_names.empty() ?
+        host_shm_name.empty() ?
             comm_alloc_domain_windows_fn_(
                 reinterpret_cast<void *>(comm_handle), allocation_id, rank_ids.data(), rank_ids.size(), domain_rank,
                 window_size, workspace_mask, &device_ctx, &local_window_base, &actual_window_size
             ) :
             comm_alloc_host_domain_windows_fn_(
                 reinterpret_cast<void *>(comm_handle), allocation_id, rank_ids.data(), rank_ids.size(), domain_rank,
-                window_size, workspace_mask, names.data(), &device_ctx, &local_window_base, &actual_window_size
+                window_size, workspace_mask, host_shm_name.c_str(), &device_ctx, &local_window_base, &actual_window_size
             );
     if (ownership_flag != nullptr &&
         (rc == 0 || rc == COMM_INITIALIZATION_ABORT_REQUIRED || rc == COMM_RECLAMATION_UNCONFIRMED)) {

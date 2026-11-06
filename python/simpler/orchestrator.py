@@ -550,9 +550,9 @@ class Orchestrator:
         On A5, workspace_engines adds asynchronous resources from sdma/urma/rdma.
         SDMA and URMA may share a domain. RDMA requires a separate domain with
         its own low-address window. Explicit selection is limited to L3 A5.
-        ``memory_source=AddressSpace.HOST`` creates independent Host windows for
-        onboard L3 a2a3 TMR ranks. Each rank maps all the domain's Host windows
-        for MTE. Named Buffers expose the owning rank's window via ``shm.buf``.
+        ``memory_source=AddressSpace.HOST`` creates independent Host windows on
+        L3 onboard a2a3 TMR ranks. Local access uses MTE; peer access uses an
+        optional SDMA workspace. CPU access uses ``shm.buf``.
         """
         if (members is None) == (workers is None):
             raise TypeError("provide exactly one of members or legacy workers")
@@ -746,16 +746,6 @@ class Orchestrator:
                 position += spec.nbytes
             if end > position:
                 raise ValueError("L3 domain copy must lie within declared buffer slices")
-            if handle.memory_source == AddressSpace.HOST:
-                # Host-registered device addresses are valid for kernels, not H2D/D2H.
-                window = ranges[0][0].shm
-                if window is None or window.buf is None:
-                    raise RuntimeError("Host domain CPU window is closed")
-                with window.buf[absolute : absolute + size] as view:
-                    if writing:
-                        view[:] = data
-                        return None
-                    return bytes(view)
             host = self._worker.create_buffer(size)
             try:
                 if writing:
