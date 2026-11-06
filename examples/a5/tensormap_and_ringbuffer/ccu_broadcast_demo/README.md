@@ -50,6 +50,17 @@ peer synchronization finish. A stop command stays terminal and is acknowledged
 with its own generation. The Host drains the service before reinitializing its
 slot or releasing the communicator and buffers.
 
+## L3 domain window probe
+
+With two permitted devices, run `ccu_domain_probe.py -d 0,1` under the device
+queue. The probe uses the public L3 domain and group submission APIs. A
+fork-inherited test adapter prepares the private HCOMM session inside each
+owner chip process, using the actual window addresses returned by Simpler.
+It drives the producer, deferred CCU wrapper, and consumer in separate AIV
+tasks, then drains and destroys the CCU session before releasing its window.
+It also rejects a view from a second live domain on the same chip and repeats
+the path after rebuilding the first domain under the same name.
+
 ## Scope
 
 The gated program takes Host launch arguments and waits on a CKE on the
