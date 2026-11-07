@@ -174,6 +174,7 @@ def test_sdma_worker_aicore_fault_teardown_is_bounded(st_platform, st_device_ids
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.timeout(90)
 def test_host_domain_uses_native_sdma_fault_recovery(st_platform, st_device_ids, monkeypatch):
+    """Host backing is reclaimed after an SDMA-enabled Worker's fatal reset."""
     _configure_timeout_fault(monkeypatch)
     worker = Worker(
         level=3,
@@ -196,7 +197,6 @@ def test_host_domain_uses_native_sdma_fault_recovery(st_platform, st_device_ids,
             window_size=4096,
             buffers=[CommBufferSpec("table", "uint8", 64, 64)],
             memory_source=AddressSpace.HOST,
-            workspace_engines=("sdma",),
             retain_after_run=True,
         )
         backing_names.append(host.member(0).buffers["table"].shm.name)
