@@ -10,6 +10,7 @@
 
 import re
 import struct
+import subprocess
 import sys
 from collections import deque
 from functools import partial
@@ -26,6 +27,35 @@ _RUNTIME = "tensormap_and_ringbuffer"
 _SDMA_DIAGNOSTIC = re.compile(
     r"TIMEOUT_EXIT|\[ASYNC_WAIT|SdmaErrorInfo|SMMU|CQE|(?:sched|orch)_error_code=", re.IGNORECASE
 )
+_HOST_MAPPING_PROBE = """
+import ctypes
+import os
+import sys
+
+print("HOST_MAP_ENV", os.uname(), flush=True)
+acl = ctypes.CDLL("libascendcl.so")
+acl.aclInit.argtypes = [ctypes.c_char_p]
+acl.aclrtSetDevice.argtypes = [ctypes.c_int32]
+acl.aclrtHostMemMapCapabilities.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+rc = acl.aclInit(None)
+print("HOST_MAP_INIT", rc, flush=True)
+if rc != 0:
+    sys.exit(1)
+try:
+    for device in map(int, sys.argv[1:]):
+        rc = acl.aclrtSetDevice(device)
+        print("HOST_MAP_SET_DEVICE", device, rc, flush=True)
+        if rc != 0:
+            continue
+        # aclrtHacType values from acl/acl_rt.h.
+        for name, engine in (("AIV", 3), ("SDMA", 6)):
+            capability = ctypes.c_int(-1)
+            rc = acl.aclrtHostMemMapCapabilities(device, engine, ctypes.byref(capability))
+            print("HOST_MAP_CAPABILITY", device, name, "rc", rc, "supported", capability.value, flush=True)
+        print("HOST_MAP_RESET", device, acl.aclrtResetDevice(device), flush=True)
+finally:
+    acl.aclFinalize()
+"""
 
 
 def _print_sdma_diagnostics(log_dir):
@@ -123,6 +153,15 @@ def test_a3_host_source_domain(st_platform, st_device_ids, sdma, depth, tmp_path
         log_dir = tmp_path / "ascend"
         log_dir.mkdir()
         monkeypatch.setenv("ASCEND_PROCESS_LOG_PATH", str(log_dir))
+        # Keep ACL initialization out of the parent process that forks L2 workers.
+        probe = subprocess.run(
+            [sys.executable, "-c", _HOST_MAPPING_PROBE, *map(str, st_device_ids[:2])],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        print(probe.stdout + probe.stderr, file=sys.stderr)
     count = 128 * 128 if sdma else COUNT
     nbytes = count * 4
     prefix = 64
