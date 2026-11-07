@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """A3 retained Host windows with local MTE and cross-rank SDMA."""
 
+import json
 import re
 import struct
 import subprocess
@@ -17,6 +18,7 @@ from functools import partial
 from pathlib import Path
 
 import pytest
+from _task_interface import _host_log_directory  # pyright: ignore[reportMissingImports]
 from simpler.task_interface import AddressSpace, ArgDirection, CommBufferSpec, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
@@ -29,32 +31,27 @@ _SDMA_DIAGNOSTIC = re.compile(
 )
 _HOST_MAPPING_PROBE = """
 import ctypes
-import os
+import json
 import sys
 
-print("HOST_MAP_ENV", os.uname(), flush=True)
 acl = ctypes.CDLL("libascendcl.so")
 acl.aclInit.argtypes = [ctypes.c_char_p]
 acl.aclrtSetDevice.argtypes = [ctypes.c_int32]
 acl.aclrtHostMemMapCapabilities.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
-rc = acl.aclInit(None)
-print("HOST_MAP_INIT", rc, flush=True)
-if rc != 0:
-    sys.exit(1)
+assert acl.aclInit(None) == 0
+capabilities = []
 try:
     for device in map(int, sys.argv[1:]):
-        rc = acl.aclrtSetDevice(device)
-        print("HOST_MAP_SET_DEVICE", device, rc, flush=True)
-        if rc != 0:
-            continue
-        # aclrtHacType values from acl/acl_rt.h.
-        for name, engine in (("AIV", 3), ("SDMA", 6)):
-            capability = ctypes.c_int(-1)
-            rc = acl.aclrtHostMemMapCapabilities(device, engine, ctypes.byref(capability))
-            print("HOST_MAP_CAPABILITY", device, name, "rc", rc, "supported", capability.value, flush=True)
-        print("HOST_MAP_RESET", device, acl.aclrtResetDevice(device), flush=True)
+        assert acl.aclrtSetDevice(device) == 0
+        capability = ctypes.c_int(-1)
+        # ACL_RT_HAC_TYPE_SDMA = 6; capability is NOT_SUPPORTED=0 or SUPPORTED=1.
+        assert acl.aclrtHostMemMapCapabilities(device, 6, ctypes.byref(capability)) == 0
+        assert capability.value in (0, 1)
+        capabilities.append(capability.value)
+        assert acl.aclrtResetDevice(device) == 0
 finally:
-    acl.aclFinalize()
+    assert acl.aclFinalize() == 0
+print(json.dumps(capabilities))
 """
 
 
@@ -72,6 +69,28 @@ def _print_sdma_diagnostics(log_dir):
             print(f"{path.name}:\n" + "\n".join(records), file=sys.stderr)
     if not found:
         print("No SDMA timeout or device fault records captured", file=sys.stderr)
+
+
+def _assert_host_sdma_rejected(worker, request, device_ids, capabilities):
+    directory = _host_log_directory()
+    assert directory
+    paths = [Path(directory) / f"host.{pid}.log" for pid in worker._chip_pids]
+    offsets = [path.stat().st_size if path.exists() else 0 for path in paths]
+
+    def prepare(orch, _args, _cfg):
+        orch.get_or_allocate_domain(**request)
+
+    with pytest.raises(RuntimeError, match=r"\(code -7\)") as failure:
+        worker.run(prepare)
+    assert "failed on 2/2 chips" in str(failure.value)
+    assert not worker.live_domains
+    worker.close()
+    assert worker._cleanup_journal.empty
+    for device, capability, path, offset in zip(device_ids, capabilities, paths, offsets, strict=True):
+        text = path.read_bytes()[offset:].decode()
+        if capability == 0:
+            assert f"Host domain SDMA unsupported: device={device} query_status=0 capability=0" in text
+        assert "timed out waiting for window announcement" not in text
 
 
 @pytest.mark.platforms(["a2a3"])
@@ -148,7 +167,9 @@ def _build_sdma_callable(platform):
         pytest.param(True, 2, id="sdma-staged", marks=pytest.mark.sdma),
     ],
 )
-def test_a3_host_source_domain(st_platform, st_device_ids, sdma, depth, tmp_path, monkeypatch):
+def test_a3_host_source_domain(  # noqa: PLR0912 -- covers supported and rejected domain lifecycles
+    st_platform, st_device_ids, sdma, depth, tmp_path, monkeypatch, drain_host_log
+):
     if sdma:
         log_dir = tmp_path / "ascend"
         log_dir.mkdir()
@@ -161,7 +182,9 @@ def test_a3_host_source_domain(st_platform, st_device_ids, sdma, depth, tmp_path
             timeout=30,
             check=False,
         )
-        print(probe.stdout + probe.stderr, file=sys.stderr)
+        assert probe.returncode == 0, probe.stdout + probe.stderr
+        capabilities = json.loads(probe.stdout.splitlines()[-1])
+        assert len(capabilities) == 2 and all(capability in (0, 1) for capability in capabilities)
     count = 128 * 128 if sdma else COUNT
     nbytes = count * 4
     prefix = 64
@@ -194,6 +217,9 @@ def test_a3_host_source_domain(st_platform, st_device_ids, sdma, depth, tmp_path
     state = {}
     try:
         worker.init()
+        if sdma and 0 in capabilities:
+            _assert_host_sdma_rejected(worker, request, st_device_ids[:2], capabilities)
+            return
         scratch = worker.create_buffer(nbytes)
 
         def prepare(orch, _args, _cfg):

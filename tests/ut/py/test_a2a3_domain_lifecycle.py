@@ -87,6 +87,16 @@ def test_a2a3_mapped_owner_needs_no_explicit_access_grant(a2a3_lifecycle_binary,
     subprocess.run([str(a2a3_lifecycle_binary), transport, "map_grants_access"], check=True, timeout=5)
 
 
-@pytest.mark.parametrize("scenario", ["host_register_failure", "host_unregister_failure", "host_borrow_sdma"])
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "host_register_failure",
+        "host_unregister_failure",
+        "host_borrow_sdma",
+        "host_sdma_unsupported",
+        "host_sdma_capability_failure",
+        "host_sdma_device_failure",
+    ],
+)
 def test_a2a3_host_domain_registration_lifecycle(a2a3_lifecycle_binary, scenario):
     subprocess.run([str(a2a3_lifecycle_binary), "fabric", scenario], check=True, timeout=5)

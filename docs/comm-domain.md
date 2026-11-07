@@ -478,7 +478,11 @@ sequence have identical meaning and can reuse the same retained domain.
 The native `comm_alloc_domain_windows` takes the corresponding bitmask directly;
 zero requests synchronous mappings only. Explicit asynchronous engine selection
 is supported on L3 A5. On L3 A2/A3 Host domains, selecting SDMA enables peer
-mappings for the Worker-owned workspace. Simulation and L4
+mappings for the Worker-owned workspace. Each participating device must report
+`ACL_RT_HOST_MEM_MAP_SUPPORTED` for `ACL_RT_HAC_TYPE_SDMA` through
+`aclrtHostMemMapCapabilities`; unsupported or failed queries abort allocation
+through the existing domain rollback path. Host registration or AIV access alone
+does not establish SDMA support. Simulation and L4
 domains support synchronous mappings, with no domain-owned asynchronous engines.
 
 Each `CommContext` stores a POD array `workspaces`, indexed by

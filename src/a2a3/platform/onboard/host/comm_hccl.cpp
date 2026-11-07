@@ -1594,6 +1594,23 @@ static bool exchange_host_window_names(
     return true;
 }
 
+static bool host_domain_sdma_supported() {
+    int32_t device = -1;
+    auto capability = ACL_RT_HOST_MEM_MAP_NOT_SUPPORTED;
+    aclError status = aclrtGetDevice(&device);
+    if (status == ACL_SUCCESS) {
+        status = aclrtHostMemMapCapabilities(static_cast<uint32_t>(device), ACL_RT_HAC_TYPE_SDMA, &capability);
+    }
+    if (status != ACL_SUCCESS || capability != ACL_RT_HOST_MEM_MAP_SUPPORTED) {
+        LOG_ERROR(
+            "Host domain SDMA unsupported: device=%d query_status=%d capability=%d", device, static_cast<int>(status),
+            static_cast<int>(capability)
+        );
+        return false;
+    }
+    return true;
+}
+
 static bool
 init_host_domain_context(CommHandle h, uint64_t allocation_id, DomainAllocation &owner, const char *name, bool sdma) {
     CommContext ctx{};
@@ -1601,7 +1618,7 @@ init_host_domain_context(CommHandle h, uint64_t allocation_id, DomainAllocation 
     ctx.rankNum = static_cast<uint32_t>(owner.nranks);
     ctx.winSize = owner.host_window_size;
     owner.host_windows.resize(ctx.rankNum);
-    const bool mapped = map_host_domain_window(owner, ctx.rankId, name);
+    const bool mapped = (!sdma || host_domain_sdma_supported()) && map_host_domain_window(owner, ctx.rankId, name);
     if (sdma) {
         std::vector<std::string> names;
         if (!exchange_host_window_names(h, allocation_id, owner, mapped ? name : nullptr, names)) return false;
