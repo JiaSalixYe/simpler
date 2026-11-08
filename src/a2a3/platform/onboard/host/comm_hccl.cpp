@@ -1537,13 +1537,33 @@ static bool valid_host_shm_name(const char *name) {
 static bool map_host_domain_window(DomainAllocation &owner, uint32_t rank, const char *name) {
     const std::string path = std::string("/") + name;
     const int fd = shm_open(path.c_str(), O_RDWR | O_CLOEXEC, 0);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        LOG_ERROR("Host domain: shm_open for window %u failed: errno=%d", rank, errno);
+        return false;
+    }
     const auto size = static_cast<off_t>(owner.host_window_size);
     struct stat info{};
-    const bool sized = fstat(fd, &info) == 0 && info.st_size == size;
-    void *cpu = sized ? mmap(nullptr, owner.host_window_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+    if (fstat(fd, &info) != 0) {
+        const int error = errno;
+        close(fd);
+        LOG_ERROR("Host domain: fstat for window %u failed: errno=%d", rank, error);
+        return false;
+    }
+    if (info.st_size != size) {
+        close(fd);
+        LOG_ERROR(
+            "Host domain: window %u size mismatch: expected=%llu actual=%lld", rank,
+            static_cast<unsigned long long>(owner.host_window_size), static_cast<long long>(info.st_size)
+        );
+        return false;
+    }
+    void *cpu = mmap(nullptr, owner.host_window_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    const int map_error = errno;
     close(fd);
-    if (cpu == MAP_FAILED) return false;
+    if (cpu == MAP_FAILED) {
+        LOG_ERROR("Host domain: mmap for window %u failed: errno=%d", rank, map_error);
+        return false;
+    }
     auto &window = owner.host_windows[rank];
     window.cpu = cpu;
     void *device = nullptr;
@@ -1632,9 +1652,18 @@ init_host_domain_context(CommHandle h, uint64_t allocation_id, DomainAllocation 
     }
     ctx.windowsIn[ctx.rankId] = ctx.windowsOut[ctx.rankId] = owner.host_windows[ctx.rankId].device_base;
     void *device_ctx = nullptr;
-    if (aclrtMalloc(&device_ctx, sizeof(ctx), ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS) return false;
+    aclError status = aclrtMalloc(&device_ctx, sizeof(ctx), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("Host domain: context allocation for rank %u failed: %d", ctx.rankId, static_cast<int>(status));
+        return false;
+    }
     owner.device_ctx = static_cast<CommContext *>(device_ctx);
-    return aclrtMemcpy(device_ctx, sizeof(ctx), &ctx, sizeof(ctx), ACL_MEMCPY_HOST_TO_DEVICE) == ACL_SUCCESS;
+    status = aclrtMemcpy(device_ctx, sizeof(ctx), &ctx, sizeof(ctx), ACL_MEMCPY_HOST_TO_DEVICE);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("Host domain: context upload for rank %u failed: %d", ctx.rankId, static_cast<int>(status));
+        return false;
+    }
+    return true;
 }
 
 extern "C" int comm_alloc_host_domain_windows(

@@ -86,7 +86,8 @@ def _assert_host_sdma_rejected(worker, request, device_ids, capabilities):
     assert not worker.live_domains
     worker.close()
     assert worker._cleanup_journal.empty
-    for device, capability, path, offset in zip(device_ids, capabilities, paths, offsets, strict=True):
+    assert len(device_ids) == len(capabilities) == len(paths) == len(offsets)
+    for device, capability, path, offset in zip(device_ids, capabilities, paths, offsets):
         text = path.read_bytes()[offset:].decode()
         if capability == 0:
             assert f"Host domain SDMA unsupported: device={device} query_status=0 capability=0" in text
@@ -164,7 +165,7 @@ def _build_sdma_callable(platform):
     [
         pytest.param(False, 1, id="local-mte"),
         pytest.param(True, 1, id="sdma-serial", marks=pytest.mark.sdma),
-        pytest.param(True, 2, id="sdma-staged", marks=pytest.mark.sdma),
+        pytest.param(True, 2, id="sdma-depth2", marks=pytest.mark.sdma),
     ],
 )
 def test_a3_host_source_domain(  # noqa: PLR0912 -- covers supported and rejected domain lifecycles

@@ -18,6 +18,7 @@ would wedge the sim.
 """
 
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -184,8 +185,15 @@ def test_host_domain_uses_native_sdma_fault_recovery(st_platform, st_device_ids,
         num_sub_workers=0,
         enable_sdma=True,
     )
-    chip = worker.register(_build_chip_callable(st_platform))
-    worker.init()
+    try:
+        chip = worker.register(_build_chip_callable(st_platform))
+        worker.init()
+    except BaseException:
+        try:
+            worker.close()
+        except BaseException as exc:
+            print(f"Worker.close after setup failure: {exc}", file=sys.stderr)
+        raise
     config = CallConfig()
     config.aicpu_thread_num = 2
     backing_names = []
