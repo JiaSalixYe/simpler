@@ -1650,20 +1650,19 @@ class _SharedMemoryCreateResult:
 class _SharedMemoryOwner:
     """Own fixed named shm slots before any create operation can publish one."""
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, capacity: int, *, name_prefix: str = "smp_") -> None:
         self._slots = [_OwnedSharedMemorySlot() for _ in range(capacity)]
+        self._name_prefix = name_prefix
         self._create_cursor = 0
         self._attempted = 0
         self._cleanup_step = 0
         self._cleanup_error: BaseException | None = None
 
-    @staticmethod
-    def _create_in_helper(slot: _OwnedSharedMemorySlot, size: int, result: _SharedMemoryCreateResult) -> None:
+    def _create_in_helper(self, slot: _OwnedSharedMemorySlot, size: int, result: _SharedMemoryCreateResult) -> None:
+        # Names must fit both macOS POSIX shm and the mailbox field.
+        nonce_length = min(24, 30 - len(self._name_prefix))
         while True:
-            # Several mailbox control payloads reserve 32 bytes including the
-            # trailing NUL for this token. Keep the explicit collision-safe
-            # name below that ABI limit while retaining 96 bits of entropy.
-            name = f"smp_{uuid.uuid4().hex[:24]}"
+            name = self._name_prefix + uuid.uuid4().hex[:nonce_length]
             shm = SharedMemory.__new__(SharedMemory)
             shm._name = f"/{name}" if SharedMemory._prepend_leading_slash else name  # noqa: SLF001
             shm._fd = -1  # noqa: SLF001
@@ -1709,6 +1708,30 @@ class _SharedMemoryOwner:
             raise RuntimeError("shared-memory helper completed without a result")
         self._create_cursor += 1
         return shm
+
+
+class _HostWindowOwner(_SharedMemoryOwner):
+    """Retain failed Host backing cleanup until a later Worker.close()."""
+
+    def close(self) -> None:
+        def release(slot: _OwnedSharedMemorySlot) -> None:
+            shm = slot.shm
+            if shm is None:
+                return
+            if slot.owns_name:
+                name = shm._name  # noqa: SLF001 -- tracker keys use the POSIX name
+                resource_tracker.register(name, "shared_memory")
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    resource_tracker.unregister(name, "shared_memory")
+                slot.owns_name = False
+            _release_owned_shm_buffer(slot)
+            _close_owned_shm_mmap(slot)
+            _close_owned_shm_fd(slot)
+            slot.shm = None
+
+        _raise_first(release, self._slots[: self._attempted])
 
 
 def _remember_cleanup_error(first_error: BaseException | None, exc: BaseException) -> BaseException:
@@ -10469,7 +10492,7 @@ class Worker:
             after_success=lambda: setattr(self, "_comm_base_ready", True),
         )
 
-    def _domain_config(
+    def _domain_config(  # noqa: PLR0912 -- validate domain topology and platform-specific engines
         self, members, window_size, buffers, retain_after_run, workspace_engines=(), memory_source=AddressSpace.DEVICE
     ) -> DomainConfig:
         if self.level == 3:
@@ -10507,10 +10530,16 @@ class Worker:
         if config.memory_source == AddressSpace.HOST:
             if (
                 self.level != 3
-                or self._config.get("platform") != "a5"
+                or self._config.get("platform") not in ("a2a3", "a5")
                 or self._config.get("runtime") != "tensormap_and_ringbuffer"
             ):
-                raise ValueError("Host-source domains require L3 A5 tensormap_and_ringbuffer")
+                raise ValueError("Host-source domains require onboard L3 A2/A3 or A5 tensormap_and_ringbuffer")
+            if self._config.get("platform") == "a2a3":
+                if config.workspace_engines not in ((), ("sdma",)):
+                    raise ValueError("Host-source domains on a2a3 support only the SDMA workspace")
+                if config.workspace_engines and not self._config.get("enable_sdma", False):
+                    raise ValueError("A2/A3 Host-domain SDMA requires Worker(enable_sdma=True)")
+                return config
             if any(engine != "urma" for engine in config.workspace_engines):
                 raise ValueError("Host-source domains support only the URMA workspace")
         if config.workspace_engines:
@@ -10690,7 +10719,7 @@ class Worker:
             self._use_domain(handle)
             return handle
 
-    def _allocate_domain(  # noqa: PLR0912 -- linear input-validation + per-chip shm staging + dispatch + reply unpack; splitting obscures the fail-fast ordering
+    def _allocate_domain(  # noqa: PLR0912, PLR0915 -- linear staging, dispatch, reply unpack and rollback
         self,
         *,
         name: str,
@@ -10720,13 +10749,11 @@ class Worker:
         # per-chip reply shm.  We let the chip child write back its own slot.
         buffer_count = len(buffers)
         req_size = _DOMAIN_REQ_HEADER.size + buffer_count * 8 + len(workers) * 4
-        host_names = {}
+        host_owner = None
+        if memory_source == AddressSpace.HOST and self._config.get("platform") == "a2a3":
+            prefix = _shm_name(self._shm_token, f"a3-{os.getpgrp():x}-")
+            host_owner = _HostWindowOwner(len(workers), name_prefix=prefix or "smp_")
         if memory_source == AddressSpace.HOST:
-            # Host windows belong to this startup tree even before allocation replies arrive.
-            for chip in workers:
-                host_name = _shm_name(self._shm_token, f"h-{uuid.uuid4().hex[:16]}")
-                assert host_name is not None
-                host_names[chip] = host_name
             req_size += _CTRL_SHM_NAME_BYTES
         reply_size = _DOMAIN_REPLY_HEADER.size + buffer_count * 8
         # Precompute worker → dense rank for O(1) lookup in the staging /
@@ -10742,8 +10769,19 @@ class Worker:
             nonlocal handle
             request_shms: dict[int, SharedMemory] = {}
             reply_shms: dict[int, SharedMemory] = {}
+            host_names: dict[int, str] = {}
             dispatch_started = False
             try:
+                if host_owner is not None:
+                    page = os.sysconf("SC_PAGE_SIZE")
+                    size = ((window_size + page - 1) // page) * page
+                    host_names = {chip: host_owner.create(size).name for chip in workers}
+                elif memory_source == AddressSpace.HOST:
+                    # A5 native windows use the startup-tree namespace for orphan cleanup.
+                    for chip in workers:
+                        host_name = _shm_name(self._shm_token, f"h-{uuid.uuid4().hex[:16]}")
+                        assert host_name is not None
+                        host_names[chip] = host_name
                 for chip_idx in workers:
                     req = staged_shms.create(req_size)
                     request_shms[chip_idx] = req
@@ -10791,6 +10829,7 @@ class Worker:
                     _domain_ranks=worker_to_rank,
                     memory_source=memory_source,
                 )
+                handle._host_window_owner = host_owner
                 handle._allocation_pending = True  # noqa: SLF001 -- owner controls publication/rollback
                 self._live_domains[name] = handle
                 resources.live_domains[name] = handle
@@ -10829,7 +10868,9 @@ class Worker:
                             ptrs = list(struct.unpack_from(f"<{buffer_count}Q", reply_buf, _DOMAIN_REPLY_HEADER.size))
                         host_mapping = None
                         if chip_idx in host_names:
-                            host_mapping = HostBufferMapping(host_names[chip_idx], int(actual_window_size))
+                            host_mapping = HostBufferMapping(
+                                host_names[chip_idx], int(actual_window_size), owner_tracks_name=host_owner is not None
+                            )
                             handle._host_mappings.append(host_mapping)
                         named_buffers: dict[str, Buffer] = {}
                         for i, b in enumerate(buffers):
@@ -10864,13 +10905,18 @@ class Worker:
                         if resources.live_domains.get(name) is handle:
                             resources.live_domains.pop(name)
                         resources.requires_ordered_cleanup = previous_ordered_cleanup
-            except BaseException:  # noqa: BLE001
+            except BaseException as allocation_error:  # noqa: BLE001
                 if handle is not None and not dispatch_started:
                     if self._live_domains.get(name) is handle:
                         self._live_domains.pop(name)
                     if resources.live_domains.get(name) is handle:
                         resources.live_domains.pop(name)
                     resources.requires_ordered_cleanup = previous_ordered_cleanup
+                if host_owner is not None and (not dispatch_started or (handle is not None and not handle.workers)):
+                    try:
+                        self._rollback_host_windows(allocation_id, host_owner)
+                    except BaseException as cleanup_error:
+                        raise allocation_error from cleanup_error
                 raise
             assert handle is not None
             return handle
@@ -10897,6 +10943,14 @@ class Worker:
         )
         assert handle is not None and published_handle is handle
         return handle
+
+    def _rollback_host_windows(self, allocation_id: int, owner: _HostWindowOwner) -> None:
+        try:
+            owner.close()
+        except BaseException:
+            with self._hierarchical_start_cv:
+                self._cleanup_journal.add_once("host-domain-backing", str(allocation_id), owner.close)
+            raise
 
     def _release_domain_handle(self, handle: CommDomainHandle, resources: _RunResources) -> None:
         """Mark a handle for release.  Actual backend free is deferred.
@@ -11016,6 +11070,10 @@ class Worker:
 
         with self._hierarchical_start_cv:
             self._cleanup_journal.add_once("domain-retirement", f"{local}:{allocation_id}", retire)
+            if getattr(handle, "_host_window_owner", None) is not None:
+                self._cleanup_journal.add_once(
+                    "host-domain-backing", str(allocation_id), lambda: self._close_domain_host_windows(handle)
+                )
             if self._ordered_cleanup_error is None and (
                 allocation_id not in results or results[allocation_id] is not None
             ):
@@ -11094,6 +11152,7 @@ class Worker:
                 failure = self._domain_free_results[handle.allocation_id]
                 if failure is not None:
                     raise failure
+                self._close_domain_host_windows(handle)
                 return
             # Absence means no backend attempt has been claimed. Once the
             # isolated target is admitted it publishes a conservative outcome
@@ -11129,6 +11188,7 @@ class Worker:
                 raise result.error
             if not result.completed:
                 raise RuntimeError("CommDomain backend release did not publish an outcome")
+            self._close_domain_host_windows(handle)
 
     def _release_domain_claimed(self, handle: CommDomainHandle) -> None:
         """Drive CTRL_RELEASE_DOMAIN. Caller holds this allocation's claim."""
@@ -11168,9 +11228,10 @@ class Worker:
             )
 
         def retire_live_handle() -> None:
-            for mapping in handle._host_mappings:
-                mapping.close()
-            handle._host_mappings.clear()
+            if handle._host_window_owner is None:
+                for mapping in handle._host_mappings:
+                    mapping.close()
+                handle._host_mappings.clear()
             if self._live_domains.get(handle.name) is handle:
                 self._live_domains.pop(handle.name)
 
@@ -11180,6 +11241,26 @@ class Worker:
             name_prefix="shm-domain-release-lifecycle-",
             after_success=retire_live_handle,
         )
+
+    @staticmethod
+    def _close_domain_host_windows(handle: CommDomainHandle) -> None:
+        owner = getattr(handle, "_host_window_owner", None)
+        if owner is None:
+            return
+
+        def close() -> None:
+            for mapping in handle._host_mappings:
+                mapping.close()
+            handle._host_mappings.clear()
+            owner.close()
+            handle._host_window_owner = None
+
+        result = _IsolatedCallResult()
+        _run_isolated_call(result, close, name_prefix="host-domain-close-")
+        if result.error is not None:
+            raise result.error
+        if not result.completed:
+            raise RuntimeError("Host domain backing cleanup did not publish an outcome")
 
     def _dispatch_control_domain(
         self,
@@ -12208,8 +12289,11 @@ class Worker:
         )
         return decode_copy_result(reply)
 
-    def _seal_domain_cpu_exports(self) -> None:
-        seal_host_mappings(mapping for handle in list(self._live_domains.values()) for mapping in handle._host_mappings)
+    def _seal_domain_cpu_exports(self, *, seal: bool = True) -> None:
+        seal_host_mappings(
+            (mapping for handle in list(self._live_domains.values()) for mapping in handle._host_mappings),
+            seal=seal,
+        )
 
     def _release_all_live_domains(
         self, resources: _RunResources | None = None, *, include_retained: bool = True
@@ -12240,7 +12324,10 @@ class Worker:
                 self._free_domain_after_fence(handle)
             except BaseException:
                 self._defer_domain_retirement(handle)
-                if resources is not None:
+                if resources is not None or (
+                    getattr(handle, "_host_window_owner", None) is not None
+                    and self._domain_free_results.get(handle.allocation_id, False) is None
+                ):
                     raise
             if live_domains.get(handle.name) is handle:
                 live_domains.pop(handle.name)
@@ -12529,6 +12616,12 @@ class Worker:
                 f"Worker.{api}: {identity} is not a live device allocation on this worker "
                 f"(never allocated here, already freed, or its domain was released)"
             )
+        if (
+            handle.backend_kind == BackendKind.VMM_WINDOW
+            and handle.shm is not None
+            and capability in (BufferCapability.COPY_TO, BufferCapability.COPY_FROM)
+        ):
+            raise ValueError(f"Worker.{api}: Host domain windows use CPU access through Buffer.shm.buf")
         kind, _profile = select_adapter(handle.to_descriptor(), self._owner_endpoint_context(), where=f"Worker.{api}")
         granted = capabilities_for_adapter(kind, handle.access)
         if capability not in granted:
@@ -14596,7 +14689,8 @@ class Worker:
                         "init()'d it (native teardown is thread-bound)"
                     )
                 self._validate_chip_execution_context()
-                self._seal_domain_cpu_exports()
+                # Admitted orchestration can still take CPU views while it drains.
+                self._seal_domain_cpu_exports(seal=self._active_ops == 0)
                 deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error_locked("close")
                 # Claim: publish CLOSED (permanent admission fence) and install a
                 # fresh teardown attempt.
@@ -14888,6 +14982,21 @@ class Worker:
             if entry.name in protected_names or not entry.name.startswith(prefixes):
                 continue
             try:
+                parts = entry.name.split("-", 4)
+                if parts[2] == "a3":
+                    if len(parts) != 5 or not re.fullmatch(r"[0-9a-f]{1,8}", parts[3]):
+                        continue
+                    pgid = int(parts[3], 16)
+                    # The owner retires its own group's windows. The enclosing
+                    # Worker can sweep only once the entire group has exited.
+                    if not 0 < pgid <= 0x7FFFFFFF or pgid == os.getpgrp():
+                        continue
+                    try:
+                        os.killpg(pgid, 0)
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        raise RuntimeError(f"Host backing process group {pgid} is still alive")
                 orphan = SharedMemory(name=entry.name)
                 try:
                     orphan.unlink()
@@ -15160,6 +15269,12 @@ class Worker:
             post_child_err = self._cleanup_journal.drive_kinds({"child", "shm"})
             if post_child_err is not None:
                 errors.append(post_child_err)
+            elif not self._chip_pids:
+                # A reaped chip may have exited abnormally. Retire L3-owned
+                # backing before reporting the child or native teardown error.
+                backing_error = self._cleanup_journal.drive_kinds({"host-domain-backing"})
+                if backing_error is not None:
+                    errors.append(backing_error)
             # Drop next-level worker refs only once their pids/shms are reclaimed.
             if not self._next_level_pids and not self._next_level_shms:
                 self._next_level_workers.clear()
