@@ -158,6 +158,24 @@ share the same retention, reuse checks, failure policy, and release fences.
 See [A5 Host-source domains](a5-host-comm-domain.md) for initialization, kernel
 addressing, and the retained Engram-table example.
 
+### A2/A3 Host-source windows
+
+Onboard L3 `tensormap_and_ringbuffer` domains use the same Host-source API.
+As on A5, L2 creates and unlinks its rank's POSIX backing and L3 borrows the CPU
+mapping. Worker teardown reclaims orphan windows in the startup namespace after
+the relevant L2 children or enclosing process group have exited.
+Local reads use MTE. For peer SDMA, initialize the Worker with `enable_sdma=True`
+and request `workspace_engines=("sdma",)` to map the peer windows. The kernel
+gets the source address from `CommContext` and the Worker workspace from
+`get_dma_workspace(args, DMA_WORKSPACE_SDMA)`. CPU access and release use the
+same borrowed views and fences as on A5.
+
+Pass `initializer(domain)` to `allocate_domain` or `get_or_allocate_domain` to
+fill the rank windows synchronously before submitting tasks in the same
+orchestration. The callback runs once per new domain instance and is skipped
+on retained reuse. It follows the shared Host initializer restrictions and
+rollback rules described in [A5 Host-source domains](a5-host-comm-domain.md).
+
 ### Global CommDomain across local and remote L3 nodes
 
 An L4 worker can build the same `CommContext` shape across any combination of
@@ -437,8 +455,8 @@ and is warned about twice: by the runtime builder and again at Worker init. A
 warmup whose device launch or sync *fails* is not in this category at all — it
 fails Worker init, because the card it faulted on must not reach the first run.
 
-On a2a3, communication-domain allocation does not create SDMA streams or carry the
-workspace through `CommContext`. Because an SDMA-enabled Worker's 48 STARS
+On a2a3, both Device- and Host-source domains use the Worker-owned SDMA workspace.
+Because an SDMA-enabled Worker's 48 STARS
 streams sit in the device fault/sync domain, a fault on that Worker slows its
 teardown; keep SDMA workloads on their own Worker (and, in CI, their own task)
 so ordinary workloads are unaffected — see
@@ -466,7 +484,12 @@ adds the requested asynchronous resources. An omitted parameter and an empty
 sequence have identical meaning and can reuse the same retained domain.
 The native `comm_alloc_domain_windows` takes the corresponding bitmask directly;
 zero requests synchronous mappings only. Explicit asynchronous engine selection
-is supported on L3 A5; A2/A3 keeps its Worker-owned SDMA path. Simulation and L4
+is supported on L3 A5. On L3 A2/A3 Host domains, selecting SDMA enables peer
+mappings for the Worker-owned workspace. Each participating device must report
+`ACL_RT_HOST_MEM_MAP_SUPPORTED` for `ACL_RT_HAC_TYPE_SDMA` through
+`aclrtHostMemMapCapabilities`; unsupported or failed queries abort allocation
+through the existing domain rollback path. Host registration or AIV access alone
+does not establish SDMA support. Simulation and L4
 domains support synchronous mappings, with no domain-owned asynchronous engines.
 
 Each `CommContext` stores a POD array `workspaces`, indexed by
@@ -583,7 +606,7 @@ The workspace coverage is split by platform and execution layer:
 | A5 host | SDMA and URMA plus optional RDMA in one build; RDMA uses a separate domain | RDMA on/off builds, domain isolation, invalid URMA descriptors, initialization failure rollback and finalization in `tests/ut/py/test_comm_workspaces.py` |
 | A5 TMR | SDMA/URMA in one domain and one Worker | Ordered mixed DAG and same-kernel disjoint transfers in `urma_deferred_completion_demo` |
 | A5 completion scheduler | A task waits for every registered backend condition | Controlled SDMA-first / URMA-first completion and failure in `test_urma_completion_scheduler.cpp` |
-| A2/A3 | Existing Worker-owned SDMA and `enable_sdma` behavior | Existing SDMA and single-card prefetch tests; domain allocation does not provision SDMA |
+| A2/A3 | Worker-owned SDMA and optional peer mappings for L3 TMR Host domains | SDMA and prefetch examples, and `test_a3_host_source_domain.py` for Host MTE and peer SDMA |
 | Simulation | Communication windows and zero backend descriptors | Existing domain/window tests; explicit nonempty engine selections are rejected |
 
 The A5 mixed hardware examples use the full two-rank communicator. They do not
