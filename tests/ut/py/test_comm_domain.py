@@ -182,7 +182,8 @@ def domain_worker(request):
             worker = Worker(level=4, num_sub_workers=0)
             node = worker.add_worker(child)
             members = [(node, 1), (node, 0)]
-        worker.init()
+        deadline = time.monotonic() + 10 if request.param == "external-l3" else None
+        worker.init(_startup_deadline=deadline)
         yield worker, members
     finally:
         if getattr(worker, "_expected_domain_debt", False):
@@ -1720,11 +1721,14 @@ def retained_a3_host_domain(domain_worker, monkeypatch):
     return worker, members, domains[0], released
 
 
-@pytest.mark.parametrize("domain_worker", [3], indirect=True)
-def test_a3_host_domain_backing_uses_startup_namespace(retained_a3_host_domain):
+@pytest.mark.parametrize(
+    ("domain_worker", "has_startup_namespace"), [(3, True), ("external-l3", False)], indirect=["domain_worker"]
+)
+def test_a3_host_domain_backing_names_and_release(retained_a3_host_domain, has_startup_namespace):
     worker, members, domain, _released = retained_a3_host_domain
     prefix = worker_mod._shm_name(worker._shm_token, f"a3-{os.getpgrp():x}-")
-    assert prefix is not None
+    assert (prefix is not None) == has_startup_namespace
+    prefix = prefix or "smp_"
     names = [domain.member(rank).buffers["payload"].shm.name for rank in range(len(members))]
     domain.release()
     assert all(name.startswith(prefix) and len(name) <= 30 for name in names)

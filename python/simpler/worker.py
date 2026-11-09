@@ -10752,8 +10752,7 @@ class Worker:
         host_owner = None
         if memory_source == AddressSpace.HOST and self._config.get("platform") == "a2a3":
             prefix = _shm_name(self._shm_token, f"a3-{os.getpgrp():x}-")
-            assert prefix is not None
-            host_owner = _HostWindowOwner(len(workers), name_prefix=prefix)
+            host_owner = _HostWindowOwner(len(workers), name_prefix=prefix or "smp_")
         if memory_source == AddressSpace.HOST:
             req_size += _CTRL_SHM_NAME_BYTES
         reply_size = _DOMAIN_REPLY_HEADER.size + buffer_count * 8
