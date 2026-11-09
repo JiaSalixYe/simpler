@@ -103,12 +103,12 @@ inline std::string marker_path(const std::string &rootinfo_path, uint64_t run_to
            run_token_hex(run_token) + "_" + std::to_string(rank) + ".ready";
 }
 
-inline bool publish_marker(const std::string &path) {
+inline bool publish_marker(const std::string &path, const char *payload = "1") {
     // Waiters treat visibility as publication, so never expose a partial
     // marker. Each token/tag/rank path has exactly one serialized writer.
     const std::string tmp_path = path + ".tmp";
     std::ofstream marker(tmp_path, std::ios::trunc);
-    marker << "1";
+    marker << payload;
     marker.close();
     if (!marker.good() || std::rename(tmp_path.c_str(), path.c_str()) != 0) {
         std::remove(tmp_path.c_str());
