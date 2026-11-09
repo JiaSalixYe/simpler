@@ -14,6 +14,7 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -353,11 +354,95 @@ static void test_host_sdma_capability_rejection(const std::string &scenario) {
     assert(registered_hosts.empty() && mappings.empty() && rmdir(folder.c_str()) == 0);
 }
 
+static void test_host_cleanup_failure_notifies_peer(const std::string &scenario) {
+    auto folder = (std::filesystem::temp_directory_path() / "simpler-host-notify-XXXXXX").string();
+    assert(mkdtemp(folder.data()));
+    const auto root = folder + "/root";
+    const uint32_t failed_rank = scenario == "host_notify_abort" ? 1 : 0;
+    const int peer_rank = 1 - static_cast<int>(failed_rank);
+    auto failed = std::make_unique<CommHandle_>();
+    auto peer = std::make_unique<CommHandle_>();
+    failed->rank = static_cast<int>(failed_rank);
+    peer->rank = peer_rank;
+    for (auto *h : {failed.get(), peer.get()}) {
+        h->nranks = 2;
+        h->rootinfo_path = root;
+        h->run_token = 2;
+    }
+    const uint32_t ranks[] = {0, 1};
+    const size_t size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const auto name = "simpler_notify_" + std::to_string(getpid());
+    const auto path = "/" + name;
+    uint64_t ctx = 0, base = 0;
+    size_t mapped = 0;
+    assert(
+        comm_alloc_host_domain_windows(
+            failed.get(), 1, ranks, 2, failed_rank, size, 0, name.c_str(), &ctx, &base, &mapped
+        ) == 0
+    );
+    const auto old_failure = barrier_marker_path(root, 1, "a3_host_cleanup_failed", 0);
+    assert(file_marker_handshake::publish_marker(old_failure));
+    assert(!host_cleanup_failed(peer.get()));
+    auto device_domain = std::make_unique<DomainAllocation>();
+    device_domain->rank = peer_rank;
+    device_domain->nranks = 2;
+    device_domain->initialized = true;
+    peer->domain_allocations.emplace(2, std::move(device_domain));
+    auto result = std::async(std::launch::async, [&] {
+        return comm_destroy(peer.get());
+    });
+    const auto arrival = barrier_marker_path(root, peer->run_token, "destroy", peer_rank);
+    assert(
+        file_marker_handshake::wait_for_path(
+            arrival, file_marker_handshake::Stage::ARRIVAL_WAIT, peer_rank,
+            std::chrono::steady_clock::now() + std::chrono::seconds(2), std::chrono::milliseconds(1)
+        )
+            .ok()
+    );
+
+    fail_host_unregister = true;
+    int rc = COMM_RECLAMATION_UNCONFIRMED;
+    if (scenario == "host_notify_release") {
+        rc = comm_release_domain_windows(failed.get(), 1, 2, failed_rank);
+    } else if (scenario == "host_notify_abort") {
+        rc = comm_abort_domain_windows(failed.get(), 1, 2, failed_rank);
+    } else {
+        rc = comm_destroy(failed.get());
+    }
+    assert(rc == COMM_RECLAMATION_UNCONFIRMED);
+    const auto peer_status = result.wait_for(std::chrono::seconds(2));
+    assert(failed->domain_allocations.count(1) == 1 && registered_hosts.size() == 1);
+    const int fd = shm_open(path.c_str(), O_RDWR, 0);
+    assert(fd >= 0 && close(fd) == 0);
+
+    fail_host_unregister = false;
+    assert(comm_abort_domain_windows(failed.get(), 1, 2, failed_rank) == 0);
+    assert(mappings.empty() && registered_hosts.empty());
+    assert(shm_open(path.c_str(), O_RDWR, 0) == -1 && errno == ENOENT);
+    assert(peer_status == std::future_status::ready && result.get() == COMM_RECLAMATION_UNCONFIRMED);
+    assert(comm_release_domain_windows(peer.get(), 2, 2, peer_rank) == COMM_RECLAMATION_UNCONFIRMED);
+    assert(peer->domain_allocations.count(2) == 1);
+    assert(
+        comm_alloc_domain_windows(peer.get(), 3, ranks, 2, peer_rank, size, 0, &ctx, &base, &mapped) ==
+        COMM_RECLAMATION_UNCONFIRMED
+    );
+    assert(
+        comm_alloc_host_domain_windows(
+            peer.get(), 3, ranks, 2, peer_rank, size, 0, name.c_str(), &ctx, &base, &mapped
+        ) == COMM_RECLAMATION_UNCONFIRMED
+    );
+    assert(file_marker_handshake::cleanup(root).ok() && rmdir(folder.c_str()) == 0);
+}
+
 int main(int argc, char **argv) {
     assert(argc == 3);
     fabric_supported = std::string(argv[1]) == "fabric";
     reject_explicit_access = std::string(argv[2]) == "map_grants_access";
     const std::string scenario = reject_explicit_access ? "success" : argv[2];
+    if (scenario == "host_notify_release" || scenario == "host_notify_abort" || scenario == "host_notify_destroy") {
+        test_host_cleanup_failure_notifies_peer(scenario);
+        return 0;
+    }
     if (scenario == "host_sdma_unsupported" || scenario == "host_sdma_capability_failure" ||
         scenario == "host_sdma_device_failure") {
         test_host_sdma_capability_rejection(scenario);

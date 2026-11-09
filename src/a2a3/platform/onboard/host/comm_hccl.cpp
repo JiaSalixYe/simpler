@@ -1155,9 +1155,37 @@ extern "C" void dma_workspace_release(void *handle) {
     }
 }
 
-static int release_host_domain_windows(DomainAllocation &alloc) {
+static std::string host_cleanup_failure_path(CommHandle h) {
+    if (h->nranks < 2 || h->rootinfo_path.empty()) return {};
+    return barrier_marker_path(h->rootinfo_path, h->run_token, "a3_host_cleanup_failed", 0);
+}
+
+static bool host_cleanup_failed(CommHandle h) {
+    const auto path = host_cleanup_failure_path(h);
+    return !path.empty() && std::ifstream(path).good();
+}
+
+static void publish_host_cleanup_failure(CommHandle h) noexcept try {
+    const auto path = host_cleanup_failure_path(h);
+    if (path.empty()) return;
+    // Existence is the entire message. Any rank can publish it once.
+    const int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        close(fd);
+    } else if (errno != EEXIST) {
+        LOG_WARN("[comm rank %d] Host cleanup failure marker could not be published: errno=%d", h->rank, errno);
+    }
+} catch (...) {
+    LOG_WARN("[comm rank %d] Host cleanup failure marker could not be published", h->rank);
+}
+
+static int release_host_domain_windows(CommHandle h, DomainAllocation &alloc) {
+    const auto unconfirmed = [h] {
+        publish_host_cleanup_failure(h);
+        return COMM_RECLAMATION_UNCONFIRMED;
+    };
     if (alloc.device_ctx != nullptr) {
-        if (aclrtFree(alloc.device_ctx) != ACL_SUCCESS) return COMM_RECLAMATION_UNCONFIRMED;
+        if (aclrtFree(alloc.device_ctx) != ACL_SUCCESS) return unconfirmed();
         alloc.device_ctx = nullptr;
     }
     aclError first_error = ACL_SUCCESS;
@@ -1178,11 +1206,11 @@ static int release_host_domain_windows(DomainAllocation &alloc) {
             }
         }
     }
-    if (first_error != ACL_SUCCESS) return COMM_RECLAMATION_UNCONFIRMED;
+    if (first_error != ACL_SUCCESS) return unconfirmed();
     if (alloc.host_shm_owned) {
         if (shm_unlink(alloc.host_shm_name.c_str()) != 0 && errno != ENOENT) {
             LOG_ERROR("Host domain: shm_unlink failed: errno=%d", errno);
-            return COMM_RECLAMATION_UNCONFIRMED;
+            return unconfirmed();
         }
         alloc.host_shm_owned = false;
     }
@@ -1444,6 +1472,7 @@ extern "C" int comm_alloc_domain_windows(
 ) try {
     if (workspace_mask != 0) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out || !actual_window_size_out) return -1;
+    if (host_cleanup_failed(h)) return COMM_RECLAMATION_UNCONFIRMED;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         LOG_ERROR(
             "[comm rank %d] alloc_domain: bad args (rank_count=%zu domain_rank=%u window_size=%zu)", h->rank,
@@ -1531,9 +1560,18 @@ static bool map_host_domain_window(DomainAllocation &owner, uint32_t rank, const
         }
     } else {
         struct stat info{};
-        if (fstat(fd, &info) != 0 || info.st_size != size) {
+        if (fstat(fd, &info) != 0) {
+            const int error = errno;
             close(fd);
-            LOG_ERROR("Host domain: unexpected backing size for peer window %u", rank);
+            LOG_ERROR("Host domain: fstat for window %u failed: errno=%d", rank, error);
+            return false;
+        }
+        if (info.st_size != size) {
+            close(fd);
+            LOG_ERROR(
+                "Host domain: window %u size mismatch: expected=%llu actual=%lld", rank,
+                static_cast<unsigned long long>(owner.host_window_size), static_cast<long long>(info.st_size)
+            );
             return false;
         }
     }
@@ -1637,6 +1675,7 @@ extern "C" int comm_alloc_host_domain_windows(
         !local_window_base_out || !actual_window_size_out || rank_count == 0 || rank_count > COMM_MAX_RANK_NUM ||
         domain_rank >= rank_count || window_size == 0 || rank_ids[domain_rank] != static_cast<uint32_t>(h->rank))
         return -1;
+    if (host_cleanup_failed(h)) return COMM_RECLAMATION_UNCONFIRMED;
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0 || window_size > static_cast<size_t>(std::numeric_limits<off_t>::max()) - page_size) return -1;
     const size_t page = static_cast<size_t>(page_size);
@@ -1691,10 +1730,11 @@ static int release_domain_allocation(
     }
     if (alloc->host_window_size != 0) {
         // L3 has drained accepted uses; registrations can retire independently.
-        const int rc = release_host_domain_windows(*alloc);
+        const int rc = release_host_domain_windows(h, *alloc);
         if (rc == 0) h->domain_allocations.erase(it);
         return rc;
     }
+    if (collective && host_cleanup_failed(h)) return COMM_RECLAMATION_UNCONFIRMED;
     int rc = 0;
     // Published domains enter the subset barrier before local teardown.
     // Abort runs locally only after the parent joins every initializer.
@@ -1936,7 +1976,7 @@ extern "C" int comm_destroy(CommHandle h) try {
             ++it;
             continue;
         }
-        const int status = release_host_domain_windows(alloc);
+        const int status = release_host_domain_windows(h, alloc);
         if (status != 0) return status;
         it = h->domain_allocations.erase(it);
     }
@@ -1944,9 +1984,15 @@ extern "C" int comm_destroy(CommHandle h) try {
     // Final barrier is best-effort: if a peer already crashed we still need to
     // release the local resources we own, so timeout just logs and proceeds.
     int rc = 0;
+    file_marker_handshake::WaitOptions options;
+    options.abort_path = host_cleanup_failure_path(h);
     const auto destroy_handshake =
-        file_marker_handshake::destroy_barrier(h->rootinfo_path, h->rank, h->nranks, h->run_token);
+        file_marker_handshake::destroy_barrier(h->rootinfo_path, h->rank, h->nranks, h->run_token, options);
     if (!destroy_handshake.ok()) {
+        if (destroy_handshake.error == file_marker_handshake::Error::ABORTED || host_cleanup_failed(h)) {
+            LOG_WARN("[comm rank %d] comm_destroy: peer Host cleanup failed; retaining communicator", h->rank);
+            return COMM_RECLAMATION_UNCONFIRMED;
+        }
         LOG_WARN(
             "[comm rank %d] comm_destroy: final barrier failed during %s for rank %d; releasing local state anyway",
             h->rank, file_marker_handshake::stage_name(destroy_handshake.stage), destroy_handshake.rank

@@ -97,6 +97,9 @@ def test_a2a3_mapped_owner_needs_no_explicit_access_grant(a2a3_lifecycle_binary,
         "host_sdma_unsupported",
         "host_sdma_capability_failure",
         "host_sdma_device_failure",
+        "host_notify_release",
+        "host_notify_abort",
+        "host_notify_destroy",
     ],
 )
 def test_a2a3_host_domain_registration_lifecycle(a2a3_lifecycle_binary, scenario):
