@@ -1650,20 +1650,19 @@ class _SharedMemoryCreateResult:
 class _SharedMemoryOwner:
     """Own fixed named shm slots before any create operation can publish one."""
 
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, capacity: int, *, name_prefix: str = "smp_") -> None:
         self._slots = [_OwnedSharedMemorySlot() for _ in range(capacity)]
+        self._name_prefix = name_prefix
         self._create_cursor = 0
         self._attempted = 0
         self._cleanup_step = 0
         self._cleanup_error: BaseException | None = None
 
-    @staticmethod
-    def _create_in_helper(slot: _OwnedSharedMemorySlot, size: int, result: _SharedMemoryCreateResult) -> None:
+    def _create_in_helper(self, slot: _OwnedSharedMemorySlot, size: int, result: _SharedMemoryCreateResult) -> None:
+        # Names must fit both macOS POSIX shm and the mailbox field.
+        nonce_length = min(24, 30 - len(self._name_prefix))
         while True:
-            # Several mailbox control payloads reserve 32 bytes including the
-            # trailing NUL for this token. Keep the explicit collision-safe
-            # name below that ABI limit while retaining 96 bits of entropy.
-            name = f"smp_{uuid.uuid4().hex[:24]}"
+            name = self._name_prefix + uuid.uuid4().hex[:nonce_length]
             shm = SharedMemory.__new__(SharedMemory)
             shm._name = f"/{name}" if SharedMemory._prepend_leading_slash else name  # noqa: SLF001
             shm._fd = -1  # noqa: SLF001
@@ -10750,11 +10749,11 @@ class Worker:
         # per-chip reply shm.  We let the chip child write back its own slot.
         buffer_count = len(buffers)
         req_size = _DOMAIN_REQ_HEADER.size + buffer_count * 8 + len(workers) * 4
-        host_owner = (
-            _HostWindowOwner(len(workers))
-            if memory_source == AddressSpace.HOST and self._config.get("platform") == "a2a3"
-            else None
-        )
+        host_owner = None
+        if memory_source == AddressSpace.HOST and self._config.get("platform") == "a2a3":
+            prefix = _shm_name(self._shm_token, f"a3-{os.getpgrp():x}-")
+            assert prefix is not None
+            host_owner = _HostWindowOwner(len(workers), name_prefix=prefix)
         if memory_source == AddressSpace.HOST:
             req_size += _CTRL_SHM_NAME_BYTES
         reply_size = _DOMAIN_REPLY_HEADER.size + buffer_count * 8
@@ -14984,6 +14983,21 @@ class Worker:
             if entry.name in protected_names or not entry.name.startswith(prefixes):
                 continue
             try:
+                parts = entry.name.split("-", 4)
+                if parts[2] == "a3":
+                    if len(parts) != 5 or not re.fullmatch(r"[0-9a-f]{1,8}", parts[3]):
+                        continue
+                    pgid = int(parts[3], 16)
+                    # The owner retires its own group's windows. The enclosing
+                    # Worker can sweep only once the entire group has exited.
+                    if not 0 < pgid <= 0x7FFFFFFF or pgid == os.getpgrp():
+                        continue
+                    try:
+                        os.killpg(pgid, 0)
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        raise RuntimeError(f"Host backing process group {pgid} is still alive")
                 orphan = SharedMemory(name=entry.name)
                 try:
                     orphan.unlink()

@@ -1721,6 +1721,20 @@ def retained_a3_host_domain(domain_worker, monkeypatch):
 
 
 @pytest.mark.parametrize("domain_worker", [3], indirect=True)
+def test_a3_host_domain_backing_uses_startup_namespace(retained_a3_host_domain):
+    worker, members, domain, _released = retained_a3_host_domain
+    prefix = worker_mod._shm_name(worker._shm_token, f"a3-{os.getpgrp():x}-")
+    assert prefix is not None
+    names = [domain.member(rank).buffers["payload"].shm.name for rank in range(len(members))]
+    domain.release()
+    assert all(name.startswith(prefix) and len(name) <= 30 for name in names)
+    assert len(set(names)) == len(members)
+    for name in names:
+        with pytest.raises(FileNotFoundError):
+            shared_memory.SharedMemory(name=name)
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
 def test_a3_host_domain_retries_only_failed_unlink_on_close(retained_a3_host_domain, monkeypatch):
     worker, members, domain, released = retained_a3_host_domain
     names = [domain.member(rank).buffers["payload"].shm.name for rank in range(2)]
