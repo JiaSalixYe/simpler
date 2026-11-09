@@ -23,14 +23,15 @@ from simpler.task_interface import ChipCallable, CommBufferSpec, DataType, TaskA
 from simpler.worker import Worker
 
 
-@pytest.fixture
-def host_domain_worker(monkeypatch, native_host_memory):
+@pytest.fixture(params=["a5", "a2a3"])
+def host_domain_worker(request, monkeypatch, native_host_memory):
+    platform = request.param
     worker = Worker(
         level=3, platform="a2a3sim", runtime="tensormap_and_ringbuffer", device_ids=[0, 1], num_sub_workers=0
     )
     try:
         worker.init()
-        monkeypatch.setitem(worker._config, "platform", "a5")
+        monkeypatch.setitem(worker._config, "platform", platform)
         monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
         owners = {}
         allocations = []
@@ -56,7 +57,7 @@ def host_domain_worker(monkeypatch, native_host_memory):
                 struct.pack_into("<2Q", response, worker_mod._DOMAIN_REPLY_HEADER.size, base, base + 64)
 
         monkeypatch.setattr(worker, "_dispatch_control_domain", dispatch)
-        request = dict(
+        config = dict(
             name="engram",
             members=[0, 1],
             window_size=4096,
@@ -64,7 +65,7 @@ def host_domain_worker(monkeypatch, native_host_memory):
             memory_source=AddressSpace.HOST,
             retain_after_run=True,
         )
-        yield SimpleNamespace(worker=worker, request=request, owners=owners, allocations=allocations)
+        yield SimpleNamespace(worker=worker, request=config, owners=owners, allocations=allocations)
     finally:
         worker.close()
 

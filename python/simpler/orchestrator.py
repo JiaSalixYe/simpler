@@ -569,10 +569,12 @@ class Orchestrator:
         Domains provide synchronous mapped-window communication by default.
         On A5, workspace_engines adds asynchronous resources from sdma/urma/rdma.
         SDMA and URMA may share a domain. RDMA requires a separate domain with
-        its own low-address window. Explicit selection is limited to L3 A5.
+        its own low-address window.
         ``memory_source=AddressSpace.HOST`` creates independent Host windows on
-        L3 A5 TMR ranks, with local device access and optional URMA peer access.
-        Their named Buffers expose CPU bytes through ``buffer.buffer`` on L3.
+        onboard L3 A2/A3 and A5 TMR. Local device access uses MTE. For A5 peer
+        access, request ``workspace_engines=("urma",)``. For A2/A3 peer access,
+        enable SDMA on the Worker and request ``workspace_engines=("sdma",)``.
+        L3 CPU access uses ``Buffer.shm.buf`` and ``domain.buffer_range(name)``.
         ``initializer(domain)`` optionally fills all Host rank windows synchronously
         on the L3 CPU after mapping/registration and before this call returns.
         Only L3 Host-source domains support it. It must return None and may not
@@ -718,10 +720,11 @@ class Orchestrator:
         buffer: str | None = None,
         offset: int = 0,
     ) -> None:
-        """Synchronously stage bytes; does not wait for queued tasks.
+        """Synchronously stage Device-source bytes without waiting for queued tasks.
 
         L3 staging precedes task submission and stays within declared buffer slices.
-        L4 keeps its existing window copy path.
+        L4 supports bounded whole-window copies. For Host-source domains, use
+        the CPU mapping at ``Buffer.shm.buf``.
         """
         self._copy_domain(handle, domain_rank, bytes(data), buffer, offset, writing=True)
 
