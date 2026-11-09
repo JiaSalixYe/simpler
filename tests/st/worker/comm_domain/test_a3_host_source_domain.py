@@ -94,41 +94,6 @@ def _assert_host_sdma_rejected(worker, request, device_ids, capabilities):
         assert "timed out waiting for window announcement" not in text
 
 
-@pytest.mark.platforms(["a2a3"])
-@pytest.mark.runtime(_RUNTIME)
-@pytest.mark.device_count(1)
-def test_a3_device_window_baseline(st_platform, st_device_ids):
-    nbytes = COUNT * 4
-    worker = Worker(level=3, platform=st_platform, runtime=_RUNTIME, device_ids=[st_device_ids[0]], num_sub_workers=0)
-    chip = worker.register(_build_tload_callable(st_platform, _RUNTIME))
-    try:
-        worker.init()
-        scratch = worker.create_buffer(nbytes)
-
-        def run(orch, _args, cfg):
-            domain = orch.allocate_domain(
-                name="device",
-                members=[0],
-                window_size=2 * nbytes,
-                buffers=[CommBufferSpec(name, "float32", COUNT, nbytes) for name in ("table", "out")],
-                retain_after_run=True,
-            )
-            orch.copy_to_domain(domain, 0, struct.pack(f"<{COUNT}f", *([2.0] * COUNT)), buffer="table")
-            args = TaskArgs()
-            buffers = domain.member(0).buffers
-            args.add_tensor(buffers["table"].tensor((COUNT,), DataType.FLOAT32), TensorArgType.INPUT)
-            args.add_tensor(buffers["out"].tensor((COUNT,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
-            args.add_scalar(1)
-            args.add_scalar(domain.device_context(0))
-            orch.submit_next_level(chip, args, cfg, worker=0)
-
-        worker.run(run)
-        worker.copy_from(scratch, worker.live_domains["device"].member(0).buffers["out"])
-        assert struct.unpack_from(f"<{COUNT}f", scratch.shm.buf) == (2.0,) * COUNT
-    finally:
-        worker.close()
-
-
 def _build_sdma_callable(platform):
     root = Path(__file__).resolve().parents[4]
     kernels = root / "examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/kernels"
@@ -222,7 +187,7 @@ def test_a3_host_source_domain(  # noqa: PLR0912 -- covers supported and rejecte
         if sdma and 0 in capabilities:
             _assert_host_sdma_rejected(worker, request, st_device_ids[:2], capabilities)
             return
-        scratch = worker.create_buffer(nbytes)
+        scratch = worker.create_buffer(nbytes) if sdma else None
 
         def fill_tables(domain, value):
             offset, size = domain.buffer_range("table")
@@ -288,6 +253,7 @@ def test_a3_host_source_domain(  # noqa: PLR0912 -- covers supported and rejecte
             windows = [host.member(rank).buffers["table"].shm for rank in range(2)]
             assert all(bytes(window.buf[:prefix]) == bytes(prefix) for window in windows)
             if device is not None:
+                assert scratch is not None
                 for rank, data in enumerate((value + 1.0, value)):
                     for name, expected in (("out", data), ("result", data + 1.0)):
                         for slot in range(depth):
@@ -300,12 +266,8 @@ def test_a3_host_source_domain(  # noqa: PLR0912 -- covers supported and rejecte
             else:
                 offset, _ = host.buffer_range("out")
                 assert struct.unpack_from(f"<{count}f", windows[0].buf, offset) == (value,) * count
-        with pytest.raises(RuntimeError, match="belongs to the domain"):
+        with pytest.raises(RuntimeError, match="belongs to L2"):
             windows[0].unlink()
-        with pytest.raises(ValueError, match="Host domain windows use CPU access"):
-            worker.copy_to(host.member(0).buffers["table"], scratch)
-        with pytest.raises(ValueError, match="Host domain windows use CPU access"):
-            worker.copy_from(scratch, host.member(0).buffers["table"])
         with windows[0].buf[prefix : prefix + nbytes] as exported:
             with pytest.raises(BufferError, match="live CPU exports"):
                 host.release()
@@ -314,6 +276,7 @@ def test_a3_host_source_domain(  # noqa: PLR0912 -- covers supported and rejecte
         host.release()
         assert host.freed and all(window.buf is None for window in windows)
         if device is not None:
+            assert scratch is not None
             worker.copy_from(scratch, device.member(1).buffers["out"])
             assert struct.unpack_from(f"<{count}f", scratch.shm.buf) == (5.0,) * count
             device.release()

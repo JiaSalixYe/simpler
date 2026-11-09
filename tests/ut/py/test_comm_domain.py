@@ -1328,14 +1328,16 @@ def test_checked_device_context_validates_live_domain_and_scalar_use(domain_work
         handle.device_context(handle.workers[0], workspace_engines=("urma",))
 
 
-@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+@pytest.mark.parametrize(
+    ("domain_worker", "platform"), [(3, "a5"), (3, "a2a3"), ("external-l3", "a2a3")], indirect=["domain_worker"]
+)
 @pytest.mark.parametrize("fail_second_import", [False, True])
 def test_host_domain_wire_cpu_import_retention_and_rollback(
-    domain_worker, monkeypatch, fail_second_import, native_host_memory
+    domain_worker, monkeypatch, fail_second_import, native_host_memory, platform
 ):
     worker, _members = domain_worker
-    # Exercise real parent transactions with a host-only stand-in for the A5 child allocator.
-    monkeypatch.setitem(worker._config, "platform", "a5")
+    # Exercise real parent transactions with a host-only stand-in for the native child allocator.
+    monkeypatch.setitem(worker._config, "platform", platform)
     monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
     owners = {}
     captured = []
@@ -1361,10 +1363,10 @@ def test_host_domain_wire_cpu_import_retention_and_rollback(
             worker_mod._DOMAIN_REPLY_HEADER.pack_into(response, 0, 1, base + size, base, size, buffer_count)
             struct.pack_into("<2Q", response, worker_mod._DOMAIN_REPLY_HEADER.size, base, base + 64)
 
-    def import_mapping(name, size, **kwargs):
+    def import_mapping(name, size):
         if fail_second_import and imports:
             raise RuntimeError("injected CPU import failure")
-        mapping = HostBufferMapping(name, size, **kwargs)
+        mapping = HostBufferMapping(name, size)
         imports.append(mapping)
         return mapping
 
@@ -1402,10 +1404,19 @@ def test_host_domain_wire_cpu_import_retention_and_rollback(
     saved = domain.member(1).buffers["table"]
     with saved.shm.buf[offset : offset + nbytes] as view:
         assert bytes(view) == bytes([37]) * 64
+    names = {mapping.name for mapping in imports}
+    assert len(names) == 2
+    if platform == "a2a3":
+        prefix = worker_mod._shm_name(worker._shm_token, f"a3-{os.getpgrp():x}-")
+        assert prefix is not None
+        assert all(name.startswith(prefix) and len(name) <= 30 for name in names)
     domain.release()
     assert domain.freed and owners == {}
     assert all(mapping.buf is None for mapping in imports)
     assert saved.shm.buf is None
+    for name in names:
+        with pytest.raises(FileNotFoundError):
+            shared_memory.SharedMemory(name=name)
 
 
 @pytest.mark.parametrize("domain_worker", [3], indirect=True)
@@ -1708,111 +1719,3 @@ def test_a3_host_domain_reclaims_backing_after_lost_reply(domain_worker, monkeyp
         with pytest.raises(RuntimeError, match="killed by signal"):
             worker.close()
     assert all(not backing_exists(name) for name in names)
-
-
-@pytest.fixture
-def retained_a3_host_domain(domain_worker, monkeypatch, native_host_memory):
-    worker, members = domain_worker
-    monkeypatch.setitem(worker._config, "platform", "a2a3")
-    monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
-    released = []
-    owners = {}
-
-    def dispatch(*, workers, request_shms, reply_shms, op, allocation_id):
-        if op == "release":
-            released.extend(workers)
-            for chip in workers:
-                owner = owners.pop(chip)
-                owner.close()
-                owner.unlink()
-            return
-        for chip in workers:
-            request = request_shms[chip].buf
-            _, rank_count, _, size, count = worker_mod._DOMAIN_REQ_HEADER.unpack_from(request)
-            tail = worker_mod._DOMAIN_REQ_HEADER.size + count * 8 + rank_count * 4
-            name = worker_mod._read_shm_name(request, tail)
-            owners[chip] = native_host_memory(name=name, size=size)
-            reply = reply_shms[chip].buf
-            worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply, 0, 1, 0xC0, 0x1000, 4096, 1)
-            struct.pack_into("<Q", reply, worker_mod._DOMAIN_REPLY_HEADER.size, 0x1000)
-
-    monkeypatch.setattr(worker, "_dispatch_control_domain", dispatch)
-    domains = []
-    request = _request(members, memory_source=AddressSpace.HOST)
-    worker.run(lambda orch, _args, _cfg: domains.append(orch.allocate_domain(**request)))
-    return worker, members, domains[0], released
-
-
-@pytest.mark.parametrize("domain_worker", [3, "external-l3"], indirect=True)
-def test_a3_host_domain_backing_names_and_release(retained_a3_host_domain):
-    worker, members, domain, _released = retained_a3_host_domain
-    prefix = worker_mod._shm_name(worker._shm_token, f"a3-{os.getpgrp():x}-")
-    assert prefix is not None
-    names = [domain.member(rank).buffers["payload"].shm.name for rank in range(len(members))]
-    domain.release()
-    assert all(name.startswith(prefix) and len(name) <= 30 for name in names)
-    assert len(set(names)) == len(members)
-    for name in names:
-        with pytest.raises(FileNotFoundError):
-            shared_memory.SharedMemory(name=name)
-
-
-@pytest.mark.parametrize("domain_worker", [3], indirect=True)
-@pytest.mark.parametrize("action", ["release", "close"])
-def test_a3_host_domain_refuses_live_numpy_slice(retained_a3_host_domain, action):
-    np = pytest.importorskip("numpy")
-    worker, members, domain, released = retained_a3_host_domain
-    mapping = domain.member(1).buffers["payload"].shm
-    close = domain.release if action == "release" else worker.close
-    with mapping.buf as exported:
-        array = np.ndarray((8,), dtype=np.int32, buffer=exported)
-        view = array[1:3]
-    del array
-    try:
-        with pytest.raises(BufferError, match="live CPU exports"):
-            close()
-        assert not domain.released and released == []
-        with domain.member(0).buffers["payload"].shm.buf as other_rank:
-            other_rank[0] = 7
-        view[:] = 29
-    finally:
-        del view
-    close()
-    assert domain.freed and released == members
-
-
-@pytest.mark.parametrize("domain_worker", [3], indirect=True)
-def test_a3_host_domain_close_drains_admitted_cpu_access(retained_a3_host_domain, monkeypatch):
-    worker, members, domain, released = retained_a3_host_domain
-    callback_entered = threading.Event()
-    close_started = threading.Event()
-    errors = []
-    seal_exports = worker._seal_domain_cpu_exports
-
-    def observe_close(*, seal=True):
-        seal_exports(seal=seal)
-        close_started.set()
-
-    def access(_orch, _args, _cfg):
-        callback_entered.set()
-        assert close_started.wait(5)
-        with domain.member(0).buffers["payload"].shm.buf as view:
-            view[0] = 7
-
-    def run():
-        try:
-            worker.run(access)
-        except BaseException as exc:
-            errors.append(exc)
-
-    monkeypatch.setattr(worker, "_seal_domain_cpu_exports", observe_close)
-    thread = threading.Thread(target=run)
-    thread.start()
-    try:
-        assert callback_entered.wait(5)
-        worker.close()
-    finally:
-        close_started.set()
-        thread.join(5)
-    assert not thread.is_alive() and not errors
-    assert domain.freed and released == members

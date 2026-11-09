@@ -12330,11 +12330,8 @@ class Worker:
         )
         return decode_copy_result(reply)
 
-    def _seal_domain_cpu_exports(self, *, seal: bool = True) -> None:
-        seal_host_mappings(
-            (mapping for handle in list(self._live_domains.values()) for mapping in handle._host_mappings),
-            seal=seal,
-        )
+    def _seal_domain_cpu_exports(self) -> None:
+        seal_host_mappings(mapping for handle in list(self._live_domains.values()) for mapping in handle._host_mappings)
 
     def _release_all_live_domains(
         self, resources: _RunResources | None = None, *, include_retained: bool = True
@@ -12656,12 +12653,6 @@ class Worker:
                 f"Worker.{api}: {identity} is not a live device allocation on this worker "
                 f"(never allocated here, already freed, or its domain was released)"
             )
-        if (
-            handle.backend_kind == BackendKind.VMM_WINDOW
-            and handle.shm is not None
-            and capability in (BufferCapability.COPY_TO, BufferCapability.COPY_FROM)
-        ):
-            raise ValueError(f"Worker.{api}: Host domain windows use CPU access through Buffer.shm.buf")
         kind, _profile = select_adapter(handle.to_descriptor(), self._owner_endpoint_context(), where=f"Worker.{api}")
         granted = capabilities_for_adapter(kind, handle.access)
         if capability not in granted:
@@ -14837,8 +14828,7 @@ class Worker:
                         "init()'d it (native teardown is thread-bound)"
                     )
                 self._validate_chip_execution_context()
-                # Admitted orchestration can still take CPU views while it drains.
-                self._seal_domain_cpu_exports(seal=self._active_ops == 0)
+                self._seal_domain_cpu_exports()
                 deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error_locked("close")
                 # Claim: publish CLOSED (permanent admission fence) and install a
                 # fresh teardown attempt.

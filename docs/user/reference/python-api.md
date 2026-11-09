@@ -181,7 +181,7 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, memory_source=AddressSpace.DEVICE)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported |
 | `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, memory_source=AddressSpace.DEVICE)` | Reuse the same live handle after full configuration validation, or create it |
 | `get_domain(name_or_ref)` / `release_domain(handle)` | Creator-local name lookup or borrowing by `CommDomainRef`; only the creator owns release |
-| `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded Device-source staging before task submission. L3 requires declared slices |
+| `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded staging before task submission; L3 requires declared slices |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
 
 Onboard A2/A3 and A5 TMR L3 domains may select `memory_source=AddressSpace.HOST`.

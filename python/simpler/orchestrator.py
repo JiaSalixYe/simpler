@@ -720,11 +720,10 @@ class Orchestrator:
         buffer: str | None = None,
         offset: int = 0,
     ) -> None:
-        """Synchronously stage Device-source bytes without waiting for queued tasks.
+        """Synchronously stage bytes; does not wait for queued tasks.
 
         L3 staging precedes task submission and stays within declared buffer slices.
-        L4 supports bounded whole-window copies. For Host-source domains, use
-        the CPU mapping at ``Buffer.shm.buf``.
+        L4 keeps its existing window copy path.
         """
         self._copy_domain(handle, domain_rank, bytes(data), buffer, offset, writing=True)
 

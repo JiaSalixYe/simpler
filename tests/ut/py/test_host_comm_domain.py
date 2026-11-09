@@ -80,7 +80,7 @@ def test_cpu_window_exports_prevent_domain_release(native_host_memory):
         assert exported[2] == 42
         with pytest.raises(ValueError, match="domain.release"):
             buf.close()
-        with pytest.raises(RuntimeError, match="belongs to the domain"):
+        with pytest.raises(RuntimeError, match="belongs to L2"):
             buf.shm.unlink()
         assert not buf.closed and buf.shm.buf is not None
         with pytest.raises(BufferError, match="export"):

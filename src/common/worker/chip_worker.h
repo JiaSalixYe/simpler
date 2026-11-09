@@ -440,11 +440,10 @@ public:
         size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr,
         const std::string &host_shm_name = {}
     );
-    /// Pair to `comm_alloc_domain_windows`: collectively free the per-rank
-    /// pool and the device CommContext, then drop the allocation record.
-    /// `rank_count` + `domain_rank` size the subset barrier; the rank list
-    /// itself is not needed (the alloc-time identity is already cached
-    /// inside the backend's per-allocation record).
+    /// Release the rank's resources after the caller drains all domain users.
+    /// `rank_count` and `domain_rank` identify the allocation and size the
+    /// subset barrier on backends that use one. A2/A3 Host domains release
+    /// their registrations independently after the caller's fence.
     void
     comm_release_domain_windows(uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
     /// Locally roll back a domain the coordinating owner has never published to device users.
