@@ -225,20 +225,22 @@ def test_a3_host_source_domain(  # noqa: PLR0912 -- covers supported and rejecte
 
         def prepare(orch, _args, _cfg):
             state["host"] = orch.get_or_allocate_domain(**request)
-            state["device"] = orch.get_or_allocate_domain(
-                name="device",
-                members=[1, 0],
-                window_size=2 * depth * nbytes,
-                buffers=[CommBufferSpec(name, "float32", depth * count, depth * nbytes) for name in ("out", "result")],
-                retain_after_run=True,
-            )
             if sdma:
+                state["device"] = orch.get_or_allocate_domain(
+                    name="device",
+                    members=[1, 0],
+                    window_size=2 * depth * nbytes,
+                    buffers=[
+                        CommBufferSpec(name, "float32", depth * count, depth * nbytes) for name in ("out", "result")
+                    ],
+                    retain_after_run=True,
+                )
                 for rank in range(2):
                     for name in ("out", "result"):
                         orch.copy_to_domain(state["device"], rank, bytes(depth * nbytes), buffer=name)
 
         worker.run(prepare)
-        host, device = state["host"], state["device"]
+        host, device = state["host"], state.get("device")
         windows = [host.member(rank).buffers["table"].shm for rank in range(2)]
         with pytest.raises(RuntimeError, match="belongs to the domain"):
             windows[0].unlink()
@@ -252,12 +254,12 @@ def test_a3_host_source_domain(  # noqa: PLR0912 -- covers supported and rejecte
             byte_offset = slot * nbytes
             for rank in range(2 if sdma else 1):
                 member = host.member(rank)
-                outputs = device.member(rank).buffers
+                outputs = device.member(rank).buffers if device is not None else member.buffers
                 args = TaskArgs()
                 args.add_tensor(member.buffers["table"].tensor((count,), DataType.FLOAT32), TensorArgType.INPUT)
-                out = outputs["out"] if sdma else member.buffers["out"]
                 args.add_tensor(
-                    out.tensor((count,), DataType.FLOAT32, byte_offset=byte_offset), TensorArgType.OUTPUT_EXISTING
+                    outputs["out"].tensor((count,), DataType.FLOAT32, byte_offset=byte_offset),
+                    TensorArgType.OUTPUT_EXISTING,
                 )
                 if sdma:
                     args.add_tensor(
@@ -280,7 +282,7 @@ def test_a3_host_source_domain(  # noqa: PLR0912 -- covers supported and rejecte
             if following is not None:
                 following.wait()
             assert all(bytes(window.buf[:prefix]) == bytes(prefix) for window in windows)
-            if sdma:
+            if device is not None:
                 for rank, data in enumerate((value + 1.0, value)):
                     for name, expected in (("out", data), ("result", data + 1.0)):
                         for slot in range(depth):
@@ -299,10 +301,10 @@ def test_a3_host_source_domain(  # noqa: PLR0912 -- covers supported and rejecte
             assert struct.unpack_from(f"<{count}f", exported) == (5.0,) * count
         host.release()
         assert host.freed and all(window.buf is None for window in windows)
-        if sdma:
+        if device is not None:
             worker.copy_from(scratch, device.member(1).buffers["out"])
             assert struct.unpack_from(f"<{count}f", scratch.shm.buf) == (5.0,) * count
-        device.release()
+            device.release()
     except BaseException:
         try:
             worker.close()
