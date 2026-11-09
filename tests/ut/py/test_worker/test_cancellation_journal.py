@@ -13,6 +13,7 @@ import os
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 import simpler.worker as worker_mod
@@ -438,6 +439,48 @@ class TestShmNames:
                 nested_shm.unlink()
             with contextlib.suppress(FileNotFoundError):
                 foreign_shm.unlink()
+
+    def test_a3_backing_sweep_waits_for_the_creator_group(self, monkeypatch):
+        nested = Worker(level=3, num_sub_workers=0)
+        root = Worker(level=4, num_sub_workers=0)
+        root.add_worker(nested)
+        root._assign_shm_namespace()
+        own_group = os.getpgrp()
+        child_group = own_group + 1
+        backing = _shm_name(nested._shm_token, f"a3-{child_group:x}-backing")
+        local = _shm_name(root._shm_token, f"a3-{own_group:x}-local")
+        foreign = _shm_name(uuid.uuid4().hex, f"a3-{child_group:x}-foreign")
+        invalid = _shm_name(nested._shm_token, "a3-0-invalid")
+        names = [backing, local, foreign, invalid]
+        unlinked = []
+        probe_error = None
+
+        def probe(group, sig):
+            assert (group, sig) == (child_group, 0)
+            if probe_error is not None:
+                raise probe_error
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os.path, "isdir", lambda path: path == "/dev/shm")
+            patch.setattr(os, "scandir", lambda _path: [SimpleNamespace(name=name) for name in names])
+            patch.setattr(os, "killpg", probe)
+            patch.setattr(
+                worker_mod,
+                "SharedMemory",
+                lambda name: SimpleNamespace(unlink=lambda: unlinked.append(name), close=lambda: None),
+            )
+            with pytest.raises(RuntimeError, match="still alive"):
+                root._reclaim_child_groups(time.monotonic())
+            assert unlinked == [] and not root._cleanup_journal.empty
+
+            probe_error = PermissionError("group visibility denied")
+            assert root._cleanup_journal.drive_kinds({"shm"}) is probe_error
+            assert unlinked == [] and not root._cleanup_journal.empty
+
+            probe_error = ProcessLookupError()
+            assert root._cleanup_journal.drive_kinds({"shm"}) is None
+            assert root._cleanup_journal.empty
+            assert unlinked == [backing]
 
 
 class TestNewWorkerClose:

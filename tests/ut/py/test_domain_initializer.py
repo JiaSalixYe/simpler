@@ -12,6 +12,7 @@ from __future__ import annotations
 import struct
 import traceback
 import weakref
+from multiprocessing.shared_memory import SharedMemory
 from types import SimpleNamespace
 
 import numpy as np
@@ -23,14 +24,15 @@ from simpler.task_interface import ChipCallable, CommBufferSpec, DataType, TaskA
 from simpler.worker import Worker
 
 
-@pytest.fixture
-def host_domain_worker(monkeypatch, native_host_memory):
+@pytest.fixture(params=["a5", "a2a3"])
+def host_domain_worker(request, monkeypatch, native_host_memory):
+    platform = request.param
     worker = Worker(
         level=3, platform="a2a3sim", runtime="tensormap_and_ringbuffer", device_ids=[0, 1], num_sub_workers=0
     )
     try:
         worker.init()
-        monkeypatch.setitem(worker._config, "platform", "a5")
+        monkeypatch.setitem(worker._config, "platform", platform)
         monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
         owners = {}
         allocations = []
@@ -40,7 +42,8 @@ def host_domain_worker(monkeypatch, native_host_memory):
                 for chip in workers:
                     owner = owners.pop((allocation_id, chip))
                     owner.close()
-                    owner.unlink()
+                    if platform == "a5":
+                        owner.unlink()
                 return
             allocations.append(allocation_id)
             for chip in workers:
@@ -49,14 +52,17 @@ def host_domain_worker(monkeypatch, native_host_memory):
                 assert identity == allocation_id and rank == chip and count == 2
                 tail = worker_mod._DOMAIN_REQ_HEADER.size + buffer_count * 8 + count * 4
                 name = worker_mod._read_shm_name(request, tail)
-                owners[allocation_id, chip] = native_host_memory(name=name, size=size)
+                if platform == "a5":
+                    owners[allocation_id, chip] = native_host_memory(name=name, size=size)
+                else:
+                    owners[allocation_id, chip] = SharedMemory(name=name)
                 base = 0x100000 * (chip + 1)
                 response = reply_shms[chip].buf
                 worker_mod._DOMAIN_REPLY_HEADER.pack_into(response, 0, 1, base + size, base, size, buffer_count)
                 struct.pack_into("<2Q", response, worker_mod._DOMAIN_REPLY_HEADER.size, base, base + 64)
 
         monkeypatch.setattr(worker, "_dispatch_control_domain", dispatch)
-        request = dict(
+        config = dict(
             name="engram",
             members=[0, 1],
             window_size=4096,
@@ -64,7 +70,7 @@ def host_domain_worker(monkeypatch, native_host_memory):
             memory_source=AddressSpace.HOST,
             retain_after_run=True,
         )
-        yield SimpleNamespace(worker=worker, request=request, owners=owners, allocations=allocations)
+        yield SimpleNamespace(worker=worker, request=config, owners=owners, allocations=allocations)
     finally:
         worker.close()
 
