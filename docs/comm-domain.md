@@ -95,13 +95,16 @@ but not freed; its cleanup obligation stays tracked and is reported, while
 independent worker-tree cleanup continues.
 `Worker.live_domains` includes both backends.
 
-`copy_to_domain` and `copy_from_domain` use domain rank and the same named-buffer
+`copy_to_domain` and `copy_from_domain` on Device-source domains use domain rank and the same named-buffer
 bounds checks. They synchronously stage data without issuing an implicit run/DAG
 fence. L3 staging precedes task submission and reuses ordinary VMM Buffer
 copies and must stay inside the declared slices, including when `buffer=None`.
 L4 retains the existing bounded whole-window copy path. `buffer_range(name)`
 returns the slice's window offset and byte size. `requested_window_size` preserves the request;
 `mapping_size` reports the backend's actual mapping extent. Complete buffer definitions remain available.
+
+For Host-source domains, use `Buffer.shm.buf` and `domain.buffer_range(name)` for CPU access.
+Domain copy helpers and `Worker.copy_to` / `Worker.copy_from` reject the mapped device address.
 
 L4 Buffer/Tensor views reach their owning chip through local or remote L3s, preserving canonical
 identity without exposing remote device addresses. Pass an immutable `CommDomainRef` (creator instance,
@@ -169,6 +172,11 @@ and request `workspace_engines=("sdma",)` to map the peer windows. The kernel
 gets the source address from `CommContext` and the Worker workspace from
 `get_dma_workspace(args, DMA_WORKSPACE_SDMA)`. CPU access and release use the
 same borrowed views and fences as on A5.
+
+Both MTE and SDMA require the installed stack to register POSIX mappings.
+The CANN 9.0 [`aclrtHostRegister` documentation](https://www.hiascend.com/doc_center/source/zh/canncommercial/900/API/runtimeapi/aclcppdevg_03_1804.html)
+specifies runtime-allocated page-locked memory on Linux 5.10 and earlier.
+A3 onboard MTE and SDMA passed with CANN 9.0.0 on HCE kernel `5.10.0-182.0.0.95.r1941_123.hce2.aarch64`.
 
 Pass `initializer(domain)` to `allocate_domain` or `get_or_allocate_domain` to
 fill the rank windows synchronously before submitting tasks in the same

@@ -12474,8 +12474,9 @@ class Worker:
         )
         return decode_copy_result(reply)
 
-    def _seal_domain_cpu_exports(self) -> None:
-        seal_host_mappings(mapping for handle in list(self._live_domains.values()) for mapping in handle._host_mappings)
+    def _seal_domain_cpu_exports(self, *, seal: bool = True) -> None:
+        mappings = (mapping for handle in list(self._live_domains.values()) for mapping in handle._host_mappings)
+        seal_host_mappings(mappings, seal=seal)
 
     def _release_all_live_domains(
         self, resources: _RunResources | None = None, *, include_retained: bool = True
@@ -12797,6 +12798,11 @@ class Worker:
                 f"Worker.{api}: {identity} is not a live device allocation on this worker "
                 f"(never allocated here, already freed, or its domain was released)"
             )
+        if isinstance(handle.shm, HostBufferMapping) and capability in (
+            BufferCapability.COPY_TO,
+            BufferCapability.COPY_FROM,
+        ):
+            raise ValueError(f"Worker.{api}: use Buffer.shm.buf for CPU copies of Host-source domain buffers")
         kind, _profile = select_adapter(handle.to_descriptor(), self._owner_endpoint_context(), where=f"Worker.{api}")
         granted = capabilities_for_adapter(kind, handle.access)
         if capability not in granted:
@@ -14975,7 +14981,7 @@ class Worker:
         - Reentrant ``close()`` from inside a leased operation is rejected.
         - Live Host-domain CPU exports reject close with ``BufferError`` before
           the claim. Drop arrays and release memoryviews, then retry. If an
-          admitted run exports a new window during drain, teardown is deferred
+          admitted run leaves a live export during drain, teardown is deferred
           and close remains retryable with the worker CLOSED.
         - ``close()`` during an in-progress ``init()`` on another thread
           cooperatively cancels it: the init epoch unwinds and this call
@@ -15107,7 +15113,8 @@ class Worker:
                         "init()'d it (native teardown is thread-bound)"
                     )
                 self._validate_chip_execution_context()
-                self._seal_domain_cpu_exports()
+                # Admitted callbacks can still borrow Host windows during drain.
+                self._seal_domain_cpu_exports(seal=self._active_ops == 0)
                 deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error_locked("close")
                 # Claim: publish CLOSED (permanent admission fence) and install a
                 # fresh teardown attempt.
@@ -15197,8 +15204,7 @@ class Worker:
                                 f"({_ROLLBACK_GRACEFUL_TIMEOUT_S}s); teardown deferred (worker stays CLOSED)"
                             )
                     else:
-                        # An operation admitted before CLOSED may have created
-                        # another Host domain while close drained its run.
+                        # Recheck all mappings after admitted runs finish.
                         self._seal_domain_cpu_exports()
                         teardown_tree = self._has_live_resources()
                         # Fence drain makes this close terminal even when the

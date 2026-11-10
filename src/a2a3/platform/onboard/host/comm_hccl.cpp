@@ -1185,14 +1185,25 @@ static int release_host_domain_windows(CommHandle h, DomainAllocation &alloc) {
         return COMM_RECLAMATION_UNCONFIRMED;
     };
     if (alloc.device_ctx != nullptr) {
-        if (aclrtFree(alloc.device_ctx) != ACL_SUCCESS) return unconfirmed();
+        const aclError status = aclrtFree(alloc.device_ctx);
+        if (status != ACL_SUCCESS) {
+            LOG_ERROR(
+                "[comm rank %d] Host domain: aclrtFree CommContext failed: %d", h->rank, static_cast<int>(status)
+            );
+            return unconfirmed();
+        }
         alloc.device_ctx = nullptr;
     }
     aclError first_error = ACL_SUCCESS;
-    for (auto &window : alloc.host_windows) {
+    for (size_t rank = 0; rank < alloc.host_windows.size(); ++rank) {
+        auto &window = alloc.host_windows[rank];
         if (window.registered) {
             const aclError status = aclrtHostUnregister(window.cpu);
             if (status != ACL_SUCCESS) {
+                LOG_ERROR(
+                    "[comm rank %d] Host domain: aclrtHostUnregister for window %zu failed: %d", h->rank, rank,
+                    static_cast<int>(status)
+                );
                 record_first_error(status, &first_error);
                 continue;
             }
@@ -1200,6 +1211,7 @@ static int release_host_domain_windows(CommHandle h, DomainAllocation &alloc) {
         }
         if (window.cpu != nullptr) {
             if (munmap(window.cpu, alloc.host_window_size) != 0) {
+                LOG_ERROR("[comm rank %d] Host domain: munmap for window %zu failed: errno=%d", h->rank, rank, errno);
                 record_first_error(ACL_ERROR_FAILURE, &first_error);
             } else {
                 window.cpu = nullptr;

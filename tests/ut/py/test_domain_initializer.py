@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import struct
+import threading
 import traceback
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import numpy as np
@@ -75,6 +77,69 @@ def _fill(domain):
     for rank in range(2):
         with domain.member(rank).buffers["table"].shm.buf[offset : offset + nbytes] as view:
             view[:] = bytes([rank + 17]) * nbytes
+
+
+@pytest.mark.parametrize("retained", [False, True], ids=["initializer", "retained"])
+def test_close_drains_admitted_host_access(host_domain_worker, retained):
+    env = host_domain_worker
+    worker = env.worker
+    entered = threading.Event()
+    domains = []
+
+    def access(domain):
+        domains.append(domain)
+        entered.set()
+        with worker._hierarchical_start_cv:
+            assert worker._hierarchical_start_cv.wait_for(
+                lambda: worker._lifecycle is worker_mod._Lifecycle.CLOSED, timeout=10
+            )
+        _fill(domain)
+
+    if retained:
+        worker.run(lambda orch, *_: orch.allocate_domain(**env.request))
+
+    def model(orch, *_):
+        if retained:
+            access(orch.get_domain("engram"))
+        else:
+            orch.allocate_domain(**env.request, initializer=access)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        run = pool.submit(worker.run, model)
+        assert entered.wait(10)
+        worker.close()
+        run.result(timeout=10)
+    assert domains[0].freed and not env.owners
+
+
+@pytest.mark.parametrize("writing", [True, False], ids=["write", "read"])
+def test_host_window_rejects_device_copy(host_domain_worker, monkeypatch, writing):
+    env = host_domain_worker
+
+    def unexpected_copy(*_):
+        pytest.fail("Host window reached the native device copy")
+
+    def model(orch, *_):
+        domain = orch.allocate_domain(**env.request)
+        window = domain.member(0).buffers["table"]
+        staging = env.worker.create_buffer(64)
+        with monkeypatch.context() as patch:
+            native_type = type(env.worker._worker)
+            patch.setattr(native_type, "copy_to", unexpected_copy)
+            patch.setattr(native_type, "copy_from", unexpected_copy)
+            patch.setattr(window, "shm", None)
+            if writing:
+                with pytest.raises(ValueError, match=r"Buffer\.shm\.buf"):
+                    orch.copy_to_domain(domain, 0, b"test", buffer="table")
+                with pytest.raises(ValueError, match=r"Buffer\.shm\.buf"):
+                    env.worker.copy_to(window, staging)
+            else:
+                with pytest.raises(ValueError, match=r"Buffer\.shm\.buf"):
+                    orch.copy_from_domain(domain, 0, 4, buffer="table")
+                with pytest.raises(ValueError, match=r"Buffer\.shm\.buf"):
+                    env.worker.copy_from(staging, window)
+
+    env.worker.run(model)
 
 
 @pytest.mark.parametrize("api", ["allocate_domain", "get_or_allocate_domain"])
