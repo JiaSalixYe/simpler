@@ -433,10 +433,10 @@ public:
         uint64_t comm_handle, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank, size_t window_offset,
         size_t window_size
     );
-    /// Collectively allocate a fresh per-rank symmetric pool for a subset of
-    /// ranks.  Multiple concurrent allocations are disambiguated by
-    /// `allocation_id`. Returns (device_ctx, local_window_base, actual_window_size). Only
-    /// participating ranks call this; non-members of the subset must not.
+    /// Allocate a fresh per-rank window for a subset identified by `rank_ids`.
+    /// Only participating ranks call this with the same `allocation_id`.
+    /// A nonempty `host_shm_name` selects Host backing. Returns
+    /// (device_ctx, local_window_base, actual_window_size).
     /// ownership_flag records cleanup responsibility, including an unpublished allocation
     /// retained after failure; a set flag does not imply a usable device context.
     std::tuple<uint64_t, uint64_t, size_t> comm_alloc_domain_windows(
@@ -445,9 +445,10 @@ public:
         const std::string &host_shm_name = {}
     );
     /// Release the rank's resources after the caller drains all domain users.
-    /// `rank_count` and `domain_rank` identify the allocation and size the
-    /// subset barrier on backends that use one. A2/A3 Host domains release
-    /// their registrations independently after the caller's fence.
+    /// `allocation_id` identifies the allocation. `rank_count` is the subset
+    /// size and `domain_rank` is the caller's dense rank in it. Backends with
+    /// a subset barrier use those values for its participant count and rank.
+    /// A2/A3 Host domains release registrations independently after the fence.
     void
     comm_release_domain_windows(uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
     /// Locally roll back a domain the coordinating owner has never published to device users.

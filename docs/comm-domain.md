@@ -137,9 +137,9 @@ continues; child exit alone does not prove device reclamation.
 | `actual_window_size` | window size actually allocated |
 | `buffers` | `{buffer_name: Buffer}` for each `CommBufferSpec` (device `VMM_WINDOW`, owned by this chip) |
 
-Kernels read peer windows through `device_ctx` (which holds every rank's
-window base, local + imported peer); `buffers[name]` is the local slice —
-name it in a task arg with `buffers[name].tensor(shapes, dtype)`.
+For Device-source domains, `device_ctx` exposes the local and imported peer
+window bases. For Host-source domains, peer access follows the platform rules
+below. Use `buffers[name].tensor(shapes, dtype)` to pass a local slice to a task.
 
 ### A5 Host-source windows
 
@@ -463,8 +463,8 @@ and is warned about twice: by the runtime builder and again at Worker init. A
 warmup whose device launch or sync *fails* is not in this category at all — it
 fails Worker init, because the card it faulted on must not reach the first run.
 
-On a2a3, both Device- and Host-source domains use the Worker-owned SDMA workspace.
-Because an SDMA-enabled Worker's 48 STARS
+On a2a3, SDMA uses the Worker-owned workspace for both Device- and Host-source
+domains. Because an SDMA-enabled Worker's 48 STARS
 streams sit in the device fault/sync domain, a fault on that Worker slows its
 teardown; keep SDMA workloads on their own Worker (and, in CI, their own task)
 so ordinary workloads are unaffected — see
@@ -500,8 +500,8 @@ through the existing domain rollback path. Host registration or AIV access alone
 does not establish SDMA support. Simulation and L4
 domains support synchronous mappings, with no domain-owned asynchronous engines.
 
-Each `CommContext` stores a POD array `workspaces`, indexed by
-`CommWorkspaceKind::{SDMA, URMA, RDMA}`. Kernels use
+Domain-owned workspace descriptors are stored in `CommContext.workspaces`,
+indexed by `CommWorkspaceKind::{SDMA, URMA, RDMA}`. Kernels use
 `comm_workspace<CommWorkspaceKind::URMA>(*ctx)` (or the corresponding engine),
 whose template argument is checked at compile time. Host publication rejects
 out-of-range enum values before indexing. An absent backend has zero address

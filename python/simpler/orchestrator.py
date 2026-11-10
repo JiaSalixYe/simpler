@@ -720,10 +720,10 @@ class Orchestrator:
         buffer: str | None = None,
         offset: int = 0,
     ) -> None:
-        """Synchronously stage bytes; does not wait for queued tasks.
+        """Synchronously stage bytes into a Device-source domain.
 
         L3 staging precedes task submission and stays within declared buffer slices.
-        L4 keeps its existing window copy path.
+        Use `Buffer.shm.buf` and `domain.buffer_range(name)` for Host-source domains.
         """
         self._copy_domain(handle, domain_rank, bytes(data), buffer, offset, writing=True)
 
@@ -736,7 +736,7 @@ class Orchestrator:
         buffer: str | None = None,
         offset: int = 0,
     ) -> bytes:
-        """Synchronously read bytes with the same range and ordering rules as copy_to_domain."""
+        """Synchronously read Device-source bytes with the same rules as copy_to_domain."""
         return cast(bytes, self._copy_domain(handle, domain_rank, int(nbytes), buffer, offset, writing=False))
 
     copy_to_global_domain = copy_to_domain

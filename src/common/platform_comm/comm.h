@@ -311,8 +311,8 @@ int comm_alloc_host_domain_windows(
  * device-side CommContext. The caller must prove all domain users have
  * stopped before invoking this API. A2/A3 Host-backed domains release
  * each rank's resources independently after that fence. Backends that
- * use a native subset barrier scope it by `allocation_id`, with
- * `rank_count` and `domain_rank` identifying the caller's subset position.
+ * use a native subset barrier scope it by `allocation_id` and use
+ * `rank_count` for its participant count and `domain_rank` for the caller's position.
  *
  * Domain VMM mappings and imported physical handles are released explicitly.
  * Shared workspace borrows end here; process-wide EnablePeerAccess routes and
