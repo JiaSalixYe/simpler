@@ -31,7 +31,6 @@ from simpler.worker import Worker
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
-from simpler_setup.torch_interop import make_tensor_arg
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DTYPE_NBYTES = 4
@@ -161,18 +160,24 @@ def _run_case_on_worker(worker: Worker, chip_handle, elem_count: int, nranks: in
     send_host = case_buffers["send_host"]
     tget_zero = case_buffers["tget_zero"]
     tput_zero = case_buffers["tput_zero"]
-    status = case_buffers["status"]
+    initial_status = case_buffers["status"]
 
     # In L3 distributed mode, host buffers for copy_to must be Worker Buffer handles
     # backed by POSIX shared memory (worker.create_buffer).
     send_buf = [worker.create_buffer(send_nbytes) for _ in range(nranks)]
     tget_buf = [worker.create_buffer(tget_nbytes) for _ in range(nranks)]
     tput_buf = [worker.create_buffer(tput_nbytes) for _ in range(nranks)]
+    status_buf = [worker.create_buffer(STATUS_WORDS * DTYPE_NBYTES) for _ in range(nranks)]
+    status = []
     for r in range(nranks):
         s_shm, tg_shm, tp_shm = send_buf[r].shm, tget_buf[r].shm, tput_buf[r].shm
         assert s_shm is not None and s_shm.buf is not None
         assert tg_shm is not None and tg_shm.buf is not None
         assert tp_shm is not None and tp_shm.buf is not None
+        status_shm = status_buf[r].shm
+        assert status_shm is not None and status_shm.buf is not None
+        status.append(torch.frombuffer(status_shm.buf, dtype=torch.int32, count=STATUS_WORDS))
+        status[-1].copy_(initial_status[r])
         torch.frombuffer(s_shm.buf, dtype=torch.float32, count=elem_count).copy_(send_host[r])
         torch.frombuffer(tg_shm.buf, dtype=torch.float32, count=tget_elems).copy_(tget_zero[r])
         torch.frombuffer(tp_shm.buf, dtype=torch.float32, count=tput_elems).copy_(tput_zero[r])
@@ -216,23 +221,24 @@ def _run_case_on_worker(worker: Worker, chip_handle, elem_count: int, nranks: in
                     domain.buffers["tput_recv"].tensor((tput_elems,), DataType.FLOAT32),
                     TensorArgType.INOUT,
                 )
-                args.add_tensor(make_tensor_arg(worker, status[rank]), TensorArgType.OUTPUT_EXISTING)
+                args.add_tensor(status_buf[rank].tensor((STATUS_WORDS,), DataType.INT32), TensorArgType.OUTPUT_EXISTING)
                 args.add_scalar(domain.device_ctx)
                 args.add_scalar(elem_count)
                 orch.submit_next_level(chip_handle, args, cfg, worker=rank)
 
     try:
         worker.run(orch_fn, args=None, config=CallConfig())
+        return _print_status(elem_count, status)
     except RuntimeError:
         _print_status(elem_count, status)
         raise
     finally:
+        status.clear()
         for r in range(nranks):
             worker.release_buffer(send_buf[r])
             worker.release_buffer(tget_buf[r])
             worker.release_buffer(tput_buf[r])
-
-    return _print_status(elem_count, status)
+            worker.release_buffer(status_buf[r])
 
 
 def run_case(platform: str, device_ids: list[int], elem_count: int, *, build: bool = False) -> bool:

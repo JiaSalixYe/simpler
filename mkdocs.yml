@@ -157,6 +157,7 @@ nav:
           - 验证与性能验收: zh-cn/design/a5-hbg-async-completion/validation.md
           - 待验证选型: zh-cn/design/a5-hbg-async-completion/choices.md
       - Worker Manager: worker-manager.md
+      - Chip startup and shared inputs (Chinese): zh-cn/chip-process-startup.md
       - Hardware:
           - Overview: hardware/README.md
           - Chip architecture: hardware/chip-architecture.md
