@@ -1298,8 +1298,7 @@ def _run_program_loader_double_failure(arch, runtime, device, use_acl):
     try:
         assert lib.simpler_init(*init_args) == 0
         if use_acl:
-            # Brings `acl_ready_` up so finalize takes the aclrtResetDevice arm
-            # instead of the bare rtDeviceReset one.
+            # Acquire the ACL reference too; finalize releases it before RTS.
             assert lib.ensure_acl_ready_ctx(ctx, device) == 0
         faults.arm_unload_failures(1)
         faults.arm_reset_failures(1)
@@ -1312,16 +1311,16 @@ def _run_program_loader_double_failure(arch, runtime, device, use_acl):
         assert faults.unload_call_count() == 2
         assert faults.reset_call_count() == 1
         assert lib.simpler_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
-        # The third close retries only the outstanding reset.
+        # The third close releases each outstanding device reference.
         assert lib.finalize_device(ctx) == 0
         assert faults.unload_call_count() == 2
-        assert faults.reset_call_count() == 2
+        assert faults.reset_call_count() == (3 if use_acl else 2)
         assert lib.finalize_device(ctx) == 0
-        assert faults.reset_call_count() == 2
+        assert faults.reset_call_count() == (3 if use_acl else 2)
         lib.destroy_device_context(ctx)
         destroyed = True
         assert faults.unload_call_count() == 2
-        assert faults.reset_call_count() == 2
+        assert faults.reset_call_count() == (3 if use_acl else 2)
     finally:
         if not destroyed:
             lib.destroy_device_context(ctx)

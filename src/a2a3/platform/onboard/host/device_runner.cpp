@@ -219,52 +219,6 @@ DeviceRunner::~DeviceRunner() { finalize(); }
 // `DeviceRunnerBase` — see
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
-int DeviceRunner::ensure_acl_ready(int device_id) {
-    if (device_id < 0) {
-        LOG_ERROR("ensure_acl_ready: invalid device_id %d", device_id);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    // aclInit / aclrtSetDevice below, and the aclFinalize this records
-    // responsibility for, are acts of device ownership, so reaching this entry
-    // makes the context a program context. Latching here rather than merely
-    // testing is_kernel() closes the unclaimed path: ensure_acl_ready_ctx is a
-    // standalone initialization entry that callers reach without simpler_init
-    // (tests/ut/cpp/common/platform_comm/test_comm_lifecycle.cpp), and an unlatched context
-    // that took ACL ownership would later let a kernel latch coexist with
-    // acl_ready_, whose finalize resets a device this context does not own.
-    // Latching before the first ACL call is also what keeps the refusal
-    // side-effect-free. The latch is write-once: an ACL failure below leaves
-    // the identity in place, and a repeat call re-latches the same mode.
-    const int mode_rc = execution_mode_latch().latch(SIMPLER_MODE_PROGRAM);
-    if (mode_rc != 0) {
-        LOG_ERROR("ensure_acl_ready: refused — this context already belongs to kernel mode");
-        return mode_rc;
-    }
-
-    // aclInit is process-wide; CANN returns ACL_ERROR_REPEAT_INITIALIZE if it
-    // has already been initialized (possibly by another owner), which we
-    // treat as success.
-    aclError aRet = aclInit(nullptr);
-    if (aRet != ACL_SUCCESS && static_cast<int>(aRet) != ACL_ERROR_REPEAT_INITIALIZE) {
-        LOG_ERROR("aclInit failed: %d", static_cast<int>(aRet));
-        ACL_LOG_ERROR_DETAIL(aRet);
-        return static_cast<int>(aRet);
-    }
-
-    // ACL device binding is per-thread; every caller must still hit it.
-    aRet = aclrtSetDevice(device_id);
-    if (aRet != ACL_SUCCESS) {
-        LOG_ERROR("aclrtSetDevice(%d) failed: %d", device_id, static_cast<int>(aRet));
-        ACL_LOG_ERROR_DETAIL(aRet);
-        return static_cast<int>(aRet);
-    }
-
-    // Record that we are responsible for aclFinalize at teardown.
-    acl_ready_ = true;
-    if (device_id_ < 0) device_id_ = device_id;
-    return 0;
-}
-
 void *DeviceRunner::create_comm_stream() {
     aclrtStream stream = nullptr;
     aclError aRet = aclrtCreateStream(&stream);
@@ -1529,15 +1483,9 @@ int DeviceRunner::finalize_impl() {
         // Only finalize the ACL owner after force reset established a clean
         // generation. On reset failure, aclFinalize may itself walk poisoned
         // stream resources and enter the same remote-event timeout.
-        if (acl_ready_) {
-            const int finalize_rc = aclFinalize();
-            if (finalize_rc != 0) {
-                LOG_ERROR("aclFinalize failed during fatal finalize: %d", finalize_rc);
-                if (abandon_rc == 0) abandon_rc = finalize_rc;
-            } else {
-                acl_ready_ = false;
-            }
-        }
+        retire_owned_device_binding();
+        const int acl_rc = finalize_owned_acl();
+        if (abandon_rc == 0) abandon_rc = acl_rc;
 
         if (abandon_rc == 0) {
             aicpu_topology_.clear();
@@ -1557,7 +1505,7 @@ int DeviceRunner::finalize_impl() {
     // A kernel-mode context runs on the caller's already-current device, so
     // this thread needs no bind and the context owns no device state to adopt.
     int rc = 0;
-    if (!execution_mode_latch().is_kernel()) {
+    if (owned_context_ != nullptr) {
         rc = bind_current_thread(device_id_);
         if (rc != 0) {
             LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
@@ -1591,51 +1539,14 @@ int DeviceRunner::finalize_impl() {
     // use the shared owned-reset policy; borrowed contexts never take that path.
     if (rc != 0) return recover_failed_close(rc);
 
-    // Reset device AFTER all device memory is freed. Two paths:
-    //
-    // - acl_ready_=true (HCCL / comm path):  aclrtResetDevice + aclFinalize
-    //   tear down both the device runtime and the ACL bring-up that
-    //   ensure_acl_ready() did.
-    //
-    // - acl_ready_=false (pure rt path, the common case for non-HCCL tests):
-    //   rtDeviceReset is still needed to clear any per-device runtime state
-    //   the test left behind — without this, an AICPU exception / stuck
-    //   kernel on this DeviceRunner wedges the device for the next
-    //   ChipWorker that initializes on the same id (rtStreamCreate then
-    //   returns 507899). a5 has been doing this unconditionally; a2a3 was
-    //   missing the rt-path reset, which is the root cause of the chronic
-    //   "test_dedup_shared_so_independent_unregister → 507899 cascade"
-    //   pattern seen across PR CI all session.
-    if (device_id_ >= 0) {
-        if (acl_ready_) {
-            int reset_rc = aclrtResetDevice(device_id_);
-            teardown_recorder_.note_reset_api(TEARDOWN_RESET_API_ACL_RESET_DEVICE, reset_rc);
-            // No probe follows this arm, so a zero here is a reset call that
-            // returned, never a confirmed device generation.
-            teardown_recorder_.note_stage(reset_rc == 0 ? TEARDOWN_STAGE_API_OK_NO_PROBE : TEARDOWN_STAGE_API_FAILED);
-            if (reset_rc != 0) {
-                LOG_ERROR("aclrtResetDevice(%d) failed during finalize: %d", device_id_, reset_rc);
-                // Keep the device owner reachable until its reset succeeds.
-                teardown_recorder_.finish(reset_rc);
-                return reset_rc;
-            }
-            int finalize_rc = aclFinalize();
-            if (finalize_rc != 0) {
-                LOG_ERROR("aclFinalize failed during finalize: %d", finalize_rc);
-                if (rc == 0) rc = finalize_rc;
-            }
-            acl_ready_ = false;
-        } else if (!execution_mode_latch().is_kernel()) {
-            int reset_rc = rtDeviceReset(device_id_);
-            teardown_recorder_.note_reset_api(TEARDOWN_RESET_API_RT_DEVICE_RESET, reset_rc);
-            teardown_recorder_.note_stage(reset_rc == 0 ? TEARDOWN_STAGE_API_OK_NO_PROBE : TEARDOWN_STAGE_API_FAILED);
-            if (reset_rc != 0) {
-                LOG_ERROR("rtDeviceReset(%d) failed during finalize: %d", device_id_, reset_rc);
-                // Keep the device owner reachable until its reset succeeds.
-                teardown_recorder_.finish(reset_rc);
-                return reset_rc;
-            }
-        }
+    const int binding_rc = release_owned_device_binding([this](TeardownResetApi api, int result) {
+        teardown_recorder_.note_reset_api(api, result);
+        teardown_recorder_.note_stage(result == 0 ? TEARDOWN_STAGE_API_OK_NO_PROBE : TEARDOWN_STAGE_API_FAILED);
+    });
+    if (rc == 0) rc = binding_rc;
+    if (binding_rc != 0) {
+        teardown_recorder_.finish(rc);
+        return rc;
     }
 
     // A poisoned card returned from the fatal branch at the top of finalize(),

@@ -61,6 +61,7 @@ extern "C" int copy_back_run_outputs_impl(Runtime *runtime, const HostApi *api, 
 }
 
 static int tokens[64], next_stream, next_event;
+static thread_local rtContext_t current_context = nullptr;
 static int fail_at, submits, syncs, copies;
 static int allocation_attempts, fail_allocation;
 static int resource_release_calls;
@@ -612,7 +613,18 @@ extern "C" aclError aclrtSynchronizeDeviceWithTimeout(int32_t) {
 }
 extern "C" rtError_t rtSetDevice(int32_t) {
     assert(owned_close_active);
-    return set_device_error;
+    if (set_device_error != 0) return set_device_error;
+    current_context = &tokens[63];
+    return 0;
+}
+extern "C" rtError_t rtCtxGetCurrent(rtContext_t *out) {
+    *out = current_context;
+    return 0;
+}
+extern "C" rtError_t rtCtxSetCurrent(rtContext_t context) {
+    if (set_device_error != 0) return set_device_error;
+    current_context = context;
+    return 0;
 }
 extern "C" rtError_t rtDeviceReset(int32_t) {
     assert(owned_close_active);
@@ -702,6 +714,7 @@ int host::LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *args, size_t byt
     return rc;
 }
 static void initialize_borrowed_context(DeviceRunnerBase &runner) {
+    current_context = &tokens[61];
     assert(runner.execution_mode_latch().latch(SIMPLER_MODE_KERNEL) == 0);
     KernelContextOps ops;
     ops.get_current_device = [](void *, int *out) noexcept {
@@ -767,8 +780,11 @@ public:
     using DeviceRunnerBase::prepare_submission_resources;
     void initialize(bool borrowed = true) {
         device_id_ = 0;
+        timeout_configuration_rc_ = 0;
+        timeout_configured_ = true;
         if (!borrowed) {
             assert(execution_mode_latch().latch(SIMPLER_MODE_PROGRAM) == 0);
+            assert(attach_current_thread(0) == 0);
             assert(rtStreamCreate(&stream_aicpu_, 0) == 0);
             assert(rtStreamCreate(&stream_aicore_, 0) == 0);
             return;
@@ -1027,9 +1043,11 @@ public:
         if (borrowed) initialize_borrowed_context(*this);
         device_id_ = 0;
         timeout_configuration_rc_ = 0;
+        timeout_configured_ = true;
         max_block_dim_ = block_dim_ = 1;
         if (!borrowed) {
             assert(execution_mode_latch().latch(SIMPLER_MODE_PROGRAM) == 0);
+            assert(attach_current_thread(0) == 0);
             // Program's initializer owns its persistent pair, including A5's fixed pair.
             assert(rtStreamCreate(&stream_aicpu_, 0) == 0);
             assert(rtStreamCreate(&stream_aicore_, 0) == 0);
