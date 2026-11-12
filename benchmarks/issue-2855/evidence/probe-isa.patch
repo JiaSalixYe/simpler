@@ -1,0 +1,13 @@
+--- a/include/pto/comm/async/urma/urma_async_intrin.hpp
++++ b/include/pto/comm/async/urma/urma_async_intrin.hpp
+@@ -86,6 +86,10 @@
+ {
+     st_dev(head, reinterpret_cast<__gm__ uint32_t*>(wq->headAddr), 0);
+     st_dev(head, reinterpret_cast<__gm__ uint32_t*>(wq->dbAddr), 0);
++    pipe_barrier(PIPE_ALL);
++    volatile __gm__ uint32_t* doorbellCount = &wq->reserved[0];
++    *doorbellCount = *doorbellCount + 1U;
++    DcciCachelines(reinterpret_cast<__gm__ uint8_t*>(wq), sizeof(*wq));
+ }
+ 
+ AICORE inline uint32_t UrmaCtxRow(__gm__ UrmaInfo* info, uint32_t peer, uint32_t jettyIdx)
